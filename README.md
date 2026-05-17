@@ -6,6 +6,10 @@ Tested against **Adobe Premiere Pro 24, 25, and 26**.
 
 ---
 
+![DateModSync panel screenshot](docs/screenshots/screenshot.jpg)
+
+---
+
 ## How it works
 
 | Step | Detail |
