@@ -79,7 +79,7 @@ Go to **Window → Extensions → DateModSync**.
 3. Review the **Detected Clips** table — it shows each clip's file name, type, estimated record-start time, and offset from the earliest clip.
 4. Click **⏱ Build Sync Sequence**.  
    A new sequence named `[original name]-SYNC` is created and opened. Clips are placed at their real-clock-time positions; gaps between recordings are preserved.
-5. **Manually align tracks** — after the sync sequence is built, use the Selection tool to drag each track so that **one clip** lines up close to the corresponding clip on the base track. Because `mtime` accuracy can vary by roughly **±1 second** per clip, this rough alignment only needs to be in the ballpark. Once every track is roughly aligned, run **Fine Tune Audio** for precise micro-adjustments.
+5. **Manually align tracks** — after the sync sequence is built, use the Selection tool and drag all clips on each track so that they line up closely to the corresponding clip on the base track (make sure all clips on a track are moved together). Because `mtime` accuracy can vary by roughly **±1 second** per clip, this rough alignment only needs to be in the ballpark. Aim for less than 3 seconds, which should be easy to do either by the waveforms or visually. You only need to do this shift once for each track. Repeat process until all tracks are roughly aligned, then run **Fine Tune Audio** for precise micro-adjustments.
 
 ### Fine Tune Audio
 
