@@ -1,0 +1,28 @@
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+
+# Node/npm artifacts (if used for tooling later)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Archive/build artifacts
+*.zip
+*.7z
+*.tar
+*.gz
+*.rar
