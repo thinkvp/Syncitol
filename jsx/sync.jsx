@@ -229,9 +229,33 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
         }
     }
 
+    // ── Scan fine-tuned clips to find how far the whole sequence must shift
+    //    forward so no adjusted clip lands before position 0 ────────────────
+    var compensateSec = 0;
+    function scanForCompensation(trackCollection) {
+        for (var t = 0; t < trackCollection.numTracks; t++) {
+            var track = trackCollection[t];
+            for (var c = 0; c < track.clips.numItems; c++) {
+                var clip = track.clips[c];
+                try {
+                    var fp = clip.projectItem.getMediaPath();
+                    if (!fp) continue;
+                    var key = fp + "|" + String(clip.start.ticks);
+                    if (!(key in adjustmentMap)) continue;
+                    var resultSec = timeToSeconds(clip.start) + adjustmentMap[key];
+                    if (resultSec < 0) compensateSec = Math.max(compensateSec, -resultSec);
+                } catch (e) {}
+            }
+        }
+    }
+    scanForCompensation(seq.videoTracks);
+    scanForCompensation(seq.audioTracks);
+
     var moved = [];
     var errors = [];
 
+    // ── Apply moves: fine-tuned clips get (delta + compensate),
+    //    every other clip gets (+compensate) so relative timing is preserved ─
     function moveTrackCollection(trackCollection, trackType) {
         for (var t = 0; t < trackCollection.numTracks; t++) {
             var track = trackCollection[t];
@@ -242,20 +266,25 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
                     if (!filePath) continue;
 
                     var key = filePath + "|" + String(clip.start.ticks);
-                    if (!(key in adjustmentMap)) continue;
+                    var inMap = (key in adjustmentMap);
+                    var delta = inMap ? adjustmentMap[key] : 0;
+                    var totalDelta = delta + compensateSec;
 
-                    var delta = adjustmentMap[key];
+                    if (Math.abs(totalDelta) < 0.0001) continue;
+
                     var deltaTime = new Time();
-                    deltaTime.seconds = delta;
+                    deltaTime.seconds = totalDelta;
                     clip.move(deltaTime);
 
-                    moved.push({
-                        clipName:   clip.name,
-                        filePath:   filePath,
-                        trackType:  trackType,
-                        trackIndex: t,
-                        deltaSec:   delta
-                    });
+                    if (inMap) {
+                        moved.push({
+                            clipName:   clip.name,
+                            filePath:   filePath,
+                            trackType:  trackType,
+                            trackIndex: t,
+                            deltaSec:   delta
+                        });
+                    }
                 } catch (e) {
                     errors.push("Failed to move " + clip.name + " on " + trackType + " track " + (t + 1) + ": " + e.message);
                 }
@@ -269,7 +298,8 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
     return JSON.stringify({
         success: true,
         moved: moved,
-        errors: errors
+        errors: errors,
+        compensateSec: compensateSec
     });
 }
 
@@ -326,8 +356,12 @@ function _buildSyncSequenceImpl(payloadJSON) {
     }
 
     // ── 2. Per-track earliest: each track independently starts at t=0 ───────
-    // Clips on different tracks are NOT spaced relative to each other by date.
-    // Use Fine Tune Audio to align tracks against each other via waveform.
+    // Video tracks and their linked audio are spaced relative to their own
+    // track's earliest clip.  Audio-only tracks (e.g. a field-recorder WAV
+    // with no video counterpart) are anchored to the global earliest
+    // recording start so they land at the correct wall-clock position on the
+    // same timeline as the video clips.  Fine Tune Audio then handles any
+    // remaining small (<5 s) discrepancy between tracks.
     var videoTrackEarliest = {};
     var fileToVideoTrackIdx = {};
     for (var j = 0; j < enriched.length; j++) {
@@ -351,6 +385,15 @@ function _buildSyncSequenceImpl(payloadJSON) {
         }
     }
 
+    // Global earliest across all tracks — used to anchor audio-only clips.
+    var globalEarliestMs = Number.MAX_VALUE;
+    for (var gvk in videoTrackEarliest) {
+        if (videoTrackEarliest[gvk] < globalEarliestMs) globalEarliestMs = videoTrackEarliest[gvk];
+    }
+    for (var gak in audioTrackEarliest) {
+        if (audioTrackEarliest[gak] < globalEarliestMs) globalEarliestMs = audioTrackEarliest[gak];
+    }
+
     // ── 2a. 24-hour span guard (per track) ────────────────────────────────────
     var MAX_SPAN_SEC = 86400;
     var spanError = null;
@@ -362,7 +405,9 @@ function _buildSyncSequenceImpl(payloadJSON) {
         } else if (fileToVideoTrackIdx.hasOwnProperty(spClip.filePath)) {
             spAnchor = videoTrackEarliest["v" + fileToVideoTrackIdx[spClip.filePath]];
         } else {
-            spAnchor = audioTrackEarliest["a" + spClip.trackIndex];
+            // Audio-only clip: anchor to global earliest so it sits at the
+            // correct wall-clock position relative to the video tracks.
+            spAnchor = globalEarliestMs;
         }
         if (spAnchor === undefined) continue;
         var spEndSec = (spClip.recordStartMs - spAnchor) / 1000 + spClip.durationSec;
@@ -459,7 +504,9 @@ function _buildSyncSequenceImpl(payloadJSON) {
             } else if (fileToVideoTrackIdx.hasOwnProperty(path)) {
                 trackAnchorMs = videoTrackEarliest["v" + fileToVideoTrackIdx[path]];
             } else {
-                trackAnchorMs = audioTrackEarliest["a" + clipInfo.trackIndex];
+                // Audio-only clip: use global earliest so it is positioned at
+                // the correct absolute wall-clock offset on the timeline.
+                trackAnchorMs = globalEarliestMs;
             }
             if (trackAnchorMs === undefined) continue;
             var targetOffsetSec = (recordStartByPath[path] - trackAnchorMs) / 1000;

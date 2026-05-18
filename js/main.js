@@ -269,7 +269,13 @@ function buildFineTuneAnchors(clips) {
                 clipName: clip.clipName,
                 trackType: clip.trackType,
                 trackIndex: clip.trackIndex,
-                layerOrder: clip.trackType === "video" ? clip.trackIndex : 1000 + clip.trackIndex,
+                // Audio-only clips (e.g. field-recorder WAV on Audio Track 1,
+                // trackIndex 0) get layerOrder = trackIndex (0, 1, …).
+                // Video clips get layerOrder = trackIndex + 1 (1, 2, …).
+                // This ensures Audio Track 1 is treated as the reference base
+                // and each video clip is individually aligned to it, rather
+                // than the WAV being shifted once to best-fit all video clips.
+                layerOrder: clip.trackType === "video" ? clip.trackIndex + 1 : clip.trackIndex,
                 startSec: clip.startSec,
                 endSec: clip.endSec,
                 inPointSec: clip.inPointSec,
@@ -284,7 +290,7 @@ function buildFineTuneAnchors(clips) {
             existing.clipName = clip.clipName;
             existing.trackType = clip.trackType;
             existing.trackIndex = clip.trackIndex;
-            existing.layerOrder = clip.trackIndex;
+            existing.layerOrder = clip.trackIndex + 1;
             existing.startSec = clip.startSec;
             existing.endSec = clip.endSec;
             existing.inPointSec = clip.inPointSec;
@@ -716,6 +722,10 @@ async function fineTuneAudio() {
 
         if (apply.errors && apply.errors.length) {
             apply.errors.forEach(msg => log(`⚠ ${msg}`, "warn"));
+        }
+
+        if (apply.compensateSec > 0) {
+            log(`Fine tune: shifted entire sequence forward by +${formatSignedSeconds(apply.compensateSec)} to keep boundary clip at position 0.`, "info");
         }
 
         setProgress(100);
