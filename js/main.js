@@ -1,5 +1,5 @@
 /**
- * DateModSync — main.js
+ * Syncitol — main.js
  * CEP panel logic: talks to ExtendScript via CSInterface,
  * uses Node.js (via __adobe_cep__) to read file mtime.
  */
@@ -15,22 +15,17 @@ const fs   = typeof cep_node !== "undefined" ? cep_node.require("fs")   : null;
 const path = typeof cep_node !== "undefined" ? cep_node.require("path") : null;
 const childProcess = typeof cep_node !== "undefined" ? cep_node.require("child_process") : null;
 
-const AUDIO_SAMPLE_RATE = 8000;
-const ENVELOPE_WINDOW_SAMPLES = 80;
-const ENVELOPE_RATE = AUDIO_SAMPLE_RATE / ENVELOPE_WINDOW_SAMPLES;
-const FINE_TUNE_MAX_SHIFT_SEC = 5;
-const FINE_TUNE_MIN_OVERLAP_SEC = 3;
-const FINE_TUNE_MAX_COMPARE_SEC = 20;
-const FINE_TUNE_MIN_SCORE = 0.2;
-const FINE_TUNE_MIN_APPLY_SEC = 0.02;
-const FINE_TUNE_WINDOW_POSITIONS = [0.5, 0.2, 0.8];
-const FINE_TUNE_DECENT_SCORE = 0.7;
+// Constants (TICKS_PER_SECOND, MAX_SPAN_SEC, AUDIO_SAMPLE_RATE, FINE_TUNE_*, …)
+// and the pure DSP/format helpers are defined in js/dsp.js, which is loaded
+// before this file and publishes them as globals. Only host-coupled state and
+// logic live here.
 const envelopeCache = new Map();
 
 // ─── State ───────────────────────────────────────────────────────────────────
 let clipPayload = null; // enriched clip list after mtime lookup
 
 // ─── DOM refs ────────────────────────────────────────────────────────────────
+const btnAuto           = document.getElementById("btn-auto");
 const btnRefresh        = document.getElementById("btn-refresh");
 const btnSync           = document.getElementById("btn-sync");
 const btnFineTune       = document.getElementById("btn-fine-tune");
@@ -83,51 +78,45 @@ function setProgress(pct, visible = true) {
 }
 
 // ─── Evaluate ExtendScript ────────────────────────────────────────────────────
+// Every JSX entry point returns either a JSON value or, on failure, a JSON
+// object shaped { error: "..." }. We surface both kinds of failure here so
+// callers can rely on a resolved result being a usable success value:
+//   1. The CEP runtime's generic "EvalScript error." sentinel (an uncaught JSX
+//      throw or a syntax error — note this string is not localized by CEP).
+//   2. A JSON { error } object returned by our own try/catch wrappers.
 function evalScript(script) {
     return new Promise((resolve, reject) => {
         csInterface.evalScript(script, (result) => {
             if (result === "EvalScript error.") {
-                reject(new Error("ExtendScript evaluation error"));
-            } else {
-                resolve(result);
+                reject(new Error("ExtendScript evaluation failed (uncaught error or syntax error in JSX)."));
+                return;
             }
+            // Detect a structured { error } payload without disturbing results
+            // that are not JSON (e.g. a bare assignment statement's value).
+            if (typeof result === "string" && result.charAt(0) === "{") {
+                let parsed;
+                try { parsed = JSON.parse(result); } catch (e) { parsed = null; }
+                if (parsed && parsed.error) {
+                    reject(new Error(parsed.error));
+                    return;
+                }
+            }
+            resolve(result);
         });
     });
 }
 
 // ─── Load ExtendScript file ───────────────────────────────────────────────────
 function loadJSX() {
-    const extDir = csInterface.getSystemPath(SystemPath.EXTENSION);
-    const jsxPath = extDir + "/jsx/sync.jsx";
-    csInterface.evalScript(`$.evalFile("${jsxPath.replace(/\\/g, "/")}")`);
+    const extDir = csInterface.getSystemPath(SystemPath.EXTENSION).replace(/\\/g, "/");
+    // Load the guarded JSON polyfill first (no-op on hosts with native JSON),
+    // then the main ExtendScript.
+    csInterface.evalScript(`$.evalFile("${extDir}/jsx/json2.js")`);
+    csInterface.evalScript(`$.evalFile("${extDir}/jsx/sync.jsx")`);
 }
 
-// ─── Format helpers ───────────────────────────────────────────────────────────
-function formatDuration(ms) {
-    const totalSec = Math.round(ms / 1000);
-    const h = Math.floor(totalSec / 3600);
-    const m = Math.floor((totalSec % 3600) / 60);
-    const s = totalSec % 60;
-    if (h > 0) return `${h}h ${m}m ${s}s`;
-    if (m > 0) return `${m}m ${s}s`;
-    return `${s}s`;
-}
-
-function formatTime(ms) {
-    const d = new Date(ms);
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-function formatDate(ms) {
-    const d = new Date(ms);
-    return d.toLocaleDateString([], { month: "short", day: "numeric" }) +
-           " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-function formatSignedSeconds(seconds) {
-    const rounded = Math.round(seconds * 1000) / 1000;
-    return `${rounded >= 0 ? "+" : ""}${rounded}s`;
-}
+// Format helpers (formatDuration / formatTime / formatDate / formatSignedSeconds)
+// live in js/dsp.js.
 
 function runCommandCapture(command, args) {
     return new Promise((resolve, reject) => {
@@ -162,26 +151,86 @@ function ensureFfmpeg() {
     ensureFfmpeg.checked = true;
 }
 
-function buildEnvelope(buffer) {
-    const sampleCount = Math.floor(buffer.length / 2);
-    const frameCount = Math.floor(sampleCount / ENVELOPE_WINDOW_SAMPLES);
-    const envelope = new Float32Array(frameCount);
+// ─── Timing source: embedded creation_time (preferred) vs. file mtime ─────────
+// mtime is a weak proxy for record time — many cameras stamp it at record-start
+// (not end) and any copy without date preservation rewrites it. When ffprobe is
+// available we read the media's embedded creation_time, which is the actual
+// recording start and survives copying. ffprobe is optional: if it is missing or
+// the file carries no creation_time tag we fall back to mtime, so Build never
+// hard-depends on it.
+const creationTimeCache = new Map();
+let ffprobeAvailable = null; // null = untested, false = confirmed absent
 
-    for (let frame = 0; frame < frameCount; frame += 1) {
-        let sum = 0;
-        const frameByteOffset = frame * ENVELOPE_WINDOW_SAMPLES * 2;
-        for (let s = 0; s < ENVELOPE_WINDOW_SAMPLES; s += 1) {
-            const byteOffset = frameByteOffset + (s * 2);
-            sum += Math.abs(buffer.readInt16LE(byteOffset));
-        }
-        envelope[frame] = sum / ENVELOPE_WINDOW_SAMPLES;
+function extractCreationTime(probe) {
+    if (probe && probe.format && probe.format.tags && probe.format.tags.creation_time) {
+        return probe.format.tags.creation_time;
     }
-
-    return envelope;
+    if (probe && Array.isArray(probe.streams)) {
+        for (const stream of probe.streams) {
+            if (stream.tags && stream.tags.creation_time) return stream.tags.creation_time;
+        }
+    }
+    return null;
 }
 
-function getEnvelope(filePath, sourceOffsetSec, durationSec) {
-    const cacheKey = `${filePath}|${sourceOffsetSec.toFixed(3)}|${durationSec.toFixed(3)}`;
+// Returns the embedded recording-start time in epoch ms, or null when
+// unavailable (ffprobe absent, no tag, or an unparseable value).
+async function probeCreationTimeMs(filePath) {
+    if (!childProcess || ffprobeAvailable === false) return null;
+    if (creationTimeCache.has(filePath)) return creationTimeCache.get(filePath);
+
+    let result = null;
+    try {
+        const out = await runCommandCapture("ffprobe", [
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_entries", "format_tags=creation_time:stream_tags=creation_time",
+            "-i", filePath
+        ]);
+        ffprobeAvailable = true;
+        const raw = extractCreationTime(JSON.parse(out.toString("utf8")));
+        if (raw) {
+            const ms = Date.parse(raw);
+            if (!Number.isNaN(ms)) result = ms;
+        }
+    } catch (e) {
+        // A spawn ENOENT means ffprobe is not installed — stop trying for this
+        // session. Any other failure (unreadable file, etc.) just yields null.
+        if (e && /ENOENT/.test(e.message)) ffprobeAvailable = false;
+        result = null;
+    }
+
+    creationTimeCache.set(filePath, result);
+    return result;
+}
+
+// Resolve a clip's record-start time once, here in the panel, so the JSX build
+// can consume it directly instead of recomputing from mtime.
+async function resolveRecordStart(clip) {
+    const durationSec = clip.durationTicks / TICKS_PER_SECOND;
+
+    const creationMs = await probeCreationTimeMs(clip.filePath);
+    if (creationMs !== null) {
+        // creation_time is the recording start itself — no duration subtraction.
+        return { recordStartMs: creationMs, durationSec, timingSource: "creation_time", mtimeMs: null };
+    }
+
+    const stats = fs.statSync(clip.filePath);
+    const mtimeMs = stats.mtimeMs;
+    return { recordStartMs: mtimeMs - (durationSec * 1000), durationSec, timingSource: "mtime", mtimeMs };
+}
+
+// buildEnvelope() lives in js/dsp.js.
+
+// opts.sampleRate / opts.windowSamples select the envelope resolution. The fine
+// pass uses the defaults (8 kHz / 80 → 100 Hz envelope); the coarse auto-align
+// pass requests a lower-rate envelope so it can search a much wider lag range
+// over long windows cheaply.
+function getEnvelope(filePath, sourceOffsetSec, durationSec, opts) {
+    opts = opts || {};
+    const sampleRate = opts.sampleRate || AUDIO_SAMPLE_RATE;
+    const windowSamples = opts.windowSamples || ENVELOPE_WINDOW_SAMPLES;
+    const cacheKey = `${filePath}|${sourceOffsetSec.toFixed(3)}|${durationSec.toFixed(3)}|${sampleRate}|${windowSamples}`;
     if (envelopeCache.has(cacheKey)) {
         return envelopeCache.get(cacheKey);
     }
@@ -194,12 +243,12 @@ function getEnvelope(filePath, sourceOffsetSec, durationSec) {
         "-i", filePath,
         "-map", "0:a:0",
         "-ac", "1",
-        "-ar", String(AUDIO_SAMPLE_RATE),
+        "-ar", String(sampleRate),
         "-f", "s16le",
         "pipe:1"
     ]).then(buffer => {
         if (!buffer.length) throw new Error(`No audio samples: ${path.basename(filePath)}`);
-        const envelope = buildEnvelope(buffer);
+        const envelope = buildEnvelope(buffer, windowSamples);
         if (!envelope.length) throw new Error(`Audio slice too short: ${path.basename(filePath)}`);
         return envelope;
     });
@@ -208,144 +257,129 @@ function getEnvelope(filePath, sourceOffsetSec, durationSec) {
     return task;
 }
 
-function findBestLag(refEnvelope, targetEnvelope) {
-    const maxLagFrames = Math.round(FINE_TUNE_MAX_SHIFT_SEC * ENVELOPE_RATE);
-    const minOverlapFrames = Math.round(FINE_TUNE_MIN_OVERLAP_SEC * ENVELOPE_RATE);
+// findBestLag(), buildFineTuneAnchors(), buildCompareWindow(), describeAnchor()
+// and formatRange() live in js/dsp.js.
+
+// ─── Coarse auto-align (whole-track, large offsets) ───────────────────────────
+// Device clocks can differ by minutes, so two tracks may sit far apart even after
+// timestamp-based Build — far beyond the fine pass's ±5 s. This pass does what the
+// old manual drag did: for each track it matches ONE clip (the longest, most
+// distinctive one) against the full reference recording by sliding a low-rate
+// envelope across it, finds the single large offset, and shifts the WHOLE track by
+// it. The fine pass then polishes the residual. Low resolution keeps even a
+// full-recording search fast.
+const COARSE_SAMPLE_RATE = 2000;     // Hz of extracted PCM — low rate for speed
+const COARSE_WINDOW_SAMPLES = 200;   // → 10 Hz envelope
+const COARSE_ENVELOPE_RATE = COARSE_SAMPLE_RATE / COARSE_WINDOW_SAMPLES;
+const COARSE_TARGET_MAX_SEC = 120;   // analyze up to this much of the matched clip
+const COARSE_REF_MAX_SEC = 3 * 3600; // cap reference extraction (memory/time)
+const COARSE_MIN_OVERLAP_SEC = 8;    // need at least this much target inside the ref
+const COARSE_MIN_SCORE = 0.3;        // confidence required to shift a whole track
+const COARSE_MIN_APPLY_SEC = 0.25;   // below this, leave it to the fine pass
+
+function trackKeyOf(anchor) {
+    return `${anchor.trackType}_${anchor.trackIndex}`;
+}
+
+function longestAnchor(list) {
     let best = null;
-
-    for (let lag = -maxLagFrames; lag <= maxLagFrames; lag += 1) {
-        const refStart = lag < 0 ? -lag : 0;
-        const targetStart = lag > 0 ? lag : 0;
-        const overlap = Math.min(refEnvelope.length - refStart, targetEnvelope.length - targetStart);
-        if (overlap < minOverlapFrames) continue;
-
-        let refSum = 0;
-        let targetSum = 0;
-        for (let i = 0; i < overlap; i += 1) {
-            refSum += refEnvelope[refStart + i];
-            targetSum += targetEnvelope[targetStart + i];
-        }
-
-        const refMean = refSum / overlap;
-        const targetMean = targetSum / overlap;
-        let dot = 0;
-        let refEnergy = 0;
-        let targetEnergy = 0;
-
-        for (let i = 0; i < overlap; i += 1) {
-            const rv = refEnvelope[refStart + i] - refMean;
-            const tv = targetEnvelope[targetStart + i] - targetMean;
-            dot += rv * tv;
-            refEnergy += rv * rv;
-            targetEnergy += tv * tv;
-        }
-
-        if (!refEnergy || !targetEnergy) continue;
-        const score = dot / Math.sqrt(refEnergy * targetEnergy);
-        if (!best || score > best.score) {
-            best = {
-                score,
-                lagSec: lag / ENVELOPE_RATE,
-                overlapSec: overlap / ENVELOPE_RATE
-            };
-        }
+    let bestDur = -1;
+    for (const a of list) {
+        const dur = a.resolvedEndSec - a.resolvedStartSec;
+        if (dur > bestDur) { bestDur = dur; best = a; }
     }
-
     return best;
 }
 
-function buildFineTuneAnchors(clips) {
-    const byKey = new Map();
+// Shift whole tracks by one large offset found from a single representative clip.
+// Mutates each anchor's resolvedStart/End so the fine pass sees aligned positions,
+// and returns a per-anchor-key map of the coarse delta applied.
+async function analyzeCoarseAlign(anchors, onProgress) {
+    const deltaByKey = new Map();
+    const notes = [];
+    if (anchors.length < 2) return { deltaByKey, notes };
 
-    for (const clip of clips) {
-        if (!clip.filePath || !clip.startTicks) continue;
-        const key = `${clip.filePath}|${clip.startTicks}`;
+    const baseLayer = anchors[0].layerOrder;
 
-        if (!byKey.has(key)) {
-            byKey.set(key, {
-                key,
-                filePath: clip.filePath,
-                startTicks: clip.startTicks,
-                clipName: clip.clipName,
-                trackType: clip.trackType,
-                trackIndex: clip.trackIndex,
-                // Audio-only clips (e.g. field-recorder WAV on Audio Track 1,
-                // trackIndex 0) get layerOrder = trackIndex (0, 1, …).
-                // Video clips get layerOrder = trackIndex + 1 (1, 2, …).
-                // This ensures Audio Track 1 is treated as the reference base
-                // and each video clip is individually aligned to it, rather
-                // than the WAV being shifted once to best-fit all video clips.
-                layerOrder: clip.trackType === "video" ? clip.trackIndex + 1 : clip.trackIndex,
-                startSec: clip.startSec,
-                endSec: clip.endSec,
-                inPointSec: clip.inPointSec,
-                resolvedStartSec: clip.startSec,
-                resolvedEndSec: clip.endSec
-            });
+    // Group non-base anchors by their real track identity (not layerOrder, which
+    // can collide between a video track and an audio-only track).
+    const trackGroups = new Map();
+    for (const anchor of anchors) {
+        if (anchor.layerOrder === baseLayer) continue;
+        const key = trackKeyOf(anchor);
+        if (!trackGroups.has(key)) trackGroups.set(key, []);
+        trackGroups.get(key).push(anchor);
+    }
+
+    notes.push(`Coarse align: matching one clip per track against the longest lower-layer recording at ${COARSE_ENVELOPE_RATE}Hz — finds large whole-track offsets that the fine pass can't reach.`);
+
+    const envOpts = { sampleRate: COARSE_SAMPLE_RATE, windowSamples: COARSE_WINDOW_SAMPLES };
+
+    let done = 0;
+    for (const [, group] of trackGroups) {
+        done += 1;
+        const trackLabel = `${group[0].trackType} track ${group[0].trackIndex + 1}`;
+        const targetLayer = group[0].layerOrder;
+
+        // Reference = longest recording on any lower layer (the continuous
+        // program/board recording in a typical multicam setup).
+        const reference = longestAnchor(anchors.filter(a => a.layerOrder < targetLayer));
+        // Representative target = longest clip on this track (most audio to match).
+        const target = longestAnchor(group);
+
+        if (onProgress) onProgress(done, trackGroups.size);
+
+        if (!reference || !target) {
+            log(`Coarse align: ${trackLabel} — no reference recording, leaving to fine pass.`);
             continue;
         }
 
-        const existing = byKey.get(key);
-        if (clip.trackType === "video" && existing.trackType !== "video") {
-            existing.clipName = clip.clipName;
-            existing.trackType = clip.trackType;
-            existing.trackIndex = clip.trackIndex;
-            existing.layerOrder = clip.trackIndex + 1;
-            existing.startSec = clip.startSec;
-            existing.endSec = clip.endSec;
-            existing.inPointSec = clip.inPointSec;
-            existing.resolvedStartSec = clip.startSec;
-            existing.resolvedEndSec = clip.endSec;
+        const refDuration = Math.min(reference.resolvedEndSec - reference.resolvedStartSec, COARSE_REF_MAX_SEC);
+        const tgtDuration = Math.min(target.resolvedEndSec - target.resolvedStartSec, COARSE_TARGET_MAX_SEC);
+        if (tgtDuration < COARSE_MIN_OVERLAP_SEC || refDuration < COARSE_MIN_OVERLAP_SEC) {
+            log(`Coarse align: ${trackLabel} — clips too short to match, leaving to fine pass.`);
+            continue;
         }
+
+        let lag;
+        try {
+            const [refEnvelope, targetEnvelope] = await Promise.all([
+                getEnvelope(reference.filePath, reference.inPointSec, refDuration, envOpts),
+                getEnvelope(target.filePath, target.inPointSec, tgtDuration, envOpts)
+            ]);
+            lag = slideMatch(refEnvelope, targetEnvelope, {
+                envelopeRate: COARSE_ENVELOPE_RATE,
+                minOverlapSec: COARSE_MIN_OVERLAP_SEC
+            });
+        } catch (e) {
+            log(`Coarse align: ${target.clipName} — ${e.message}; leaving to fine pass.`, "warn");
+            continue;
+        }
+
+        if (!lag || lag.score < COARSE_MIN_SCORE) {
+            log(`Coarse align: ${trackLabel} — no confident match for ${target.clipName} (best score ${lag ? lag.score.toFixed(2) : "n/a"}), leaving to fine pass.`, "warn");
+            continue;
+        }
+
+        // The target's first analyzed frame (its in-point) should sit on the
+        // timeline at reference.resolvedStart + lagSec. Shift the whole track.
+        const desiredTargetStart = reference.resolvedStartSec + lag.lagSec;
+        const coarseDelta = Math.round((desiredTargetStart - target.resolvedStartSec) * 1000) / 1000;
+
+        if (Math.abs(coarseDelta) < COARSE_MIN_APPLY_SEC) {
+            log(`Coarse align: ${trackLabel} already aligned (match score ${lag.score.toFixed(2)}).`);
+            continue;
+        }
+
+        for (const anchor of group) {
+            anchor.resolvedStartSec += coarseDelta;
+            anchor.resolvedEndSec += coarseDelta;
+            deltaByKey.set(anchor.key, (deltaByKey.get(anchor.key) || 0) + coarseDelta);
+        }
+        log(`Coarse align: ${trackLabel} shifted ${formatSignedSeconds(coarseDelta)} to match ${target.clipName} against ${reference.clipName} (score ${lag.score.toFixed(2)}).`, "success");
     }
 
-    return Array.from(byKey.values()).sort((a, b) => {
-        if (a.layerOrder !== b.layerOrder) return a.layerOrder - b.layerOrder;
-        if (a.startSec !== b.startSec) return a.startSec - b.startSec;
-        return a.clipName.localeCompare(b.clipName);
-    });
-}
-
-function describeAnchor(anchor) {
-    return `${anchor.clipName} [${anchor.trackType.toUpperCase()} ${anchor.trackIndex + 1}, t=${anchor.startSec.toFixed(2)}s, startTicks=${anchor.startTicks}]`;
-}
-
-function formatRange(startSec, durationSec) {
-    const endSec = startSec + durationSec;
-    return `${startSec.toFixed(2)}s-${endSec.toFixed(2)}s (${durationSec.toFixed(2)}s)`;
-}
-
-function buildCompareWindow(reference, target) {
-    const compareStart = Math.max(reference.resolvedStartSec, target.resolvedStartSec);
-    const compareEnd = Math.min(reference.resolvedEndSec, target.resolvedEndSec);
-    const overlap = compareEnd - compareStart;
-    if (overlap < FINE_TUNE_MIN_OVERLAP_SEC) return null;
-
-    const compareDuration = Math.min(overlap, FINE_TUNE_MAX_COMPARE_SEC);
-    const slack = overlap - compareDuration;
-    const windows = [];
-    const seenStarts = new Set();
-
-    for (const position of FINE_TUNE_WINDOW_POSITIONS) {
-        const start = compareStart + (slack * position);
-        const roundedStart = Number(start.toFixed(3));
-        if (seenStarts.has(roundedStart)) continue;
-        seenStarts.add(roundedStart);
-
-        windows.push({
-            compareStartSec: start,
-            compareDurationSec: compareDuration,
-            compareEndSec: start + compareDuration,
-            refSourceOffsetSec: reference.inPointSec + (start - reference.resolvedStartSec),
-            targetSourceOffsetSec: target.inPointSec + (start - target.resolvedStartSec)
-        });
-    }
-
-    return {
-        overlapSec: overlap,
-        compareDurationSec: compareDuration,
-        windows
-    };
+    return { deltaByKey, notes };
 }
 
 async function comparePair(reference, target) {
@@ -549,14 +583,20 @@ async function refreshSequence() {
         if (!fs) throw new Error("Node.js not available. Ensure --enable-nodejs and --mixed-context are set in manifest.");
 
         const enriched = [];
+        const sourceCounts = {};
         for (const clip of clips) {
             try {
-                const stats = fs.statSync(clip.filePath);
-                const mtimeMs = stats.mtimeMs;
-                const durationSec = clip.durationTicks / 254016000000;
-                const recordStartMs = mtimeMs - (durationSec * 1000);
-                enriched.push({ ...clip, mtimeMs, recordStartMs, durationSec });
-                log(`✓ ${path.basename(clip.filePath)} — modified ${formatDate(mtimeMs)}, duration ${formatDuration(durationSec * 1000)}, est. start ${formatTime(recordStartMs)}`);
+                const r = await resolveRecordStart(clip);
+                enriched.push({
+                    ...clip,
+                    mtimeMs: r.mtimeMs,
+                    recordStartMs: r.recordStartMs,
+                    durationSec: r.durationSec,
+                    timingSource: r.timingSource
+                });
+                sourceCounts[r.timingSource] = (sourceCounts[r.timingSource] || 0) + 1;
+                const srcLabel = r.timingSource === "creation_time" ? "embedded metadata" : "file mtime";
+                log(`✓ ${path.basename(clip.filePath)} — start ${formatTime(r.recordStartMs)} via ${srcLabel}, duration ${formatDuration(r.durationSec * 1000)}`);
             } catch (e) {
                 log(`⚠ Could not read "${clip.filePath}": ${e.message}`, "warn");
             }
@@ -564,45 +604,46 @@ async function refreshSequence() {
 
         if (!enriched.length) throw new Error("Could not read timestamps for any clips.");
 
-        // Per-track earliest (each track independently starts at t=0)
-        const perTrackEarliest = new Map();
+        // Mixed timing sources have different semantics (embedded record-start vs.
+        // mtime-derived), so clips from different sources may not agree on the
+        // absolute clock. Warn; Fine Tune Audio can correct the residual drift.
+        const usedSources = Object.keys(sourceCounts);
+        if (usedSources.length > 1) {
+            const breakdown = usedSources.map(s => `${s}: ${sourceCounts[s]}`).join(", ");
+            log(`⚠ Mixed timing sources (${breakdown}). Alignment across these clips may be off; use Fine Tune Audio to correct residual drift.`, "warn");
+        }
+
+        // Global earliest recording — every clip is placed relative to this one
+        // shared wall-clock anchor (matches the Build logic).
+        let globalEarliestMs = Infinity;
         for (const clip of enriched) {
-            const key = `${clip.trackType}_${clip.trackIndex}`;
-            const cur = perTrackEarliest.get(key);
-            if (cur === undefined || clip.recordStartMs < cur) {
-                perTrackEarliest.set(key, clip.recordStartMs);
-            }
+            if (clip.recordStartMs < globalEarliestMs) globalEarliestMs = clip.recordStartMs;
         }
 
         setProgress(80);
 
-        // 4. Populate clip table (offset shown relative to that clip's own track)
+        // 4. Populate clip table (offset shown relative to the global earliest)
         clipBody.innerHTML = "";
         enriched.forEach(clip => {
-            const trackKey = `${clip.trackType}_${clip.trackIndex}`;
-            const offsetMs = clip.recordStartMs - perTrackEarliest.get(trackKey);
+            const offsetMs = clip.recordStartMs - globalEarliestMs;
             const tr = document.createElement("tr");
+            const srcTag = clip.timingSource === "creation_time" ? "meta" : "mtime";
             tr.innerHTML = `
                 <td class="cell-name" title="${clip.filePath}">${path.basename(clip.filePath)}</td>
                 <td class="cell-type ${clip.trackType}">${clip.trackType === "video" ? "🎬" : "🎵"} ${clip.trackType}</td>
-                <td class="cell-time">${formatTime(clip.recordStartMs)}</td>
+                <td class="cell-time" title="timing source: ${clip.timingSource}">${formatTime(clip.recordStartMs)} <span class="cell-src">${srcTag}</span></td>
                 <td class="cell-offset">${formatDuration(offsetMs)}</td>
             `;
             clipBody.appendChild(tr);
         });
         clipTable.style.display = "table";
 
-        // 5. 24-hour span guard
-        let hasSpanViolation = false;
-        for (const [key, anchorMs] of perTrackEarliest) {
-            const trackClips = enriched.filter(c => `${c.trackType}_${c.trackIndex}` === key);
-            const maxEndMs = Math.max(...trackClips.map(c => c.recordStartMs + c.durationSec * 1000));
-            const spanSec = (maxEndMs - anchorMs) / 1000;
-            if (spanSec > 86400) {
-                const label = key.replace("_", " track ");
-                log(`\u26a0 ${label} spans ${(spanSec / 3600).toFixed(1)}h \u2014 exceeds Premiere\u2019s 24-hour maximum.`, "warn");
-                hasSpanViolation = true;
-            }
+        // 5. 24-hour span guard (whole sequence runs from the global earliest)
+        const maxEndMs = Math.max(...enriched.map(c => c.recordStartMs + c.durationSec * 1000));
+        const spanSec = (maxEndMs - globalEarliestMs) / 1000;
+        const hasSpanViolation = spanSec > MAX_SPAN_SEC;
+        if (hasSpanViolation) {
+            log(`\u26a0 Sequence spans ${(spanSec / 3600).toFixed(1)}h \u2014 exceeds Premiere\u2019s 24-hour maximum.`, "warn");
         }
 
         clipPayload = enriched;
@@ -611,22 +652,25 @@ async function refreshSequence() {
         setTimeout(() => setProgress(0, false), 600);
 
         if (hasSpanViolation) {
-            log("Build Sync Sequence is disabled \u2014 each track must fit within 24 hours. Process one recording day at a time.", "error");
+            log("Build Sync Sequence is disabled \u2014 the sequence must fit within 24 hours. Process one recording day at a time.", "error");
         } else {
             btnSync.disabled = false;
             log(`Ready. Click \"Build Sync Sequence\" to create ${info.name}-SYNC.`, "success");
         }
 
+        return !hasSpanViolation;
+
     } catch (e) {
         seqInfo.textContent = "Error reading sequence.";
         log(`✗ ${e.message}`, "error");
         setProgress(0, false);
+        return false;
     }
 }
 
 // ─── Build sync sequence ──────────────────────────────────────────────────────
 async function buildSync() {
-    if (!clipPayload) return;
+    if (!clipPayload) return false;
 
     btnSync.disabled = true;
     btnRefresh.disabled = true;
@@ -661,10 +705,12 @@ async function buildSync() {
 
         // Refresh UI state so ACTIVE SEQUENCE reflects the newly opened sequence.
         await refreshSequence();
+        return true;
 
     } catch (e) {
         log(`✗ ${e.message}`, "error");
         setProgress(0, false);
+        return false;
     } finally {
         btnSync.disabled = false;
         btnRefresh.disabled = false;
@@ -680,6 +726,11 @@ async function fineTuneAudio() {
     setProgress(5);
     log("Fine tune: analyzing waveform overlaps…");
 
+    // Envelopes are cached per (file, offset, duration) within a run; clear at
+    // the start of each run so the cache cannot grow for the panel's lifetime
+    // and so a re-run re-reads files that may have changed on disk.
+    envelopeCache.clear();
+
     try {
         ensureFfmpeg();
 
@@ -692,26 +743,57 @@ async function fineTuneAudio() {
             throw new Error("Need at least two clips with accessible audio for fine tune.");
         }
 
-        log(`Fine tune: evaluating ${anchors.length} clips layer-by-layer.`);
+        const refAnchor = anchors.find(a => a.isReference);
+        if (refAnchor) {
+            const refCount = anchors.filter(a => a.isReference).length;
+            log(`Reference track: ${refAnchor.trackType.toUpperCase()} ${refAnchor.trackIndex + 1} — longest coverage (${refCount} clip${refCount !== 1 ? "s" : ""}). All other tracks align to it.`);
+        }
+
+        log(`Fine tune: evaluating ${anchors.length} clips.`);
         setProgress(10);
 
-        const analysis = await analyzeFineTune(anchors, (done, total) => {
-            setProgress(10 + Math.round((done / total) * 75));
+        // Phase 1 — coarse auto-align: shift whole tracks into the fine pass's
+        // ±5 s range (removes the old manual drag step). It mutates the anchors'
+        // resolved positions so Phase 2 sees the pre-aligned layout.
+        const coarse = await analyzeCoarseAlign(anchors, (done, total) => {
+            setProgress(10 + Math.round((done / total) * 25));
         });
-        analysis.notes.forEach(msg => log(msg));
+        coarse.notes.forEach(msg => log(msg));
 
-        if (!analysis.adjustments.length) {
+        // Phase 2 — fine residual via per-clip waveform correlation.
+        const fine = await analyzeFineTune(anchors, (done, total) => {
+            setProgress(35 + Math.round((done / total) * 50));
+        });
+        fine.notes.forEach(msg => log(msg));
+
+        // Merge coarse + fine deltas per clip so each clip moves exactly once.
+        const totalByKey = new Map();
+        for (const [key, d] of coarse.deltaByKey) {
+            totalByKey.set(key, (totalByKey.get(key) || 0) + d);
+        }
+        for (const adj of fine.adjustments) {
+            const key = `${adj.filePath}|${adj.startTicks}`;
+            totalByKey.set(key, (totalByKey.get(key) || 0) + adj.deltaSec);
+        }
+
+        const anchorByKey = new Map(anchors.map(a => [a.key, a]));
+        const adjustments = [];
+        for (const [key, total] of totalByKey) {
+            const rounded = Math.round(total * 1000) / 1000;
+            if (Math.abs(rounded) < FINE_TUNE_MIN_APPLY_SEC) continue;
+            const anchor = anchorByKey.get(key);
+            if (!anchor) continue;
+            adjustments.push({ filePath: anchor.filePath, startTicks: anchor.startTicks, deltaSec: rounded });
+        }
+
+        if (!adjustments.length) {
             setProgress(100);
             setTimeout(() => setProgress(0, false), 600);
             log("Fine tune: no shifts needed.", "success");
             return;
         }
 
-        const payloadJSON = JSON.stringify(analysis.adjustments.map(adj => ({
-            filePath: adj.filePath,
-            startTicks: adj.startTicks,
-            deltaSec: adj.deltaSec
-        })));
+        const payloadJSON = JSON.stringify(adjustments);
 
         await evalScript(`$.fineTunePayload = ${JSON.stringify(payloadJSON)};`);
         setProgress(90);
@@ -730,7 +812,7 @@ async function fineTuneAudio() {
 
         setProgress(100);
         setTimeout(() => setProgress(0, false), 800);
-        log(`Fine tune complete: adjusted ${analysis.adjustments.length} clips.`, "success");
+        log(`Fine tune complete: adjusted ${adjustments.length} clips.`, "success");
 
     } catch (e) {
         log(`✗ ${e.message}`, "error");
@@ -742,7 +824,38 @@ async function fineTuneAudio() {
     }
 }
 
+// ─── Auto Sync: Scan → Build → Fine Tune in one click ─────────────────────────
+// Hands-off path. Run it on the ORIGINAL sequence (not an already-built -SYNC):
+// it scans the active sequence, builds the -SYNC clone (which becomes active),
+// then fine tunes that. Stops early with a clear message if a step can't proceed.
+async function autoSync() {
+    btnAuto.disabled = true;
+    log("Auto Sync: starting (scan → build → fine tune)…");
+
+    try {
+        const ready = await refreshSequence();
+        if (!ready) {
+            log("Auto Sync stopped: the sequence is not ready to build (see above).", "warn");
+            return;
+        }
+
+        const built = await buildSync();
+        if (!built) {
+            log("Auto Sync stopped: building the sync sequence failed (see above).", "warn");
+            return;
+        }
+
+        await fineTuneAudio();
+        log("Auto Sync complete.", "success");
+    } catch (e) {
+        log(`✗ Auto Sync: ${e.message}`, "error");
+    } finally {
+        btnAuto.disabled = false;
+    }
+}
+
 // ─── Button click handlers ───────────────────────────────────────────────────
+btnAuto.addEventListener("click", autoSync);
 btnRefresh.addEventListener("click", refreshSequence);
 btnSync.addEventListener("click", buildSync);
 btnFineTune.addEventListener("click", fineTuneAudio);

@@ -26,3 +26,9 @@ yarn-error.log*
 *.tar
 *.gz
 *.rar
+
+# ZXP packaging output and signing certificates (never commit private keys)
+dist/
+certs/
+*.p12
+*.zxp

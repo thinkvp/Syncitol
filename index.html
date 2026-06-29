@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8"/>
     <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
-    <title>DateModSync</title>
+    <title>Syncitol</title>
     <link rel="stylesheet" href="css/style.css"/>
 </head>
 <body>
@@ -12,8 +12,8 @@
     <div class="header">
         <div class="header-icon">📅</div>
         <div class="header-text">
-            <div class="header-title">DateModSync</div>
-            <div class="header-sub">Modification date–based clip sync for Premiere Pro</div>
+            <div class="header-title">Syncitol</div>
+            <div class="header-sub">Automatic recording-time sync for Premiere Pro</div>
         </div>
         <button id="btn-instructions" class="btn-header-icon" title="Instructions">?</button>
     </div>
@@ -29,9 +29,13 @@
 
         <!-- Action buttons -->
         <div class="btn-row">
+            <button id="btn-auto" class="btn-primary">⚡ Auto Sync</button>
+        </div>
+        <div class="card-label">Manual steps</div>
+        <div class="btn-row">
             <button id="btn-refresh" class="btn-secondary">↺ Scan Sequence</button>
-            <button id="btn-sync"    class="btn-primary"    disabled>⏱ Build Sync Sequence</button>
-            <button id="btn-fine-tune"   class="btn-secondary" disabled>≈ Fine Tune Audio</button>
+            <button id="btn-sync"    class="btn-secondary" disabled>⏱ Build Sync</button>
+            <button id="btn-fine-tune"   class="btn-secondary" disabled>≈ Fine Tune</button>
         </div>
 
         <!-- Clip preview table -->
@@ -63,15 +67,20 @@
     <!-- Instructions panel -->
     <div id="instructions-panel" class="instructions-panel" hidden>
         <div class="instructions-header">
-            <span class="instructions-title">How to use DateModSync</span>
+            <span class="instructions-title">How to use Syncitol</span>
             <button id="btn-instructions-close" class="btn-header-icon" title="Close">✕</button>
         </div>
         <div class="instructions-body">
 
             <div class="ins-section">
                 <div class="ins-heading">How it works</div>
-                <p class="ins-text">DateModSync reads each clip's <strong>file modification date</strong> to determine when recording finished. Subtracting the clip's duration gives the approximate record-start time. Every clip is then placed on a new timeline so the gaps between recordings match real clock time.</p>
-                <p class="ins-text ins-note">Tip: preserve file dates when copying media — if the OS updates <code>mtime</code> on copy the sync will be off.</p>
+                <p class="ins-text">Syncitol resolves each clip's <strong>record-start time</strong> from the best available source. When <code>ffprobe</code> is installed it reads the media's embedded <strong>creation_time</strong> (the real recording start). Otherwise it falls back to the <strong>file modification date</strong> minus the clip's duration. Every clip is then placed on a new timeline so the gaps between recordings match real clock time.</p>
+                <p class="ins-text ins-note">The Detected Clips table tags each row <code>meta</code> (embedded metadata) or <code>mtime</code> (file date). On the <code>mtime</code> fallback, preserve file dates when copying media — if the OS updates <code>mtime</code> on copy the sync will be off.</p>
+            </div>
+
+            <div class="ins-section">
+                <div class="ins-heading">⚡ Auto Sync</div>
+                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>Scan → Build Sync → Fine Tune</strong>. Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code>), then click Auto Sync. It stops with a clear message if a step can't proceed. The Manual steps below run the same stages individually if you want to inspect between them.</p>
             </div>
 
             <div class="ins-section">
@@ -87,11 +96,12 @@
 
             <div class="ins-section">
                 <div class="ins-heading">≈ Fine Tune Audio</div>
-                <p class="ins-text">Refines the rough mtime sync using audio waveform cross-correlation via <strong>ffmpeg</strong>. Just click the button — no configuration needed.</p>
-                <p class="ins-text">Each non-base track is compared against the tracks below it to find the best sub-second shift. Only corrections larger than <code>20&nbsp;ms</code> are applied.</p>
+                <p class="ins-text">Aligns tracks using audio waveform cross-correlation via <strong>ffmpeg</strong>. Just click the button — no configuration and no manual pre-alignment needed.</p>
+                <p class="ins-text">It auto-picks a <strong>reference track</strong> (the one with the most recorded coverage — your main camera or program recording, on any track) and aligns everything else to it. Then it runs two phases: a <strong>coarse</strong> whole-track match that handles large clock offsets, and a <strong>fine</strong> per-clip pass. Only net corrections larger than <code>20&nbsp;ms</code> are applied.</p>
                 <div class="ins-subheading">How it works</div>
                 <div class="ins-range-table">
-                    <div class="ins-range-row"><span class="ins-tag">±5s</span><span>Maximum lag searched from current position</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">Coarse</span><span>Matches one clip per track against the full reference — handles large (minute-scale) offsets</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">±5s</span><span>Fine pass: per-clip polish from the coarse-aligned position</span></div>
                     <div class="ins-range-row"><span class="ins-tag">20s</span><span>Max audio compared per pair (needs ≥3s overlap)</span></div>
                     <div class="ins-range-row"><span class="ins-tag">3×</span><span>Samples overlap at 50%, 20% and 80% through the window</span></div>
                     <div class="ins-range-row"><span class="ins-tag">Fast</span><span>Skips extra windows when centred score ≥0.70</span></div>
@@ -114,12 +124,14 @@
 
     <!-- Footer -->
     <div class="footer">
-        <span>DateModSync v1.0</span>
+        <span>Syncitol v1.1</span>
         <span>Premiere Pro 24 – 26+</span>
     </div>
 
     <!-- CEP CSInterface -->
     <script src="js/CSInterface.js"></script>
+    <!-- Pure DSP/format core (publishes globals consumed by main.js) -->
+    <script src="js/dsp.js"></script>
     <script src="js/main.js"></script>
 </body>
 </html>

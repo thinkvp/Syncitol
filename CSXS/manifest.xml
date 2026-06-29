@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<ExtensionManifest Version="7.0" ExtensionBundleId="com.datemodsync.panel" ExtensionBundleVersion="1.0.0" ExtensionBundleName="DateModSync">
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.syncitol.panel" ExtensionBundleVersion="1.1.0" ExtensionBundleName="Syncitol">
   <ExtensionList>
-    <Extension Id="com.datemodsync.panel.main" Version="1.0.0"/>
+    <Extension Id="com.syncitol.panel.main" Version="1.1.0"/>
   </ExtensionList>
   <ExecutionEnvironment>
     <HostList>
@@ -16,7 +16,7 @@
     </RequiredRuntimeList>
   </ExecutionEnvironment>
   <DispatchInfoList>
-    <Extension Id="com.datemodsync.panel.main">
+    <Extension Id="com.syncitol.panel.main">
       <DispatchInfo>
         <Resources>
           <MainPath>./index.html</MainPath>
@@ -30,7 +30,7 @@
         </Lifecycle>
         <UI>
           <Type>Panel</Type>
-          <Menu>DateModSync</Menu>
+          <Menu>Syncitol</Menu>
           <Geometry>
             <Size>
               <Height>560</Height>

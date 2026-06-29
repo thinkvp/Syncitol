@@ -1,24 +1,43 @@
-# DateModSync — Premiere Pro CEP Extension
+# Syncitol — Premiere Pro CEP Extension
 
-Syncs video/audio clips onto a new timeline based on their **file modification date** (`mtime`), reconstructing real-world recording gaps without timecode or metadata.
+[![CI](https://github.com/thinkvp/Syncitol/actions/workflows/ci.yml/badge.svg)](https://github.com/thinkvp/Syncitol/actions/workflows/ci.yml)
+
+Rebuilds real-world recording timing on a new Premiere Pro timeline from each clip's **embedded recording time** (`creation_time`, falling back to file modification date), then refines the sync with **audio waveform matching** — no timecode, genlock, or slate required.
 
 Tested against **Adobe Premiere Pro 24, 25, and 26**.
 
+- **Repository:** <https://github.com/thinkvp/Syncitol>
+- **Download:** grab the latest signed `.zxp` from the [Releases](https://github.com/thinkvp/Syncitol/releases) page, then see [Installation](#installation).
+
 ---
 
-![DateModSync panel screenshot](docs/screenshots/screenshot.jpg)
+![Syncitol panel screenshot](docs/screenshots/screenshot.jpg)
+
+> _Note: the screenshot above may show an earlier UI; the current panel leads with a one-click **⚡ Auto Sync** button._
 
 ---
 
 ## How it works
 
-| Step | Detail |
-|------|--------|
-| 1 | `date modified` of a clip file ≈ when that recording **finished** |
-| 2 | `date modified − clip duration` = when the camera hit **Record** |
-| 3 | DateModSync repeats this for every clip, then places them on a new sequence so the gaps between clips match real clock time |
+Syncitol needs each clip's **record-start time**. It resolves that per clip
+from the best available source:
 
-> **Important:** preserve file dates when copying media. If the OS updates `mtime` on copy (e.g. some cloud sync tools do this), the estimated record-start time will be wrong.
+| Priority | Source | Detail |
+|----------|--------|--------|
+| 1 (preferred) | **Embedded `creation_time`** | Read via `ffprobe` from the media's metadata — the actual recording start. Accurate and survives copying. |
+| 2 (fallback) | **File `mtime`** | `date modified ≈ when recording finished`, so `mtime − clip duration ≈ record start`. Used when `ffprobe` is unavailable or the file has no `creation_time` tag. |
+
+Every clip is then placed on a new sequence so the gaps between recordings match
+real clock time. The **Detected Clips** table tags each row with the source used
+(`meta` = embedded metadata, `mtime` = file date).
+
+> **Note:** when relying on the `mtime` fallback, preserve file dates while
+> copying media — if the OS rewrites `mtime` on copy (some cloud sync tools do),
+> the estimated record-start time will be wrong. Clips carrying embedded
+> `creation_time` are unaffected.
+>
+> If a project mixes both sources, the panel warns you: the two have different
+> semantics, so run **Fine Tune Audio** afterwards to correct residual drift.
 
 ---
 
@@ -29,12 +48,25 @@ Tested against **Adobe Premiere Pro 24, 25, and 26**.
 | **Premiere Pro** | 24 (2024), 25 (2025), 26 (2026) and later |
 | **CEP runtime** | CSXS 11.0+ |
 | **Node.js bridge** | CEP `--enable-nodejs` flag (already set in manifest) |
-| **ffmpeg** | Required for **Fine Tune Audio** only — must be on system PATH |
+| **ffmpeg / ffprobe** | `ffmpeg` is required for **Fine Tune Audio**; `ffprobe` (ships with ffmpeg) enables the embedded `creation_time` timing source. Both must be on the system PATH. Optional — the plugin falls back to `mtime` without them. |
 | **OS** | macOS or Windows |
 
 ---
 
 ## Installation
+
+### Option A — Signed ZXP (recommended)
+
+1. Download `Syncitol-<version>.zxp` from the [Releases](https://github.com/thinkvp/Syncitol/releases) page (or build it yourself with `npm run build:zxp`, see [Development](#development)).
+2. Install it with a free extension manager such as [Anastasiy's Extension Manager](https://install.anastasiy.com/) or [ZXPInstaller](https://zxpinstaller.com/).
+3. Launch Premiere Pro → **Window → Extensions → Syncitol**.
+
+This needs no `PlayerDebugMode`. The release ZXP is **self-signed**, so the
+extension manager may note an unverified publisher — that is expected.
+
+### Option B — Manual / developer install
+
+Use this for development or if you prefer not to use an extension manager.
 
 ### Step 1 — Enable unsigned CEP extensions (one-time)
 
@@ -54,48 +86,61 @@ reg add HKEY_CURRENT_USER\Software\Adobe\CSXS.11 /v PlayerDebugMode /t REG_STRIN
 
 ### Step 2 — Copy the extension folder
 
-Place the `DateModSync` folder into your CEP extensions directory:
+Place the `Syncitol` folder into your CEP extensions directory:
 
 | Platform | Path |
 |----------|------|
 | macOS    | `~/Library/Application Support/Adobe/CEP/extensions/` |
 | Windows  | `%APPDATA%\Adobe\CEP\extensions\` |
 
-Result: `.../CEP/extensions/DateModSync/CSXS/manifest.xml`
+Result: `.../CEP/extensions/Syncitol/CSXS/manifest.xml`
 
 ### Step 3 — Launch Premiere Pro
 
-Go to **Window → Extensions → DateModSync**.
+Go to **Window → Extensions → Syncitol**.
 
 ---
 
 ## Usage
 
-### Basic sync
+### Auto Sync (hands-off)
+
+Make your **original** sequence the active one (double-click it in the Project
+panel — not an already-built `-SYNC`), then click **⚡ Auto Sync**. It runs the
+whole pipeline in one go — **Scan → Build Sync → Fine Tune** — and stops with a
+clear message if a step can't proceed. The Manual steps below do the same thing
+in stages if you want to inspect the result between each one.
+
+### Manual sync (step by step)
 
 1. Open your project and make the sequence you want to sync the **active sequence** (double-click it in the Project panel).
-2. In the DateModSync panel, click **↺ Scan Sequence**.  
-   The panel reads every clip in the sequence and looks up its `mtime` via Node.js `fs.statSync()`.
-3. Review the **Detected Clips** table — it shows each clip's file name, type, estimated record-start time, and offset from the earliest clip.
+2. In the Syncitol panel, click **↺ Scan Sequence**.  
+   The panel reads every clip in the sequence and resolves its record-start time (embedded `creation_time` when available, otherwise `mtime`).
+3. Review the **Detected Clips** table — it shows each clip's file name, type, estimated record-start time (tagged `meta`/`mtime`), and offset from the earliest clip.
 4. Click **⏱ Build Sync Sequence**.  
    A new sequence named `[original name]-SYNC` is created and opened. Clips are placed at their real-clock-time positions; gaps between recordings are preserved.
-5. **Manually align tracks** — after the sync sequence is built, use the Selection tool and drag all clips on each track so that they line up closely to the corresponding clip on the base track (make sure all clips on a track are moved together). Because `mtime` accuracy can vary by roughly **±1 second** per clip, this rough alignment only needs to be in the ballpark. Aim for less than 3 seconds, which should be easy to do either by the waveforms or visually. You only need to do this shift once for each track. Repeat process until all tracks are roughly aligned, then run **Fine Tune Audio** for precise micro-adjustments.
+5. Click **≈ Fine Tune Audio** to align the tracks precisely. As of v1.1 this is hands-free — a coarse auto-align pass pulls each track into range automatically, so the old manual track-dragging step is no longer required (see below).
 
 ### Fine Tune Audio
 
-Fine Tune refines the rough `mtime`-based sync using **audio waveform cross-correlation** via ffmpeg. Just click the button — there is no configuration needed. It runs automatically after the sync sequence has been built and tracks have been roughly aligned.
+Fine Tune aligns tracks using **audio waveform cross-correlation** via ffmpeg in two automatic phases — no configuration and no manual pre-alignment needed.
 
-1. Click **≈ Fine Tune Audio**.
-2. The plugin compares each non-base track against the tracks below it and calculates the best sub-second shift for each clip.
-3. Only shifts greater than **20 ms** are applied — smaller differences are considered already close enough.
+It first picks a **reference track** automatically: the track with the most total recorded coverage (typically your continuous main camera, program recording, or a field-recorder WAV). Every other track is aligned to it. This is chosen by content, **not** by track position — so it does not matter whether your main camera is on V1, V2, or an audio track.
 
-**How the algorithm works:**
+1. **Coarse auto-align (large offsets)** — for each non-reference track it matches **one** representative clip (the longest) against the **full** reference recording by sliding a low-resolution envelope across it, finds the single offset, and shifts the **whole track** by it. Because device clocks can differ by minutes, this searches the entire reference rather than a fixed window — exactly what the old manual track-drag did, automated.
+2. **Fine residual** — each non-reference clip is then compared per-clip against the reference track to find the best sub-second shift, bringing every clip to 100%.
 
-- Searches for the best lag within **±5 seconds** of the current position.
+Click **≈ Fine Tune Audio** once; both phases run in sequence. Only net shifts greater than **20 ms** are applied — smaller differences are considered already aligned.
+
+**How the fine phase works:**
+
+- Searches for the best lag within **±5 seconds** of the (coarse-aligned) position.
 - Extracts up to **20 seconds** of audio per comparison pair (needs at least **3 seconds** of overlap between clips).
 - Samples the overlap at three positions — centred (50%), early (20%), and late (80%) — to avoid locking onto an unrepresentative section.
 - If the centred window already produces a strong match (confidence ≥ 0.70), the remaining windows are skipped for speed.
-- Each non-base layer is compared against all lower layers; the highest-confidence pair determines the final shift.
+- Each non-reference clip is compared against the reference track; the highest-confidence overlap determines the final shift.
+
+> **Manual fallback:** for footage where a track has no usable overlapping audio (so coarse align can't lock), you can still drag that track roughly into place with the Selection tool before running Fine Tune.
 
 > **ffmpeg must be on PATH.** Install from [ffmpeg.org](https://ffmpeg.org/download.html) and confirm with `ffmpeg -version` in a terminal before using this feature.
 
@@ -105,10 +150,11 @@ Fine Tune refines the rough `mtime`-based sync using **audio waveform cross-corr
 
 | Consideration | Notes |
 |---------------|-------|
-| **Local files only** | `mtime` is read via `fs.statSync()`. Network drives or cloud-synced folders may not report reliable dates. |
-| **mtime accuracy** | Some copy tools (rsync without `--times`, cloud sync apps) reset `mtime`. Use tools that preserve file dates when transferring media. |
-| **~1s per-clip variance** | `mtime` resolution and filesystem timing mean each clip's calculated start time can be off by up to ~1 second. Tracks need a manual rough alignment after building; Fine Tune corrects the residual. |
-| **Camera clock drift** | The sync is relative. If two cameras have different system clocks, the relative gap is preserved as-is. Use Fine Tune to correct residual drift. |
+| **Local files only** | Timestamps are read from the local filesystem (`fs.statSync()`) and via `ffprobe`. Network drives or cloud-synced folders may not report reliable dates. |
+| **mtime fallback accuracy** | When falling back to `mtime`, some copy tools (rsync without `--times`, cloud sync apps) reset it. Use tools that preserve file dates, or rely on clips that carry embedded `creation_time`. |
+| **~1s fallback variance** | On the `mtime` fallback, filesystem timing means a clip's calculated start can be off by up to ~1 second; the coarse + fine Fine Tune passes correct the residual. Clips using embedded `creation_time` are more precise. |
+| **Undo granularity** | Premiere's ExtendScript exposes no undo-group API, so Build and Fine Tune each register several undo steps rather than one. Undo repeatedly, or delete the generated `-SYNC` sequence, to revert. |
+| **Camera clock drift** | If devices have different clocks, clips first land at their own absolute times; Fine Tune's coarse pass then corrects large whole-track offsets automatically (when the audio overlaps), and the fine pass polishes the residual. Devices whose audio shares no common sound can't be auto-aligned. |
 | **Linked audio** | The plugin processes video-track clips; linked audio follows via Premiere's clip model. Audio-only tracks are handled on dedicated audio tracks. |
 | **Sequence must be active** | Double-click the sequence in the Project panel before scanning — the panel operates on the sequence currently open in the timeline. |
 
@@ -117,15 +163,62 @@ Fine Tune refines the rough `mtime`-based sync using **audio waveform cross-corr
 ## File structure
 
 ```
-DateModSync/
+Syncitol/
 ├── CSXS/
 │   └── manifest.xml       # CEP extension definition (bundle ID, host versions)
 ├── jsx/
-│   └── sync.jsx           # ExtendScript: sequence read + build logic
+│   ├── sync.jsx           # ExtendScript: sequence read + build + apply shifts
+│   └── json2.js           # Guarded JSON polyfill (no-op on hosts with native JSON)
 ├── js/
 │   ├── CSInterface.js     # Adobe CEP bridge library
-│   └── main.js            # Panel logic: mtime lookup, UI, Fine Tune
+│   ├── dsp.js             # Pure DSP/format core (also unit-tested under Node)
+│   └── main.js            # Panel logic: timing lookup, UI, Fine Tune orchestration
 ├── css/
 │   └── style.css          # Panel styles
-└── index.html             # Panel HTML (includes Instructions view)
+├── fonts/                 # Bundled IBM Plex woff2 (SIL OFL, see fonts/LICENSE.txt)
+├── scripts/
+│   ├── set-version.js     # Single-source the version across files
+│   ├── check-syntax.js    # Zero-dependency syntax gate
+│   └── build-zxp.js       # Package a signed ZXP
+├── tests/
+│   └── dsp.test.js        # Unit tests for js/dsp.js
+├── .github/workflows/     # CI (lint/test) and tag-driven signed-ZXP releases
+├── index.html             # Panel HTML (includes Instructions view)
+├── package.json           # Tooling scripts + repo metadata
+└── LICENSE                # MIT (bundled fonts: SIL OFL, see fonts/LICENSE.txt)
 ```
+
+---
+
+## Development
+
+No build step is required to run the panel — it is loaded directly by Premiere.
+Tooling uses only Node's built-ins (no `npm install` needed for test/lint):
+
+```bash
+npm test                 # run unit tests (node --test) for js/dsp.js
+npm run lint             # syntax-check all scripts
+npm run set-version 1.2.0   # bump the version everywhere from one place
+npm run set-version:check   # CI guard: fail if versions drift
+npm run build:zxp        # package dist/Syncitol-<version>.zxp (needs ZXPSignCmd)
+```
+
+CI (`.github/workflows/ci.yml`) runs lint, tests and the version check on
+Node 20/22/24.
+
+### Releasing
+
+Distribution is tag-driven — no manual signing or uploading:
+
+```bash
+npm run set-version 1.2.0      # stamp VERSION + manifest + footer + package.json
+git commit -am "Release v1.2.0"
+git tag v1.2.0
+git push --follow-tags
+```
+
+`.github/workflows/release.yml` then fetches Adobe's `ZXPSignCmd`, builds and
+self-signs `Syncitol-1.2.0.zxp`, and publishes a GitHub Release with it
+attached. (It fails fast if the tag and `VERSION` disagree.) For a properly
+verified publisher instead of a self-signed certificate, sign locally with a
+real code-signing `.p12` and attach that ZXP to the release.

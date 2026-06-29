@@ -1,0 +1,31 @@
+{
+  "name": "syncitol",
+  "version": "1.1.0",
+  "description": "Modification-date / metadata-based clip sync for Adobe Premiere Pro (CEP extension).",
+  "private": true,
+  "homepage": "https://github.com/thinkvp/Syncitol#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thinkvp/Syncitol.git"
+  },
+  "bugs": {
+    "url": "https://github.com/thinkvp/Syncitol/issues"
+  },
+  "author": "thinkvp",
+  "keywords": [
+    "premiere-pro",
+    "cep-extension",
+    "multicam",
+    "audio-sync",
+    "ffmpeg",
+    "creation-time"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "lint": "node scripts/check-syntax.js",
+    "set-version": "node scripts/set-version.js",
+    "set-version:check": "node scripts/set-version.js --check",
+    "build:zxp": "node scripts/build-zxp.js"
+  },
+  "license": "MIT"
+}

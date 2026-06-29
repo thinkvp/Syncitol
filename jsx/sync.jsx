@@ -1,17 +1,27 @@
 /**
- * DateModSync — ExtendScript (sync.jsx)
+ * Syncitol — ExtendScript (sync.jsx)
  * Runs inside Premiere Pro's scripting engine.
  * Called from the CEP panel via CSInterface.evalScript()
  */
 
+// ─── Constants ──────────────────────────────────────────────────────────────
+// Premiere's internal timebase: ticks per second.
+var TICKS_PER_SECOND = 254016000000;
+// Premiere timelines cannot exceed 24 hours; a track spanning more is rejected.
+var MAX_SPAN_SEC = 86400;
+// Below this (seconds) a fine-tune move is treated as "already aligned".
+var MIN_MOVE_SEC = 0.0001;
+// Below this (seconds) a build placement delta is treated as "already placed".
+var MIN_PLACE_SEC = 0.0005;
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function ticksToSeconds(ticks) {
-    return ticks / 254016000000;
+    return ticks / TICKS_PER_SECOND;
 }
 
 function secondsToTicks(seconds) {
-    return seconds * 254016000000;
+    return seconds * TICKS_PER_SECOND;
 }
 
 function timeToSeconds(timeObj) {
@@ -27,6 +37,16 @@ function timeToSeconds(timeObj) {
 
 /** Return name and basic stats of the active sequence (for UI display) */
 function getActiveSequenceInfo() {
+    try {
+        return _getActiveSequenceInfoImpl();
+    } catch (e) {
+        return JSON.stringify({
+            error: "Failed to read active sequence info: " + e.message + " (line " + e.line + ")"
+        });
+    }
+}
+
+function _getActiveSequenceInfoImpl() {
     var seq = app.project.activeSequence;
     if (!seq) return JSON.stringify({ error: "No active sequence open." });
     var videoCount = 0, audioCount = 0;
@@ -51,6 +71,16 @@ function getActiveSequenceInfo() {
  * The panel's Node.js layer will stat() each file for mtime.
  */
 function getClipFileInfo() {
+    try {
+        return _getClipFileInfoImpl();
+    } catch (e) {
+        return JSON.stringify({
+            error: "Failed to read clip file info: " + e.message + " (line " + e.line + ")"
+        });
+    }
+}
+
+function _getClipFileInfoImpl() {
     var seq = app.project.activeSequence;
     if (!seq) return JSON.stringify({ error: "No active sequence." });
 
@@ -176,22 +206,6 @@ function _getFineTuneClipInfoImpl() {
     return JSON.stringify(result);
 }
 
-/** Recursively search bins for a project item by file path */
-function findProjectItemByPath(folder, targetPath) {
-    for (var i = 0; i < folder.children.numItems; i++) {
-        var child = folder.children[i];
-        if (child.type === ProjectItemType.BIN) {
-            var found = findProjectItemByPath(child, targetPath);
-            if (found) return found;
-        } else {
-            try {
-                if (child.getMediaPath() === targetPath) return child;
-            } catch (e) {}
-        }
-    }
-    return null;
-}
-
 /**
  * Apply fine-tune shifts to matching timeline clips.
  * adjustmentsJSON: [{ filePath, startTicks, deltaSec }]
@@ -270,7 +284,7 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
                     var delta = inMap ? adjustmentMap[key] : 0;
                     var totalDelta = delta + compensateSec;
 
-                    if (Math.abs(totalDelta) < 0.0001) continue;
+                    if (Math.abs(totalDelta) < MIN_MOVE_SEC) continue;
 
                     var deltaTime = new Time();
                     deltaTime.seconds = totalDelta;
@@ -340,8 +354,13 @@ function _buildSyncSequenceImpl(payloadJSON) {
     var enriched = [];
     for (var i = 0; i < payload.length; i++) {
         var p = payload[i];
-        var durationSec   = p.durationTicks / 254016000000;
-        var recordStartMs = p.mtimeMs - (durationSec * 1000);
+        var durationSec   = p.durationTicks / TICKS_PER_SECOND;
+        // The panel resolves record-start once (embedded creation_time when
+        // available, else mtime − duration) and sends it as recordStartMs.
+        // Fall back to recomputing from mtime for older/partial payloads.
+        var recordStartMs = (p.recordStartMs !== undefined && p.recordStartMs !== null)
+            ? p.recordStartMs
+            : (p.mtimeMs - (durationSec * 1000));
         enriched.push({
             filePath:      p.filePath,
             clipName:      p.clipName,
@@ -355,62 +374,29 @@ function _buildSyncSequenceImpl(payloadJSON) {
         });
     }
 
-    // ── 2. Per-track earliest: each track independently starts at t=0 ───────
-    // Video tracks and their linked audio are spaced relative to their own
-    // track's earliest clip.  Audio-only tracks (e.g. a field-recorder WAV
-    // with no video counterpart) are anchored to the global earliest
-    // recording start so they land at the correct wall-clock position on the
-    // same timeline as the video clips.  Fine Tune Audio then handles any
-    // remaining small (<5 s) discrepancy between tracks.
-    var videoTrackEarliest = {};
-    var fileToVideoTrackIdx = {};
-    for (var j = 0; j < enriched.length; j++) {
-        var ej = enriched[j];
-        if (ej.trackType === "video") {
-            var vtKey = "v" + ej.trackIndex;
-            if (!videoTrackEarliest.hasOwnProperty(vtKey) || ej.recordStartMs < videoTrackEarliest[vtKey]) {
-                videoTrackEarliest[vtKey] = ej.recordStartMs;
-            }
-            fileToVideoTrackIdx[ej.filePath] = ej.trackIndex;
-        }
-    }
-    var audioTrackEarliest = {};
-    for (var j2 = 0; j2 < enriched.length; j2++) {
-        var ej2 = enriched[j2];
-        if (ej2.trackType === "audio") {
-            var atKey = "a" + ej2.trackIndex;
-            if (!audioTrackEarliest.hasOwnProperty(atKey) || ej2.recordStartMs < audioTrackEarliest[atKey]) {
-                audioTrackEarliest[atKey] = ej2.recordStartMs;
-            }
-        }
-    }
-
-    // Global earliest across all tracks — used to anchor audio-only clips.
+    // ── 2. Global wall-clock anchoring ──────────────────────────────────────
+    // Every clip is placed at its absolute recording time relative to the single
+    // earliest recording across ALL tracks. Because record-start comes from
+    // embedded creation_time (or mtime) on a shared real-time clock, this lines
+    // the tracks up automatically; Fine Tune Audio then corrects any small
+    // residual clock drift between devices.
+    //
+    // (Earlier versions anchored each track independently to t=0, which left
+    // tracks offset by the difference between their first clips — e.g. a program
+    // recorder and a camera that started minutes apart — and forced a manual
+    // drag to align. Trustworthy timestamps make that unnecessary.)
     var globalEarliestMs = Number.MAX_VALUE;
-    for (var gvk in videoTrackEarliest) {
-        if (videoTrackEarliest[gvk] < globalEarliestMs) globalEarliestMs = videoTrackEarliest[gvk];
-    }
-    for (var gak in audioTrackEarliest) {
-        if (audioTrackEarliest[gak] < globalEarliestMs) globalEarliestMs = audioTrackEarliest[gak];
+    for (var j = 0; j < enriched.length; j++) {
+        if (enriched[j].recordStartMs < globalEarliestMs) {
+            globalEarliestMs = enriched[j].recordStartMs;
+        }
     }
 
     // ── 2a. 24-hour span guard (per track) ────────────────────────────────────
-    var MAX_SPAN_SEC = 86400;
     var spanError = null;
     for (var sp = 0; sp < enriched.length; sp++) {
         var spClip = enriched[sp];
-        var spAnchor;
-        if (spClip.trackType === "video") {
-            spAnchor = videoTrackEarliest["v" + spClip.trackIndex];
-        } else if (fileToVideoTrackIdx.hasOwnProperty(spClip.filePath)) {
-            spAnchor = videoTrackEarliest["v" + fileToVideoTrackIdx[spClip.filePath]];
-        } else {
-            // Audio-only clip: anchor to global earliest so it sits at the
-            // correct wall-clock position relative to the video tracks.
-            spAnchor = globalEarliestMs;
-        }
-        if (spAnchor === undefined) continue;
-        var spEndSec = (spClip.recordStartMs - spAnchor) / 1000 + spClip.durationSec;
+        var spEndSec = (spClip.recordStartMs - globalEarliestMs) / 1000 + spClip.durationSec;
         if (spEndSec > MAX_SPAN_SEC) {
             spanError = (spClip.trackType === "video" ? "Video" : "Audio") +
                 " track " + (spClip.trackIndex + 1) + " spans " +
@@ -498,22 +484,12 @@ function _buildSyncSequenceImpl(payloadJSON) {
                 continue;
             }
 
-            var trackAnchorMs;
-            if (clipInfo.trackType === "video") {
-                trackAnchorMs = videoTrackEarliest["v" + clipInfo.trackIndex];
-            } else if (fileToVideoTrackIdx.hasOwnProperty(path)) {
-                trackAnchorMs = videoTrackEarliest["v" + fileToVideoTrackIdx[path]];
-            } else {
-                // Audio-only clip: use global earliest so it is positioned at
-                // the correct absolute wall-clock offset on the timeline.
-                trackAnchorMs = globalEarliestMs;
-            }
-            if (trackAnchorMs === undefined) continue;
-            var targetOffsetSec = (recordStartByPath[path] - trackAnchorMs) / 1000;
+            // All tracks share one wall-clock anchor so they line up directly.
+            var targetOffsetSec = (recordStartByPath[path] - globalEarliestMs) / 1000;
             var currentStartSec = timeToSeconds(timelineClip.start);
             var deltaSec = targetOffsetSec - currentStartSec;
 
-            if (Math.abs(deltaSec) < 0.0005) {
+            if (Math.abs(deltaSec) < MIN_PLACE_SEC) {
                 continue;
             }
 
@@ -526,7 +502,7 @@ function _buildSyncSequenceImpl(payloadJSON) {
                 trackType:     clipInfo.trackType,
                 trackIndex:    clipInfo.trackIndex,
                 offsetSec:     targetOffsetSec,
-                offsetTicks:   String(Math.round(targetOffsetSec * 254016000000)),
+                offsetTicks:   String(Math.round(targetOffsetSec * TICKS_PER_SECOND)),
                 recordStartMs: recordStartByPath[path]
             });
         } catch (e3) {
