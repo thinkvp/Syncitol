@@ -40,10 +40,18 @@
 
     var FINE_TUNE_MAX_SHIFT_SEC = 5;
     var FINE_TUNE_MIN_OVERLAP_SEC = 3;
-    var FINE_TUNE_MAX_COMPARE_SEC = 20;
+    // Audio window decoded per compare. The coarse pass lands tracks within a few
+    // seconds, so the fine pass only refines a small residual — a 10s window keeps
+    // ≥5s of overlap even at the ±5s search extreme (window − maxShift) while
+    // halving the per-clip ffmpeg decode vs. the old 20s. Don't drop below
+    // ~2×MAX_SHIFT or the extreme-lag overlap falls under MIN_OVERLAP.
+    var FINE_TUNE_MAX_COMPARE_SEC = 10;
     var FINE_TUNE_MIN_SCORE = 0.2;
     var FINE_TUNE_MIN_APPLY_SEC = 0.02;
-    var FINE_TUNE_WINDOW_POSITIONS = [0.5, 0.2, 0.8];
+    // Window start positions (fraction of slack) tried in order until one scores
+    // ≥ DECENT_SCORE. Two positions instead of three trims a third of the work on
+    // weak-correlation footage where the short-circuit rarely fires.
+    var FINE_TUNE_WINDOW_POSITIONS = [0.5, 0.2];
     var FINE_TUNE_DECENT_SCORE = 0.7;
 
     // ─── Envelope extraction ──────────────────────────────────────────────────
@@ -124,6 +132,15 @@
                     overlapSec: overlap / envelopeRate
                 };
             }
+        }
+
+        // Flag a best lag pinned to the search boundary. A peak at ±maxShift is the
+        // classic signature of a spurious match (the true peak is elsewhere or
+        // absent), so callers can distrust it rather than apply a boundary guess.
+        if (best) {
+            var bestFrames = Math.round(best.lagSec * envelopeRate);
+            var railTol = Math.max(1, Math.round(maxLagFrames * 0.05));
+            best.atRail = Math.abs(bestFrames) >= (maxLagFrames - railTol);
         }
 
         return best;
@@ -352,6 +369,109 @@
             "s, startTicks=" + anchor.startTicks + "]";
     }
 
+    // ─── Timecode ─────────────────────────────────────────────────────────────
+    // Parse an SMPTE timecode ("HH:MM:SS:FF", or drop-frame "HH:MM:SS;FF") into
+    // seconds from midnight. The frame field is converted with `fps`; drop-frame is
+    // treated as non-drop, a sub-second approximation that's fine because the coarse
+    // pass only uses this as a search PREDICTION that audio then confirms. Returns
+    // null for anything unparseable so callers can fall back to other signals.
+    function parseTimecodeToSeconds(tc, fps) {
+        if (typeof tc !== "string") return null;
+        var m = tc.match(/^(\d{1,2}):([0-5]?\d):([0-5]?\d)[:;](\d{1,3})$/);
+        if (!m) return null;
+        var rate = (fps && fps > 0) ? fps : 25;
+        var frames = parseInt(m[4], 10);
+        if (frames >= Math.round(rate) && rate >= 1) frames = Math.round(rate) - 1; // clamp a stray frame index
+        return (parseInt(m[1], 10) * 3600) +
+            (parseInt(m[2], 10) * 60) +
+            parseInt(m[3], 10) +
+            (frames / rate);
+    }
+
+    // ─── Coarse search planning + selection (pure; host supplies the matcher) ──
+    // The whole-track coarse align is just arithmetic over slide-match candidates,
+    // but it lives behind ffmpeg in main.js where it can't be unit-tested. These
+    // three pure helpers carry all of the bug-prone window math and selection
+    // policy so they CAN be tested; main.js only owns the async ffmpeg decode loop.
+    //
+    // geom: { refInPointSec, refDurationFull, refResolvedStartSec, targetInPointSec,
+    //         targetResolvedStartSec, targetAvailSec, tcDelta }
+    // cfg:  { minOverlapSec, targetMaxSec, tcConfirmSec, predictMarginSec, headSec,
+    //         minScore, strongScore, confirmNearSec }
+
+    // Ordered list of coarse search windows for one reference/target pair, cheapest
+    // and most-reliable first. Each plan: { label, winStart, winDur, probeDur,
+    // predicts }. `predicts` plans are centered on a metadata/TC prediction (trusted
+    // even when weak); head/full scan blind (acted on only when strong).
+    function planCoarseSearch(geom, cfg) {
+        var refMinSrc = geom.refInPointSec;
+        var refMaxSrc = geom.refInPointSec + geom.refDurationFull;
+        var probeShort = Math.min(geom.targetAvailSec, cfg.targetMaxSec);
+
+        var plans = [];
+        var seen = {};
+        function addPlan(label, start, dur, probeDur, predicts) {
+            var s = Math.max(refMinSrc, start);
+            var e = Math.min(refMaxSrc, start + dur);
+            var winDur = e - s;
+            if (winDur < cfg.minOverlapSec) return;
+            var key = Math.round(s) + "|" + Math.round(winDur) + "|" + Math.round(probeDur);
+            if (seen[key]) return;                   // don't re-decode an identical window/probe
+            seen[key] = true;
+            plans.push({ label: label, winStart: s, winDur: winDur, probeDur: probeDur, predicts: predicts });
+        }
+
+        if (geom.tcDelta !== null && geom.tcDelta !== undefined) {
+            var predRefSrc = geom.targetInPointSec + geom.tcDelta;
+            addPlan("timecode", predRefSrc - cfg.tcConfirmSec, probeShort + (2 * cfg.tcConfirmSec), probeShort, true);
+        }
+        var predTs = geom.refInPointSec + (geom.targetResolvedStartSec - geom.refResolvedStartSec);
+        addPlan("timestamp", predTs - cfg.predictMarginSec, probeShort + (2 * cfg.predictMarginSec), probeShort, true);
+        // Head: first headSec of each file, matched symmetrically (long target probe)
+        // so a camera that started before OR after the reference is found.
+        addPlan("head", refMinSrc, cfg.headSec, Math.min(geom.targetAvailSec, cfg.headSec), false);
+        addPlan("full", refMinSrc, geom.refDurationFull, probeShort, false);
+        return plans;
+    }
+
+    function createCoarseState() {
+        return { best: null, near: null, skipFull: false };
+    }
+
+    // Fold one plan's slide-match candidate ({score, lagSec} | null) into `state`.
+    // Returns true when the search should stop early (a strong match was found).
+    // Sets state.skipFull when a prediction is confirmed near its expected spot.
+    function coarseConsider(state, plan, candidate, geom, cfg) {
+        if (!candidate) return false;
+        var entry = { score: candidate.score, lagSec: candidate.lagSec, winStart: plan.winStart, label: plan.label };
+        if (!state.best || entry.score > state.best.score) state.best = entry;
+        if (plan.predicts && (!state.near || entry.score > state.near.score)) state.near = entry;
+        if (entry.score >= cfg.strongScore) return true;       // strong — trust it, stop searching
+        if (plan.predicts && entry.score >= cfg.minScore) {
+            var impliedDelta = geom.refResolvedStartSec +
+                (plan.winStart + candidate.lagSec - geom.refInPointSec) - geom.targetResolvedStartSec;
+            if (Math.abs(impliedDelta) <= cfg.confirmNearSec) state.skipFull = true;
+        }
+        return false;
+    }
+
+    // Resolve the final coarse decision. A strong match anywhere overrides the
+    // metadata; else trust the best prediction-aligned match; else nothing. Returns
+    // { chosen, best, coarseDelta } — chosen/coarseDelta null when nothing confident.
+    function coarseResolve(state, geom, cfg) {
+        var chosen = null;
+        if (state.best && state.best.score >= cfg.strongScore) chosen = state.best;
+        else if (state.near && state.near.score >= cfg.minScore) chosen = state.near;
+
+        var coarseDelta = null;
+        if (chosen) {
+            var matchedRefSrc = chosen.winStart + chosen.lagSec;
+            var desiredTargetStart = geom.refResolvedStartSec + (matchedRefSrc - geom.refInPointSec);
+            coarseDelta = Math.round((desiredTargetStart - geom.targetResolvedStartSec) * 1000) / 1000;
+        }
+        return { chosen: chosen, best: state.best, coarseDelta: coarseDelta };
+    }
+
     return {
         TICKS_PER_SECOND: TICKS_PER_SECOND,
         MAX_SPAN_SEC: MAX_SPAN_SEC,
@@ -375,6 +495,11 @@
         formatDate: formatDate,
         formatSignedSeconds: formatSignedSeconds,
         formatRange: formatRange,
-        describeAnchor: describeAnchor
+        describeAnchor: describeAnchor,
+        parseTimecodeToSeconds: parseTimecodeToSeconds,
+        planCoarseSearch: planCoarseSearch,
+        createCoarseState: createCoarseState,
+        coarseConsider: coarseConsider,
+        coarseResolve: coarseResolve
     };
 });

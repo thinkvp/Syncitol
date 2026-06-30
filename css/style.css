@@ -154,7 +154,7 @@ body {
 /* ── Progress ───────────────────────────────────────────────────────────────── */
 #progress-wrap {
     display: none;
-    height: 2px;
+    height: 4px;
     background: var(--bg-input);
     border-radius: 2px;
     overflow: hidden;
@@ -163,11 +163,46 @@ body {
 
 #progress-bar {
     height: 100%;
-    background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+    /* A repeating gradient that keeps shimmering even when the width (overall
+       stage progress) sits still during a long ffmpeg decode — so the panel never
+       looks frozen mid-operation. */
+    background: linear-gradient(90deg,
+        var(--accent-dim) 0%, var(--accent) 40%, #b3a6ff 50%, var(--accent) 60%, var(--accent-dim) 100%);
+    background-size: 200% 100%;
     border-radius: 2px;
     transition: width 0.3s ease;
     width: 0%;
+    animation: progress-shimmer 1.2s linear infinite;
 }
+@keyframes progress-shimmer {
+    from { background-position: 200% 0; }
+    to   { background-position: -200% 0; }
+}
+
+/* Busy indicator — spinner + phase text shown while an operation runs. */
+.busy-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--accent);
+}
+.busy-row[hidden] { display: none; }
+
+.busy-spinner {
+    width: 11px;
+    height: 11px;
+    border: 2px solid var(--accent-dim);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    flex-shrink: 0;
+    animation: busy-spin 0.7s linear infinite;
+}
+@keyframes busy-spin { to { transform: rotate(360deg); } }
+
+.seq-stale { color: var(--yellow); }
 
 /* ── Buttons ────────────────────────────────────────────────────────────────── */
 .btn-row {
@@ -218,6 +253,55 @@ button:disabled {
 }
 .btn-primary:not(:disabled):active {
     transform: translateY(0);
+}
+
+/* ── Manual steps (stacked: instruction left, button right) ─────────────────── */
+.step-card {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+}
+
+.step-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 9px 12px;
+}
+.step-row + .step-row {
+    border-top: 1px solid var(--border);
+}
+
+.step-num {
+    font-family: var(--mono);
+    font-size: 9px;
+    font-weight: 600;
+    color: var(--text-hi);
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.step-desc {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    color: var(--text-mid);
+    line-height: 1.4;
+}
+
+/* Uniform width so the buttons line up down the right edge. */
+.step-row .btn-secondary {
+    flex: 0 0 auto;
+    min-width: 124px;
+    text-align: center;
 }
 
 .btn-header-icon {

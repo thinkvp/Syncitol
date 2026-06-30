@@ -473,6 +473,7 @@ function _buildSyncSequenceImpl(payloadJSON) {
 
     var placed = [];
     var errors = [];
+    var avGroups = {}; // path -> { video: [trackItems], audio: [trackItems] }
 
     for (var k = 0; k < clipInstances.length; k++) {
         var clipInfo = clipInstances[k];
@@ -483,6 +484,13 @@ function _buildSyncSequenceImpl(payloadJSON) {
             if (!path || !recordStartByPath.hasOwnProperty(path)) {
                 continue;
             }
+
+            // Remember each source's video + audio track items so we can re-link them
+            // after moving (move() repositions items independently, which unlinks A/V
+            // whose audio spans multiple tracks). Captured before the MIN_PLACE skip
+            // so items that don't need moving are still part of their group.
+            if (!avGroups[path]) avGroups[path] = { video: [], audio: [] };
+            avGroups[path][clipInfo.trackType].push(timelineClip);
 
             // All tracks share one wall-clock anchor so they line up directly.
             var targetOffsetSec = (recordStartByPath[path] - globalEarliestMs) / 1000;
@@ -510,13 +518,60 @@ function _buildSyncSequenceImpl(payloadJSON) {
         }
     }
 
+    // ── 4a. Re-link video + audio per source ────────────────────────────────
+    // move() repositions each track item on its own, which unlinks linked A/V when
+    // the audio spans multiple tracks (e.g. multichannel camera audio). Re-link each
+    // such group via the sequence selection. Two-item links survive move() intact,
+    // so we only touch groups whose audio is on 2+ tracks.
+    function setAllSelected(value) {
+        var ti, ci, tr;
+        for (ti = 0; ti < syncSeq.videoTracks.numTracks; ti++) {
+            tr = syncSeq.videoTracks[ti];
+            for (ci = 0; ci < tr.clips.numItems; ci++) {
+                try { tr.clips[ci].setSelected(value, false); } catch (eSel) {}
+            }
+        }
+        for (ti = 0; ti < syncSeq.audioTracks.numTracks; ti++) {
+            tr = syncSeq.audioTracks[ti];
+            for (ci = 0; ci < tr.clips.numItems; ci++) {
+                try { tr.clips[ci].setSelected(value, false); } catch (eSel2) {}
+            }
+        }
+    }
+
+    var canLink = (typeof syncSeq.linkSelection === "function");
+    var relinked = 0;
+    var multiAudioGroups = 0;
+    for (var gp in avGroups) {
+        if (!avGroups.hasOwnProperty(gp)) continue;
+        var grp = avGroups[gp];
+        if (grp.video.length < 1 || grp.audio.length < 2) continue; // only the multi-track case unlinks
+        multiAudioGroups++;
+        if (!canLink) continue;
+        try {
+            setAllSelected(false);
+            var members = grp.video.concat(grp.audio);
+            for (var mi = 0; mi < members.length; mi++) {
+                members[mi].setSelected(true, false);
+            }
+            syncSeq.linkSelection();
+            relinked++;
+        } catch (eLink) {
+            errors.push("Re-link failed for " + gp + ": " + eLink.message);
+        }
+    }
+    if (canLink) { try { setAllSelected(false); } catch (eClr) {} }
+
     try { syncSeq.open(); } catch(e) {}
 
     return JSON.stringify({
-        success:      true,
-        sequenceName: syncSeq.name,
-        placed:       placed,
-        errors:       errors
+        success:          true,
+        sequenceName:     syncSeq.name,
+        placed:           placed,
+        errors:           errors,
+        relinked:         relinked,
+        relinkSupported:  canLink,
+        multiAudioGroups: multiAudioGroups
     });
 }
 

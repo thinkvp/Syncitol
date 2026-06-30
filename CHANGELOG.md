@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [1.2.0] - 2026-06-30
+
+### Added
+- **Timecode-predicted coarse align.** The whole-track coarse pass now plans its
+  search windows from embedded SMPTE timecode and record-start timestamps before
+  falling back to blind head/full scans, so large clock offsets are found faster
+  and more reliably. The window math and selection policy are extracted into pure,
+  unit-tested helpers (`planCoarseSearch` and friends in `js/dsp.js`).
+- **Spurious-match guard.** A best lag pinned to the ±search boundary (`atRail`)
+  is now flagged so a boundary guess is distrusted rather than applied.
+- **Sony MXF record-start support.** Scan now reads `modification_date` (verified
+  as the recording start) in addition to `creation_time`.
+- **Busy indicator.** A spinner + phase label stays up for the whole operation and
+  the progress bar shimmers, so a long ffmpeg decode never looks frozen.
+- **Active-sequence freshness.** The panel polls the active sequence while idle and
+  flags the scanned clip data as stale when you switch sequences in Premiere.
+
+### Changed
+- **Parallel ffmpeg passes.** The per-clip coarse/fine decodes (mutually
+  independent) now run several at a time via a bounded pool, the biggest speedup
+  for multi-clip projects.
+- **Faster fine pass.** The compare window drops from 20 s to 10 s and from three
+  window positions to two, roughly halving per-clip decode while keeping ≥5 s of
+  overlap at the search extreme.
+- **Manual Fine Tune is now the fine pass only.** The coarse whole-track align runs
+  as part of ⚡ Auto Sync; the manual button does the fast ±5 s per-clip polish.
+  The three manual steps are presented as a numbered step card.
+
 ## [1.1.0] - 2026-06-29
 
 ### Added

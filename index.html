@@ -23,7 +23,11 @@
         <!-- Active sequence info -->
         <div class="card">
             <div class="card-label">Active Sequence</div>
-            <div id="seq-info">Click "Scan Sequence" to begin.</div>
+            <div id="seq-info">Click "Auto Sync" or follow the manual steps to begin.</div>
+            <div id="busy-row" hidden>
+                <span class="busy-spinner"></span>
+                <span id="busy-text">Working…</span>
+            </div>
             <div id="progress-wrap"><div id="progress-bar"></div></div>
         </div>
 
@@ -32,10 +36,22 @@
             <button id="btn-auto" class="btn-primary">⚡ Auto Sync</button>
         </div>
         <div class="card-label">Manual steps</div>
-        <div class="btn-row">
-            <button id="btn-refresh" class="btn-secondary">↺ Scan Sequence</button>
-            <button id="btn-sync"    class="btn-secondary" disabled>⏱ Build Sync</button>
-            <button id="btn-fine-tune"   class="btn-secondary" disabled>≈ Fine Tune</button>
+        <div class="step-card">
+            <div class="step-row">
+                <span class="step-num">1</span>
+                <span class="step-desc">Read clips from the active sequence</span>
+                <button id="btn-refresh" class="btn-secondary">↺ Scan Sequence</button>
+            </div>
+            <div class="step-row">
+                <span class="step-num">2</span>
+                <span class="step-desc">Lay clips out by recording time</span>
+                <button id="btn-sync" class="btn-secondary" disabled>⏱ Build Sync</button>
+            </div>
+            <div class="step-row">
+                <span class="step-num">3</span>
+                <span class="step-desc">Polish tracks you've aligned within ~5s</span>
+                <button id="btn-fine-tune" class="btn-secondary" disabled>≈ Fine Tune</button>
+            </div>
         </div>
 
         <!-- Clip preview table -->
@@ -80,7 +96,7 @@
 
             <div class="ins-section">
                 <div class="ins-heading">⚡ Auto Sync</div>
-                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>Scan → Build Sync → Fine Tune</strong>. Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code>), then click Auto Sync. It stops with a clear message if a step can't proceed. The Manual steps below run the same stages individually if you want to inspect between them.</p>
+                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>Scan → Build Sync → align</strong> (coarse whole-track + fine per-clip). Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code>), then click Auto Sync. It stops with a clear message if a step can't proceed. The Manual steps below run the stages individually — note the manual Fine Tune does the <strong>fast fine pass only</strong>, so Auto Sync is what corrects large clock offsets.</p>
             </div>
 
             <div class="ins-section">
@@ -96,15 +112,14 @@
 
             <div class="ins-section">
                 <div class="ins-heading">≈ Fine Tune Audio</div>
-                <p class="ins-text">Aligns tracks using audio waveform cross-correlation via <strong>ffmpeg</strong>. Just click the button — no configuration and no manual pre-alignment needed.</p>
-                <p class="ins-text">It auto-picks a <strong>reference track</strong> (the one with the most recorded coverage — your main camera or program recording, on any track) and aligns everything else to it. Then it runs two phases: a <strong>coarse</strong> whole-track match that handles large clock offsets, and a <strong>fine</strong> per-clip pass. Only net corrections larger than <code>20&nbsp;ms</code> are applied.</p>
-                <div class="ins-subheading">How it works</div>
+                <p class="ins-text">The manual Fine Tune button runs the <strong>fine per-clip pass only</strong> (±5s) — fast, for when you're hands-on and have already nudged tracks into rough alignment. It auto-picks a <strong>reference track</strong> (the one with the most recorded coverage, on any track) and polishes every other clip to it via audio waveform cross-correlation through <strong>ffmpeg</strong>. Only corrections larger than <code>20&nbsp;ms</code> are applied.</p>
+                <p class="ins-text ins-note">Large (minute-scale) clock offsets are handled by the <strong>coarse</strong> whole-track pass, which runs as part of <strong>⚡ Auto Sync</strong>. If a manual Fine Tune leaves a track far off, run Auto Sync instead — or drag the track within ~5s first.</p>
+                <div class="ins-subheading">Fine pass</div>
                 <div class="ins-range-table">
-                    <div class="ins-range-row"><span class="ins-tag">Coarse</span><span>Matches one clip per track against the full reference — handles large (minute-scale) offsets</span></div>
-                    <div class="ins-range-row"><span class="ins-tag">±5s</span><span>Fine pass: per-clip polish from the coarse-aligned position</span></div>
-                    <div class="ins-range-row"><span class="ins-tag">20s</span><span>Max audio compared per pair (needs ≥3s overlap)</span></div>
-                    <div class="ins-range-row"><span class="ins-tag">3×</span><span>Samples overlap at 50%, 20% and 80% through the window</span></div>
-                    <div class="ins-range-row"><span class="ins-tag">Fast</span><span>Skips extra windows when centred score ≥0.70</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">±5s</span><span>Search range — clips must already be within this</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">10s</span><span>Max audio compared per pair (needs ≥3s overlap)</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">2×</span><span>Samples overlap at 50% and 20% through the window</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">Fast</span><span>Skips the alternate window when centred score ≥0.70</span></div>
                 </div>
                 <p class="ins-text ins-note">Requires <code>ffmpeg</code> on your system PATH. Run <code>ffmpeg -version</code> in a terminal to confirm it is available before using this feature.</p>
             </div>
@@ -124,7 +139,7 @@
 
     <!-- Footer -->
     <div class="footer">
-        <span>Syncitol v1.1</span>
+        <span>Syncitol v1.2</span>
         <span>Premiere Pro 24 – 26+</span>
     </div>
 
