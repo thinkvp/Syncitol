@@ -391,23 +391,24 @@ function extractEmbeddedStart(probe) {
 }
 
 // One probe per file for everything main.js wants from ffprobe. Returns
-// { embeddedStart: { ms, kind } | null, startTimecodeSec: number | null }.
-// Failures (unreadable file, no tags, no ffprobe) resolve to nulls so callers
-// can fall back; a cancelled probe is NOT cached so the next run retries.
+// { embeddedStart: { ms, kind } | null, startTimecodeSec: number | null,
+//   durationSec: number | null }. Failures (unreadable file, no tags, no
+// ffprobe) resolve to nulls so callers can fall back; a cancelled probe is NOT
+// cached so the next run retries.
 function probeMedia(filePath) {
     if (mediaProbeCache.has(filePath)) return mediaProbeCache.get(filePath);
 
     const task = (async () => {
         await toolsReady;
         if (!childProcess || !toolPath.ffprobe) {
-            return { embeddedStart: null, startTimecodeSec: null };
+            return { embeddedStart: null, startTimecodeSec: null, durationSec: null };
         }
         try {
             const out = await runCommandCapture(toolPath.ffprobe, [
                 "-v", "quiet",
                 "-print_format", "json",
                 "-show_entries",
-                "format_tags=creation_time,modification_date,timecode:stream_tags=creation_time,timecode:stream=timecode,codec_type,r_frame_rate",
+                "format=duration:format_tags=creation_time,modification_date,timecode:stream_tags=creation_time,timecode:stream=timecode,codec_type,r_frame_rate",
                 "-i", filePath
             ]);
             const probe = JSON.parse(out.toString("utf8"));
@@ -426,13 +427,19 @@ function probeMedia(filePath) {
                 if (sec !== null) startTimecodeSec = sec;
             }
 
-            return { embeddedStart, startTimecodeSec };
+            let durationSec = null;
+            if (probe.format && probe.format.duration) {
+                const d = parseFloat(probe.format.duration);
+                if (!Number.isNaN(d) && d > 0) durationSec = d;
+            }
+
+            return { embeddedStart, startTimecodeSec, durationSec };
         } catch (e) {
             if (e && e.cancelled) {
                 mediaProbeCache.delete(filePath); // don't poison the cache with a cancel
                 throw e;
             }
-            return { embeddedStart: null, startTimecodeSec: null };
+            return { embeddedStart: null, startTimecodeSec: null, durationSec: null };
         }
     })();
 
@@ -617,6 +624,135 @@ function getEnvelope(filePath, sourceOffsetSec, durationSec, opts) {
 // findBestLag(), buildFineTuneAnchors(), buildCompareWindow(), describeAnchor()
 // and formatRange() live in js/dsp.js.
 
+// ─── Premiere peak-file (.pek) fast path ──────────────────────────────────────
+// Premiere pre-computes an audio peak cache (.pek) for every imported media file
+// — effectively the envelope the coarse pass spends minutes decoding via ffmpeg,
+// already sitting on disk (parser in dsp.js, validated against ffmpeg ground
+// truth). Media → .pek mapping comes from Adobe's media-cache database records
+// (.mcdb), which store the original media path alongside each cache entry path.
+// Everything here is opportunistic: any failure or doubt (missing cache, stale
+// mtime, duration mismatch, unparseable header) falls back to the audio path.
+
+function mediaCacheDbDir() {
+    if (!path || !os) return null;
+    const home = os.homedir();
+    return os.platform() === "darwin"
+        ? path.join(home, "Library", "Application Support", "Adobe", "Common", "Media Cache")
+        : path.join(home, "AppData", "Roaming", "Adobe", "Common", "Media Cache");
+}
+
+// Premiere sometimes records paths with the Windows long-path prefix (\\?\).
+function normalizeMediaPath(p) {
+    return String(p || "").replace(/^\\\\\?\\/, "").toLowerCase();
+}
+
+// Scan the .mcdb records once per session into Map<normalized media path, pek path>.
+let pekIndexPromise = null;
+function getPekIndex() {
+    if (pekIndexPromise) return pekIndexPromise;
+    pekIndexPromise = (async () => {
+        const index = new Map();
+        const dir = mediaCacheDbDir();
+        if (!fs || !dir) return index;
+        let names;
+        try {
+            names = (await fs.promises.readdir(dir)).filter(n => n.endsWith(".mcdb"));
+        } catch (e) {
+            return index; // no media cache database — no pek fast path
+        }
+        const BATCH = 64;
+        for (let i = 0; i < names.length; i += BATCH) {
+            await Promise.all(names.slice(i, i + BATCH).map(async (name) => {
+                let text;
+                try {
+                    text = await fs.promises.readFile(path.join(dir, name), "utf8");
+                } catch (e) {
+                    return;
+                }
+                if (text.indexOf("pek") === -1) return;
+                const orig = /<OriginalWinPath>([^<]+)<\/OriginalWinPath>/.exec(text) ||
+                             /<OriginalPath>([^<]+)<\/OriginalPath>/.exec(text);
+                if (!orig) return;
+                // A record can hold several items (index, peaks, …) — Item.KeyN
+                // pairs with Item.WinPathN / Item.PathN by index.
+                const keyRe = /<Item\.Key(\d+)>pek\d+<\/Item\.Key\1>/g;
+                let m;
+                while ((m = keyRe.exec(text)) !== null) {
+                    const n = m[1];
+                    const win = new RegExp(`<Item\\.WinPath${n}>([^<]+)</Item\\.WinPath${n}>`).exec(text) ||
+                                new RegExp(`<Item\\.Path${n}>([^<]+)</Item\\.Path${n}>`).exec(text);
+                    if (win && /\.pek$/i.test(win[1])) {
+                        index.set(normalizeMediaPath(orig[1]), win[1]);
+                        break;
+                    }
+                }
+            }));
+        }
+        return index;
+    })();
+    return pekIndexPromise;
+}
+
+// Resolve a media file to its trusted .pek: mapped in the cache DB, not older
+// than the media, header parseable, and (when ffprobe is present) matching the
+// media's duration. Returns { pekPath, info } or null. Cached per session.
+const pekCache = new Map();
+function resolvePek(mediaPath) {
+    if (pekCache.has(mediaPath)) return pekCache.get(mediaPath);
+    const task = (async () => {
+        const index = await getPekIndex();
+        const pekPath = index.get(normalizeMediaPath(mediaPath));
+        if (!pekPath) return null;
+
+        let pekStat, mediaStat;
+        try {
+            pekStat = fs.statSync(pekPath);
+            mediaStat = fs.statSync(mediaPath);
+        } catch (e) {
+            return null;
+        }
+        // Media modified after its peaks were generated → the peaks describe
+        // old audio. (Premiere regenerates the .pek on reimport, so a healthy
+        // cache entry is always newer than its media.)
+        if (mediaStat.mtimeMs > pekStat.mtimeMs) return null;
+
+        let buffer;
+        try {
+            buffer = await fs.promises.readFile(pekPath);
+        } catch (e) {
+            return null;
+        }
+        const info = parsePekInfo(buffer);
+        if (!info) return null;
+
+        try {
+            const probe = await probeMedia(mediaPath);
+            if (probe.durationSec !== null && Math.abs(probe.durationSec - info.durationSec) > 2) {
+                return null; // wrong file behind this name — don't trust it
+            }
+        } catch (e) {
+            if (e && e.cancelled) {
+                pekCache.delete(mediaPath);
+                throw e;
+            }
+        }
+        return { pekPath, info };
+    })();
+    pekCache.set(mediaPath, task);
+    return task;
+}
+
+// Coarse-rate envelope from a resolved .pek slice, deduped via the run cache
+// (the reference window is shared by every track).
+function getPekEnvelope(resolved, startSec, durSec) {
+    const key = `pek|${resolved.pekPath}|${startSec.toFixed(3)}|${durSec.toFixed(3)}`;
+    if (envelopeCache.has(key)) return envelopeCache.get(key);
+    const task = fs.promises.readFile(resolved.pekPath)
+        .then(buffer => pekToEnvelope(buffer, resolved.info, COARSE_ENVELOPE_RATE, startSec, durSec));
+    envelopeCache.set(key, task);
+    return task;
+}
+
 // ─── Coarse auto-align (whole-track, large offsets) ───────────────────────────
 // Device clocks routinely differ by minutes (and embedded timestamps disagree
 // across camera makes), so two tracks may sit far apart even after timestamp-based
@@ -716,7 +852,7 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         trackGroups.get(key).push(anchor);
     }
 
-    notes.push(`Coarse align: staged search — start timecode and Build-position windows for every track first, then offsets learned from already-matched tracks, then the head region, then the full file — at ${COARSE_ENVELOPE_RATE}Hz.`);
+    notes.push(`Coarse align: staged search — Premiere peak files first (no audio decode), then start timecode and Build-position windows, then offsets learned from already-matched tracks, then the head region, then the full file — at ${COARSE_ENVELOPE_RATE}Hz.`);
 
     const envOpts = { sampleRate: COARSE_SAMPLE_RATE, windowSamples: COARSE_WINDOW_SAMPLES };
     const cfg = COARSE_CFG;
@@ -808,6 +944,34 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         }));
     }
 
+    // Premiere peak-file fast path: when BOTH files carry a trusted .pek, match
+    // the probe against the whole reference straight from the cached peaks — no
+    // audio decode at all. Returns true on a strong match.
+    async function tryPekCoarse(job) {
+        const [refPek, tgtPek] = await Promise.all([
+            resolvePek(job.reference.filePath),
+            resolvePek(job.target.filePath)
+        ]);
+        if (!refPek || !tgtPek) return false;
+
+        const probeDur = Math.min(job.geom.targetAvailSec, COARSE_TARGET_MAX_SEC);
+        const plan = {
+            label: "pek", winStart: job.geom.refInPointSec, winDur: job.geom.refDurationFull,
+            probeDur, predicts: false, predictedDeltaSec: 0
+        };
+        const [refEnv, tgtEnv] = await Promise.all([
+            getPekEnvelope(refPek, plan.winStart, plan.winDur),
+            getPekEnvelope(tgtPek, job.geom.targetInPointSec, probeDur)
+        ]);
+        if (!refEnv.length || !tgtEnv.length) return false;
+
+        const candidate = slideMatch(refEnv, tgtEnv, {
+            envelopeRate: COARSE_ENVELOPE_RATE,
+            minOverlapSec: Math.min(probeDur, COARSE_MATCH_OVERLAP_SEC)
+        });
+        return coarseConsider(job.state, plan, candidate, job.geom, cfg);
+    }
+
     // Check every learned offset this job hasn't tried yet; true = strong match.
     async function tryLearnedHints(job) {
         for (const learned of [...learnedDeltas]) {
@@ -856,6 +1020,29 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         }
         for (const [msg, type] of job.lines) log(msg, type);
         job.lines.length = 0;
+    }
+
+    // ── Stage 0 — Premiere peak files ─────────────────────────────────────────
+    // Costs milliseconds when the peaks exist, so it runs for every track before
+    // any audio is touched. Strong matches finalize immediately and seed learned
+    // offsets for tracks whose media has no usable peaks.
+    await mapPool(jobs, SYNC_CONCURRENCY, async (job) => {
+        try {
+            if (await tryPekCoarse(job)) job.done = true;
+        } catch (e) {
+            if (e && e.cancelled) throw e;
+            // peaks are opportunistic — fall through to the audio stages
+        }
+    });
+    let pekMatched = 0;
+    for (const job of jobs) {
+        if (job.done && !job.finalized) {
+            finalizeJob(job);
+            pekMatched += 1;
+        }
+    }
+    if (pekMatched > 0) {
+        notes.push(`Coarse align: ${pekMatched} of ${jobs.length} track${jobs.length !== 1 ? "s" : ""} matched from Premiere's peak-file cache — no audio decoded.`);
     }
 
     // ── Staged execution across tracks ────────────────────────────────────────

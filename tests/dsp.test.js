@@ -517,6 +517,106 @@ test("buildDriftProbe returns null when the overlap is too short to matter", () 
     assert.strictEqual(dsp.buildDriftProbe(ref, target), null);
 });
 
+// ─── parsePekInfo / pekToEnvelope ───────────────────────────────────────────────
+
+// Build a synthetic .pek: channel-planar (int16 max, int16 min) per 256-sample
+// block. ampOf(channel, block) gives the desired per-block amplitude.
+function makePek(channels, blocks, sampleRate, ampOf) {
+    const buf = Buffer.alloc(dsp.PEK_HEADER_BYTES + channels * blocks * 4);
+    buf.writeUInt32LE(dsp.PEK_MAGIC, 0);
+    buf.writeUInt32LE(8, 4);
+    buf.writeUInt32LE(channels, 8);
+    buf.writeDoubleLE(sampleRate, 12);
+    buf.writeUInt32LE(channels * blocks * 4, 64);
+    for (let c = 0; c < channels; c += 1) {
+        for (let b = 0; b < blocks; b += 1) {
+            const amp = ampOf(c, b);
+            const base = dsp.PEK_HEADER_BYTES + ((c * blocks) + b) * 4;
+            buf.writeInt16LE(amp, base);       // max
+            buf.writeInt16LE(-amp, base + 2);  // min
+        }
+    }
+    return buf;
+}
+
+test("parsePekInfo reads the validated header layout", () => {
+    const buf = makePek(2, 750, 48000, () => 100);
+    const info = dsp.parsePekInfo(buf);
+    assert.ok(info);
+    assert.strictEqual(info.channels, 2);
+    assert.strictEqual(info.sampleRate, 48000);
+    assert.strictEqual(info.blocks, 750);
+    assert.strictEqual(info.blockRate, 187.5);
+    assert.ok(Math.abs(info.durationSec - 4) < 1e-9); // 750 blocks @ 187.5 Hz
+});
+
+test("parsePekInfo rejects wrong magic, bad fields and truncated payloads", () => {
+    const good = makePek(2, 100, 48000, () => 1);
+    const badMagic = Buffer.from(good); badMagic.writeUInt32LE(0xdeadbeef, 0);
+    assert.strictEqual(dsp.parsePekInfo(badMagic), null);
+    const badRate = Buffer.from(good); badRate.writeDoubleLE(1e9, 12);
+    assert.strictEqual(dsp.parsePekInfo(badRate), null);
+    const truncated = good.slice(0, good.length - 8); // dataBytes overruns buffer
+    assert.strictEqual(dsp.parsePekInfo(truncated), null);
+    assert.strictEqual(dsp.parsePekInfo(null), null);
+});
+
+test("pekToEnvelope reads channel PLANES and averages them", () => {
+    // ch0 amplitude = block index, ch1 = 3x block index → mean = 2x block index.
+    // With an interleaved (wrong) read this would come out scrambled.
+    const blocks = 375; // 2s at 187.5 Hz
+    const buf = makePek(2, blocks, 48000, (c, b) => (c === 0 ? b : 3 * b));
+    const info = dsp.parsePekInfo(buf);
+    const env = dsp.pekToEnvelope(buf, info, 187.5, 0, null); // 1 block per frame
+    assert.strictEqual(env.length, blocks);
+    assert.strictEqual(env[10], 20);   // (10 + 30) / 2
+    assert.strictEqual(env[100], 200); // (100 + 300) / 2
+});
+
+test("pekToEnvelope slices by time and aggregates to the target rate", () => {
+    // 4s of stereo; amplitude = block index on both channels.
+    const buf = makePek(2, 750, 48000, (c, b) => b);
+    const info = dsp.parsePekInfo(buf);
+    // 10 Hz envelope of [1s, 3s): 20 frames, each the mean of ~18.75 blocks
+    // starting at block 187 (t=1s → block 187.5).
+    const env = dsp.pekToEnvelope(buf, info, 10, 1, 2);
+    assert.strictEqual(env.length, 20);
+    // Frame 0 covers blocks ~187..205 → mean ≈ 196; linear ramp keeps frames
+    // increasing by ~18.75.
+    assert.ok(Math.abs(env[0] - 196) < 2, `env[0] ${env[0]}`);
+    assert.ok(Math.abs((env[10] - env[0]) - 187.5) < 3, `slope ${env[10] - env[0]}`);
+    // Out-of-range slice yields an empty envelope, not garbage.
+    assert.strictEqual(dsp.pekToEnvelope(buf, info, 10, 100, 10).length, 0);
+});
+
+test("pek envelopes recover a known offset through slideMatch", () => {
+    // Target = the reference's blocks 750.. shifted to its own start; matching
+    // at 10 Hz should find the 750-block (4.0s) offset, mimicking stage 0.
+    // Aperiodic LCG noise (like makeSignal) so the correlation has ONE peak; the
+    // offset is a whole number of 18.75-block envelope frames because iid noise
+    // (unlike real audio) has no sub-frame smoothness to survive misalignment.
+    const blocks = 2000;
+    const rnd = new Array(blocks);
+    let st = 42 >>> 0;
+    for (let i = 0; i < blocks; i += 1) {
+        st = (1664525 * st + 1013904223) >>> 0;
+        rnd[i] = 50 + (st % 1000);
+    }
+    const ref = makePek(1, blocks, 48000, (c, b) => rnd[b]);
+    const refInfo = dsp.parsePekInfo(ref);
+    const at = 750; // = 40 envelope frames at 10 Hz exactly
+    const tgt = makePek(1, 600, 48000, (c, b) => rnd[b + at]);
+    const tgtInfo = dsp.parsePekInfo(tgt);
+
+    const refEnv = dsp.pekToEnvelope(ref, refInfo, 10, 0, null);
+    const tgtEnv = dsp.pekToEnvelope(tgt, tgtInfo, 10, 0, null);
+    const best = dsp.slideMatch(refEnv, tgtEnv, { envelopeRate: 10, minOverlapSec: 2 });
+    assert.ok(best, "expected a match");
+    const expected = at / 187.5;
+    assert.ok(Math.abs(best.lagSec - expected) <= 0.2, `lagSec ${best.lagSec} should be ~${expected.toFixed(2)}`);
+    assert.ok(best.score > 0.95, `score ${best.score}`);
+});
+
 // ─── escapeHtml ───────────────────────────────────────────────────────────────
 
 test("escapeHtml neutralizes markup in user-controlled names", () => {

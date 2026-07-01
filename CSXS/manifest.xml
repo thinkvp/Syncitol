@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<ExtensionManifest Version="7.0" ExtensionBundleId="com.syncitol.panel" ExtensionBundleVersion="1.3.1" ExtensionBundleName="Syncitol">
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.syncitol.panel" ExtensionBundleVersion="1.4.0" ExtensionBundleName="Syncitol">
   <ExtensionList>
-    <Extension Id="com.syncitol.panel.main" Version="1.3.1"/>
+    <Extension Id="com.syncitol.panel.main" Version="1.4.0"/>
   </ExtensionList>
   <ExecutionEnvironment>
     <HostList>

@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [1.4.0] - 2026-07-02
+
+### Added
+- **Premiere peak-file (.pek) fast path for coarse align.** Premiere already
+  computes a waveform cache for every imported media file; the coarse pass now
+  reads it directly instead of decoding audio through ffmpeg. Reverse-engineered
+  format, validated against ffmpeg ground truth on real stereo MP4 and 4-channel
+  MXF footage (r ≥ 0.99 at exact offsets): a 68-byte header (magic `0x67235411`,
+  channel count, f64 sample rate, payload size) followed by a **channel-planar**
+  payload of int16 (max, min) peak pairs per 256-sample block (187.5 Hz at
+  48 kHz). The parser and envelope builder are pure, unit-tested functions in
+  `js/dsp.js` (`parsePekInfo`, `pekToEnvelope`).
+- Media → .pek resolution goes through Adobe's media-cache database (`.mcdb`
+  records, `OriginalWinPath` → `Item.WinPathN` keyed `pekNNNNN`), indexed once
+  per session (~8k records in ~300 ms). A .pek is only trusted when the media
+  hasn't been modified since the peaks were written, the header parses, and
+  (when ffprobe is present) the durations agree — anything doubtful falls back
+  to the ffmpeg pipeline unchanged.
+- The pek match runs as **stage 0** of the staged coarse search, before any
+  audio is touched, and strong matches also seed the learned-offset hints for
+  tracks whose media has no usable peaks. On the footage that took ~6 minutes
+  of coarse decode (v1.3.0), the same offsets now come back in ~300 ms with
+  0.00 s error.
+
 ## [1.3.1] - 2026-07-02
 
 ### Changed

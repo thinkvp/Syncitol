@@ -377,6 +377,78 @@
         };
     }
 
+    // ─── Premiere .pek peak files ─────────────────────────────────────────────
+    // Premiere pre-computes an audio peak cache (.pek) for every imported media
+    // file — effectively the envelope the coarse pass spends minutes decoding
+    // with ffmpeg, already on disk. Format (validated against ffmpeg ground
+    // truth on real stereo MP4 and 4-channel MXF footage, r ≥ 0.99 at exact
+    // offsets):
+    //   header, 68 bytes: u32 magic 0x67235411 @0, u32 @4, u32 channelCount @8,
+    //     f64le sampleRate @12, ids/hashes, u32 payloadBytes @64
+    //   payload, CHANNEL-PLANAR: for each channel in order, `blocks` consecutive
+    //     4-byte entries (int16 max, int16 min), each covering
+    //     PEK_SAMPLES_PER_BLOCK source samples (187.5 Hz at 48 kHz).
+    // The planar layout matters: interleaving reads one channel at double speed
+    // and produces a self-consistent but WRONG envelope.
+    var PEK_MAGIC = 0x67235411;
+    var PEK_HEADER_BYTES = 68;
+    var PEK_SAMPLES_PER_BLOCK = 256;
+
+    // Parse and sanity-check a .pek header. Returns the layout info or null when
+    // the buffer is not a plausible peak file (callers then fall back to ffmpeg).
+    function parsePekInfo(buffer) {
+        if (!buffer || buffer.length < PEK_HEADER_BYTES + 4) return null;
+        if (buffer.readUInt32LE(0) !== PEK_MAGIC) return null;
+        var channels = buffer.readUInt32LE(8);
+        var sampleRate = buffer.readDoubleLE(12);
+        var dataBytes = buffer.readUInt32LE(64);
+        if (!(channels >= 1 && channels <= 32)) return null;
+        if (!(sampleRate >= 8000 && sampleRate <= 384000)) return null;
+        if (dataBytes <= 0 || PEK_HEADER_BYTES + dataBytes > buffer.length) return null;
+        var blocks = Math.floor(dataBytes / 4 / channels);
+        if (blocks < 1) return null;
+        var blockRate = sampleRate / PEK_SAMPLES_PER_BLOCK;
+        return {
+            channels: channels,
+            sampleRate: sampleRate,
+            blocks: blocks,
+            blockRate: blockRate,
+            durationSec: blocks / blockRate
+        };
+    }
+
+    // Build an envelope at `targetRate` Hz for [startSec, startSec + durSec)
+    // from a parsed .pek: mean over channels of per-block (max − min) / 2,
+    // aggregated per target frame. Pass durSec null/undefined for "to the end".
+    // Returns a Float32Array (possibly empty when the slice is out of range).
+    function pekToEnvelope(buffer, info, targetRate, startSec, durSec) {
+        var startBlock = Math.max(0, Math.floor((startSec || 0) * info.blockRate));
+        var endBlock = (durSec === null || durSec === undefined)
+            ? info.blocks
+            : Math.min(info.blocks, Math.ceil(((startSec || 0) + durSec) * info.blockRate));
+        var span = endBlock - startBlock;
+        if (span < 1) return new Float32Array(0);
+
+        var frames = Math.floor(span * targetRate / info.blockRate);
+        var env = new Float32Array(frames);
+        for (var f = 0; f < frames; f += 1) {
+            var b0 = startBlock + Math.floor(f * info.blockRate / targetRate);
+            var b1 = Math.max(b0 + 1, startBlock + Math.floor((f + 1) * info.blockRate / targetRate));
+            if (b1 > endBlock) b1 = endBlock;
+            var sum = 0;
+            for (var b = b0; b < b1; b += 1) {
+                for (var c = 0; c < info.channels; c += 1) {
+                    var base = PEK_HEADER_BYTES + ((c * info.blocks) + b) * 4;
+                    var hi = buffer.readInt16LE(base);
+                    var lo = buffer.readInt16LE(base + 2);
+                    sum += (hi >= lo ? hi - lo : lo - hi) / 2;
+                }
+            }
+            env[f] = sum / ((b1 - b0) * info.channels);
+        }
+        return env;
+    }
+
     // ─── HTML escaping ────────────────────────────────────────────────────────
     // Sequence names, clip names and file paths are user-controlled and get
     // interpolated into innerHTML in the panel — escape them so a name like
@@ -586,6 +658,11 @@
         DRIFT_MIN_OVERLAP_SEC: DRIFT_MIN_OVERLAP_SEC,
         DRIFT_EDGE_FRACTION: DRIFT_EDGE_FRACTION,
         DRIFT_MIN_REPORT_SEC: DRIFT_MIN_REPORT_SEC,
+        PEK_MAGIC: PEK_MAGIC,
+        PEK_HEADER_BYTES: PEK_HEADER_BYTES,
+        PEK_SAMPLES_PER_BLOCK: PEK_SAMPLES_PER_BLOCK,
+        parsePekInfo: parsePekInfo,
+        pekToEnvelope: pekToEnvelope,
         buildEnvelope: buildEnvelope,
         findBestLag: findBestLag,
         slideMatch: slideMatch,
