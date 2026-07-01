@@ -24,9 +24,10 @@
         <div class="card">
             <div class="card-label">Active Sequence</div>
             <div id="seq-info">Click "Auto Sync" or follow the manual steps to begin.</div>
-            <div id="busy-row" hidden>
+            <div id="busy-row" class="busy-row" hidden>
                 <span class="busy-spinner"></span>
                 <span id="busy-text">Working…</span>
+                <button id="btn-cancel" class="btn-mini btn-cancel" title="Stop the current operation">✕ Cancel</button>
             </div>
             <div id="progress-wrap"><div id="progress-bar"></div></div>
         </div>
@@ -51,6 +52,28 @@
                 <span class="step-num">3</span>
                 <span class="step-desc">Polish tracks you've aligned within ~5s</span>
                 <button id="btn-fine-tune" class="btn-secondary" disabled>≈ Fine Tune</button>
+            </div>
+        </div>
+
+        <!-- Sync results summary (filled after a fine tune / Auto Sync) -->
+        <div id="results-section" hidden>
+            <div class="results-head">
+                <div class="card-label">Sync Results</div>
+                <button id="btn-revert" class="btn-mini" hidden
+                        title="Undo the shifts applied by the last fine tune">↩ Revert</button>
+            </div>
+            <div class="table-wrap">
+                <table id="results-table" class="sync-table">
+                    <thead>
+                        <tr>
+                            <th>Item</th>
+                            <th>Result</th>
+                            <th>Via</th>
+                            <th>Score</th>
+                        </tr>
+                    </thead>
+                    <tbody id="results-body"></tbody>
+                </table>
             </div>
         </div>
 
@@ -92,11 +115,12 @@
                 <div class="ins-heading">How it works</div>
                 <p class="ins-text">Syncitol resolves each clip's <strong>record-start time</strong> from the best available source. When <code>ffprobe</code> is installed it reads the media's embedded <strong>creation_time</strong> (the real recording start). Otherwise it falls back to the <strong>file modification date</strong> minus the clip's duration. Every clip is then placed on a new timeline so the gaps between recordings match real clock time.</p>
                 <p class="ins-text ins-note">The Detected Clips table tags each row <code>meta</code> (embedded metadata) or <code>mtime</code> (file date). On the <code>mtime</code> fallback, preserve file dates when copying media — if the OS updates <code>mtime</code> on copy the sync will be off.</p>
+                <p class="ins-text ins-note">The footer shows whether <code>ffmpeg</code> and <code>ffprobe</code> were found (✓/✗) — checked once when the panel opens. Audio envelopes are cached on disk, so re-running a sync on unchanged media is much faster.</p>
             </div>
 
             <div class="ins-section">
                 <div class="ins-heading">⚡ Auto Sync</div>
-                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>Scan → Build Sync → align</strong> (coarse whole-track + fine per-clip). Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code>), then click Auto Sync. It stops with a clear message if a step can't proceed. The Manual steps below run the stages individually — note the manual Fine Tune does the <strong>fast fine pass only</strong>, so Auto Sync is what corrects large clock offsets.</p>
+                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>Scan → Build Sync → align</strong> (coarse whole-track + fine per-clip). Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code> — Auto Sync refuses those), then click Auto Sync. It stops with a clear message if a step can't proceed, and a <strong>✕ Cancel</strong> button next to the spinner stops long audio scans at any time. When it finishes, the <strong>Sync Results</strong> table shows each track and clip's shift, the signal it matched on, and a confidence score. The Manual steps below run the stages individually — note the manual Fine Tune does the <strong>fast fine pass only</strong>, so Auto Sync is what corrects large clock offsets.</p>
             </div>
 
             <div class="ins-section">
@@ -114,6 +138,7 @@
                 <div class="ins-heading">≈ Fine Tune Audio</div>
                 <p class="ins-text">The manual Fine Tune button runs the <strong>fine per-clip pass only</strong> (±5s) — fast, for when you're hands-on and have already nudged tracks into rough alignment. It auto-picks a <strong>reference track</strong> (the one with the most recorded coverage, on any track) and polishes every other clip to it via audio waveform cross-correlation through <strong>ffmpeg</strong>. Only corrections larger than <code>20&nbsp;ms</code> are applied.</p>
                 <p class="ins-text ins-note">Large (minute-scale) clock offsets are handled by the <strong>coarse</strong> whole-track pass, which runs as part of <strong>⚡ Auto Sync</strong>. If a manual Fine Tune leaves a track far off, run Auto Sync instead — or drag the track within ~5s first.</p>
+                <p class="ins-text ins-note">After a fine tune, <strong>↩ Revert</strong> (in Sync Results) undoes exactly the shifts that were applied. On overlaps longer than 10 minutes the panel also checks for <strong>clock drift</strong> — devices whose clocks run at different rates — and warns with the measured drift (a single offset can't fix both ends; split long clips before syncing if flagged).</p>
                 <div class="ins-subheading">Fine pass</div>
                 <div class="ins-range-table">
                     <div class="ins-range-row"><span class="ins-tag">±5s</span><span>Search range — clips must already be within this</span></div>
@@ -139,7 +164,8 @@
 
     <!-- Footer -->
     <div class="footer">
-        <span>Syncitol v1.2</span>
+        <span>Syncitol v1.3</span>
+        <span id="tool-status" class="tool-status"></span>
         <span>Premiere Pro 24 – 26+</span>
     </div>
 

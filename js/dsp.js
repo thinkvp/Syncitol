@@ -54,6 +54,19 @@
     var FINE_TUNE_WINDOW_POSITIONS = [0.5, 0.2];
     var FINE_TUNE_DECENT_SCORE = 0.7;
 
+    // Drift detection. A single offset assumes both devices' clocks run at the
+    // same RATE — consumer cameras drift ~10–50 ppm, which on a multi-hour
+    // recording puts the tail audibly out even when the head is perfectly
+    // aligned. We can't fix that (rate-stretch isn't scriptable cleanly), but we
+    // can MEASURE it: correlate a window near each end of a long overlap and
+    // compare the residual lags. Only overlaps this long are worth checking:
+    var DRIFT_MIN_OVERLAP_SEC = 600;
+    // Probe windows sit this fraction in from each end of the overlap.
+    var DRIFT_EDGE_FRACTION = 0.05;
+    // Report only when the ends diverge by more than this (the 100 Hz envelope
+    // resolves ~10 ms per end, so anything under 40 ms is measurement noise).
+    var DRIFT_MIN_REPORT_SEC = 0.04;
+
     // ─── Envelope extraction ──────────────────────────────────────────────────
     // Aggregate signed 16-bit LE PCM into a mean-absolute-amplitude envelope,
     // one frame per `windowSamples` samples.
@@ -331,6 +344,52 @@
         };
     }
 
+    // Plan the two probe windows for a drift check on a reference/target pair:
+    // one near the start of their overlap, one near the end. Returns null when
+    // the overlap is too short for drift to be measurable (or matter). The
+    // caller correlates each window (same shape as buildCompareWindow windows)
+    // and compares the two lags: driftSec = lateLag − earlyLag over spanSec.
+    function buildDriftProbe(reference, target) {
+        var overlapStart = Math.max(reference.resolvedStartSec, target.resolvedStartSec);
+        var overlapEnd = Math.min(reference.resolvedEndSec, target.resolvedEndSec);
+        var overlap = overlapEnd - overlapStart;
+        if (overlap < DRIFT_MIN_OVERLAP_SEC) return null;
+
+        var windowDur = FINE_TUNE_MAX_COMPARE_SEC;
+        var earlyStart = overlapStart + (overlap * DRIFT_EDGE_FRACTION);
+        var lateStart = overlapStart + (overlap * (1 - DRIFT_EDGE_FRACTION)) - windowDur;
+        var spanSec = lateStart - earlyStart;
+        if (spanSec <= 0) return null;
+
+        function windowAt(startSec) {
+            return {
+                compareStartSec: startSec,
+                compareDurationSec: windowDur,
+                refSourceOffsetSec: reference.inPointSec + (startSec - reference.resolvedStartSec),
+                targetSourceOffsetSec: target.inPointSec + (startSec - target.resolvedStartSec)
+            };
+        }
+
+        return {
+            spanSec: spanSec,
+            early: windowAt(earlyStart),
+            late: windowAt(lateStart)
+        };
+    }
+
+    // ─── HTML escaping ────────────────────────────────────────────────────────
+    // Sequence names, clip names and file paths are user-controlled and get
+    // interpolated into innerHTML in the panel — escape them so a name like
+    // "<b>Day 1" can't break (or script) the UI.
+    function escapeHtml(value) {
+        return String(value === null || value === undefined ? "" : value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
     // ─── Display formatting ───────────────────────────────────────────────────
     function formatDuration(ms) {
         var totalSec = Math.round(ms / 1000);
@@ -401,8 +460,11 @@
 
     // Ordered list of coarse search windows for one reference/target pair, cheapest
     // and most-reliable first. Each plan: { label, winStart, winDur, probeDur,
-    // predicts }. `predicts` plans are centered on a metadata/TC prediction (trusted
-    // even when weak); head/full scan blind (acted on only when strong).
+    // predicts, predictedDeltaSec }. `predicts` plans are centered on a metadata/TC
+    // prediction (trusted even when weak); head/full scan blind (acted on only when
+    // strong). predictedDeltaSec is the whole-track delta the plan EXPECTS, so a
+    // match can be judged "near its prediction" relative to that plan's own claim
+    // (a timecode prediction may legitimately disagree with the timestamps).
     function planCoarseSearch(geom, cfg) {
         var refMinSrc = geom.refInPointSec;
         var refMaxSrc = geom.refInPointSec + geom.refDurationFull;
@@ -410,7 +472,7 @@
 
         var plans = [];
         var seen = {};
-        function addPlan(label, start, dur, probeDur, predicts) {
+        function addPlan(label, start, dur, probeDur, predicts, predictedDeltaSec) {
             var s = Math.max(refMinSrc, start);
             var e = Math.min(refMaxSrc, start + dur);
             var winDur = e - s;
@@ -418,20 +480,53 @@
             var key = Math.round(s) + "|" + Math.round(winDur) + "|" + Math.round(probeDur);
             if (seen[key]) return;                   // don't re-decode an identical window/probe
             seen[key] = true;
-            plans.push({ label: label, winStart: s, winDur: winDur, probeDur: probeDur, predicts: predicts });
+            plans.push({
+                label: label, winStart: s, winDur: winDur, probeDur: probeDur,
+                predicts: predicts, predictedDeltaSec: predictedDeltaSec || 0
+            });
         }
 
         if (geom.tcDelta !== null && geom.tcDelta !== undefined) {
             var predRefSrc = geom.targetInPointSec + geom.tcDelta;
-            addPlan("timecode", predRefSrc - cfg.tcConfirmSec, probeShort + (2 * cfg.tcConfirmSec), probeShort, true);
+            var tcPredictedDelta = geom.refResolvedStartSec +
+                (predRefSrc - geom.refInPointSec) - geom.targetResolvedStartSec;
+            addPlan("timecode", predRefSrc - cfg.tcConfirmSec, probeShort + (2 * cfg.tcConfirmSec), probeShort, true, tcPredictedDelta);
         }
         var predTs = geom.refInPointSec + (geom.targetResolvedStartSec - geom.refResolvedStartSec);
-        addPlan("timestamp", predTs - cfg.predictMarginSec, probeShort + (2 * cfg.predictMarginSec), probeShort, true);
+        addPlan("timestamp", predTs - cfg.predictMarginSec, probeShort + (2 * cfg.predictMarginSec), probeShort, true, 0);
         // Head: first headSec of each file, matched symmetrically (long target probe)
         // so a camera that started before OR after the reference is found.
         addPlan("head", refMinSrc, cfg.headSec, Math.min(geom.targetAvailSec, cfg.headSec), false);
         addPlan("full", refMinSrc, geom.refDurationFull, probeShort, false);
         return plans;
+    }
+
+    // Plan a bounded confirm window around an offset LEARNED from another track.
+    // Devices from one shoot usually share the same clock-error family (in a real
+    // log, two cameras' true offsets were -641.8s and -619.7s — 22s apart), so once
+    // one track has found its offset confidently, the others should look there
+    // before paying for a blind head/full scan. Returns one plan (same shape as
+    // planCoarseSearch's) or null when the predicted spot falls outside the
+    // reference.
+    function planLearnedSearch(geom, cfg, learnedDeltaSec) {
+        var refMinSrc = geom.refInPointSec;
+        var refMaxSrc = geom.refInPointSec + geom.refDurationFull;
+        var probeShort = Math.min(geom.targetAvailSec, cfg.targetMaxSec);
+
+        // Where the target's in-point would sit in the reference source if this
+        // track shared the learned offset (inverse of coarseResolve's mapping).
+        var predRefSrc = geom.refInPointSec +
+            ((geom.targetResolvedStartSec + learnedDeltaSec) - geom.refResolvedStartSec);
+
+        var start = Math.max(refMinSrc, predRefSrc - cfg.learnedMarginSec);
+        var end = Math.min(refMaxSrc, predRefSrc + probeShort + cfg.learnedMarginSec);
+        var winDur = end - start;
+        if (winDur < cfg.minOverlapSec) return null;
+
+        return {
+            label: "learned", winStart: start, winDur: winDur, probeDur: probeShort,
+            predicts: true, predictedDeltaSec: learnedDeltaSec
+        };
     }
 
     function createCoarseState() {
@@ -440,7 +535,9 @@
 
     // Fold one plan's slide-match candidate ({score, lagSec} | null) into `state`.
     // Returns true when the search should stop early (a strong match was found).
-    // Sets state.skipFull when a prediction is confirmed near its expected spot.
+    // Sets state.skipFull when a prediction is confirmed near ITS OWN expected
+    // delta (plan.predictedDeltaSec) — a timecode or learned-offset prediction can
+    // legitimately sit far from the timestamp position and still be confirmed.
     function coarseConsider(state, plan, candidate, geom, cfg) {
         if (!candidate) return false;
         var entry = { score: candidate.score, lagSec: candidate.lagSec, winStart: plan.winStart, label: plan.label };
@@ -450,7 +547,8 @@
         if (plan.predicts && entry.score >= cfg.minScore) {
             var impliedDelta = geom.refResolvedStartSec +
                 (plan.winStart + candidate.lagSec - geom.refInPointSec) - geom.targetResolvedStartSec;
-            if (Math.abs(impliedDelta) <= cfg.confirmNearSec) state.skipFull = true;
+            var predicted = plan.predictedDeltaSec || 0;
+            if (Math.abs(impliedDelta - predicted) <= cfg.confirmNearSec) state.skipFull = true;
         }
         return false;
     }
@@ -485,11 +583,16 @@
         FINE_TUNE_MIN_APPLY_SEC: FINE_TUNE_MIN_APPLY_SEC,
         FINE_TUNE_WINDOW_POSITIONS: FINE_TUNE_WINDOW_POSITIONS,
         FINE_TUNE_DECENT_SCORE: FINE_TUNE_DECENT_SCORE,
+        DRIFT_MIN_OVERLAP_SEC: DRIFT_MIN_OVERLAP_SEC,
+        DRIFT_EDGE_FRACTION: DRIFT_EDGE_FRACTION,
+        DRIFT_MIN_REPORT_SEC: DRIFT_MIN_REPORT_SEC,
         buildEnvelope: buildEnvelope,
         findBestLag: findBestLag,
         slideMatch: slideMatch,
         buildFineTuneAnchors: buildFineTuneAnchors,
         buildCompareWindow: buildCompareWindow,
+        buildDriftProbe: buildDriftProbe,
+        escapeHtml: escapeHtml,
         formatDuration: formatDuration,
         formatTime: formatTime,
         formatDate: formatDate,
@@ -498,6 +601,7 @@
         describeAnchor: describeAnchor,
         parseTimecodeToSeconds: parseTimecodeToSeconds,
         planCoarseSearch: planCoarseSearch,
+        planLearnedSearch: planLearnedSearch,
         createCoarseState: createCoarseState,
         coarseConsider: coarseConsider,
         coarseResolve: coarseResolve

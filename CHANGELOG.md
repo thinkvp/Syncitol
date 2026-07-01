@@ -4,6 +4,79 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project adheres to Semantic Versioning.
 
+## [1.3.1] - 2026-07-02
+
+### Changed
+- **Coarse align is staged across tracks, with learned-offset hints.** Previously
+  each track independently escalated timecode → timestamp → head → full, so a
+  track whose clock was minutes off (outside every predictor window) paid for a
+  blind full-reference scan even when a sibling track had already found the
+  answer. Now every track runs its cheap metadata windows first, and before any
+  blind head/full scan a track first checks a ±120 s window around each offset
+  other tracks have already confirmed strongly — devices from one shoot share
+  the same clock-error family (22 s apart in the motivating log, where this
+  change eliminates a ~2-minute full scan). Cost also no longer swings on which
+  of two near-equal-coverage recordings wins the reference coin-flip.
+
+### Fixed
+- A weak coarse match is now judged "near its prediction" against the plan's own
+  predicted delta rather than always against the timestamp position, so a
+  correct start-timecode prediction that disagrees with the timestamps can
+  confirm (and skip the full scan) the way it was always meant to.
+
+## [1.3.0] - 2026-07-02
+
+### Added
+- **Sync Results table.** After a fine tune / Auto Sync, a glanceable summary
+  shows one row per coarse-aligned track and per fine-tuned clip: the shift
+  applied, the signal it matched via (timecode / timestamp / head / full, or the
+  reference clip), and a color-coded confidence score — so "which track failed
+  and why" no longer requires scrolling the log.
+- **✕ Cancel button.** Long operations (coarse scans especially) can now be
+  stopped at any time: every in-flight ffmpeg/ffprobe child is killed and the
+  pipeline unwinds cleanly without applying partial adjustments.
+- **↩ Revert.** One click undoes exactly the shifts the last fine tune applied
+  (including the boundary compensation), using each moved clip's post-move start
+  ticks reported back by ExtendScript — a working undo despite Premiere's
+  scripting API having no undo grouping.
+- **Clock-drift detection.** On overlaps longer than 10 minutes, the fine pass
+  also correlates a window near each END of the overlap; if the residual lags
+  diverge (> 40 ms) it reports the drift and rate (ppm) — naming the one class
+  of misalignment a single offset cannot fix, with the workaround (split long
+  clips) in the message.
+- **ffmpeg / ffprobe detected at panel load**, shown as ✓/✗ chips in the footer
+  with an install hint — a missing tool is now known before clicking anything,
+  not discovered mid-run. On macOS the Homebrew/manual install locations are
+  probed too, since GUI apps don't inherit the shell PATH.
+- **Persistent envelope cache.** Decoded audio envelopes are cached on disk
+  (keyed by file path + mtime + size + slice/resolution, auto-pruned after 30
+  days), so re-running a sync on unchanged media skips ffmpeg entirely — the
+  dominant cost of a re-run. The in-memory cache is still cleared per run;
+  changed files change the key, so stale audio can never be served.
+- **Skipped-clip reporting.** Scan and Fine Tune now count clips they could not
+  read (offline media, no file path) and say so, instead of silently showing
+  fewer clips than the sequence contains.
+- **`-SYNC` guard.** Auto Sync refuses to run on an already-built `-SYNC`
+  sequence (which would clone it into `X-SYNC-SYNC` and re-shift aligned clips);
+  the manual Build button warns but allows it.
+
+### Changed
+- **Scan is parallel.** Per-file record-start resolution (ffprobe + stat) now
+  runs through the same bounded pool as the audio passes instead of serially —
+  several times faster on multi-clip sequences.
+- **One ffprobe pass per file.** The record-start tags and the start timecode
+  used to be two separate ffprobe spawns per file; they are now read in a single
+  cached probe, halving process spawns during Scan.
+
+### Fixed
+- Sequence names, clip names and file paths are HTML-escaped before being
+  rendered into the panel — a sequence named `<b>Day 1` no longer breaks the
+  header markup.
+- The busy row now actually carries its `busy-row` class, so the spinner row
+  lays out as designed.
+- The ffmpeg availability check no longer runs a synchronous spawn on the UI
+  thread at the start of every first fine tune.
+
 ## [1.2.0] - 2026-06-30
 
 ### Added

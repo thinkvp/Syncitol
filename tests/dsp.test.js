@@ -133,6 +133,7 @@ test("slideMatch honours a raised overlap floor (rejects short edge matches)", (
 const COARSE_CFG = {
     minOverlapSec: 8, targetMaxSec: 120, tcConfirmSec: 30, predictMarginSec: 300,
     headSec: 720, minScore: 0.3, strongScore: 0.5, confirmNearSec: 90,
+    learnedMarginSec: 120,
 };
 
 // A reference 2h long; target placed `tsErrorSec` later than truth on the timeline.
@@ -183,6 +184,61 @@ test("planCoarseSearch clamps windows to the reference and dedupes identical one
     // head [0,200] probe 60 and full [0,200] probe 60 are identical → one survives.
     const labels = plans.map(p => p.label);
     assert.ok(!(labels.includes("head") && labels.includes("full")), `head/full not deduped: ${labels}`);
+});
+
+// ─── planLearnedSearch ──────────────────────────────────────────────────────────
+
+test("planLearnedSearch centers a confirm window on another track's offset", () => {
+    // The motivating real-world case: track 1 proved -641.8s; this track's rep
+    // clip sits at 5800s on the timeline with ~500s of audio available.
+    const geom = {
+        refInPointSec: 0, refDurationFull: 7200, refResolvedStartSec: 0,
+        targetInPointSec: 0, targetResolvedStartSec: 5800, targetAvailSec: 500, tcDelta: null,
+    };
+    const plan = dsp.planLearnedSearch(geom, COARSE_CFG, -641.8);
+    assert.ok(plan, "expected a learned plan");
+    assert.strictEqual(plan.label, "learned");
+    assert.strictEqual(plan.predicts, true);
+    assert.strictEqual(plan.predictedDeltaSec, -641.8);
+    // Predicted ref source = 5800 - 641.8 = 5158.2; window ±120 around
+    // [predRefSrc, predRefSrc + probe(120)].
+    assert.ok(Math.abs(plan.winStart - (5158.2 - 120)) < 1e-9, `winStart ${plan.winStart}`);
+    assert.ok(Math.abs(plan.winDur - (120 + 120 + 120)) < 1e-9, `winDur ${plan.winDur}`);
+    assert.strictEqual(plan.probeDur, 120);
+    // A true offset 22s away from the hint (as in the real log) is inside it.
+    const actualRefSrc = 5800 - 619.7;
+    assert.ok(actualRefSrc > plan.winStart && actualRefSrc < plan.winStart + plan.winDur,
+        "the sibling camera's true offset must fall inside the learned window");
+});
+
+test("planLearnedSearch clamps to the reference and rejects out-of-range hints", () => {
+    const geom = {
+        refInPointSec: 0, refDurationFull: 7200, refResolvedStartSec: 0,
+        targetInPointSec: 0, targetResolvedStartSec: 60, targetAvailSec: 500, tcDelta: null,
+    };
+    // Hint near the reference start: window clamps at 0.
+    const clamped = dsp.planLearnedSearch(geom, COARSE_CFG, -30);
+    assert.ok(clamped);
+    assert.strictEqual(clamped.winStart, 0);
+    // Hint far beyond the reference end: nothing to search.
+    assert.strictEqual(dsp.planLearnedSearch(geom, COARSE_CFG, 100000), null);
+});
+
+test("learned plan drives coarseConsider/coarseResolve to the sibling's offset", () => {
+    const geom = {
+        refInPointSec: 0, refDurationFull: 7200, refResolvedStartSec: 0,
+        targetInPointSec: 0, targetResolvedStartSec: 5800, targetAvailSec: 500, tcDelta: null,
+    };
+    const plan = dsp.planLearnedSearch(geom, COARSE_CFG, -641.8);
+    const state = dsp.createCoarseState();
+    // The matcher finds the true spot 22.1s later than the hint predicted:
+    // matchedRefSrc = 5800 - 619.7 → lag = that - winStart.
+    const lagSec = (5800 - 619.7) - plan.winStart;
+    const stop = dsp.coarseConsider(state, plan, { score: 0.72, lagSec }, geom, COARSE_CFG);
+    assert.strictEqual(stop, true, "a strong learned match should stop the search");
+    const result = dsp.coarseResolve(state, geom, COARSE_CFG);
+    assert.strictEqual(result.chosen.label, "learned");
+    assert.ok(Math.abs(result.coarseDelta - (-619.7)) < 0.01, `coarseDelta ${result.coarseDelta}`);
 });
 
 // ─── coarseConsider / coarseResolve ─────────────────────────────────────────────
@@ -239,6 +295,22 @@ test("coarse: a confirmed prediction skips the full scan but still runs head", (
     assert.ok(!queried.includes("full"), "confirmed prediction should skip the full scan");
     assert.strictEqual(result.chosen.label, "timestamp");
     assert.ok(Math.abs(result.coarseDelta) < 0.001, `expected ~0 shift, got ${result.coarseDelta}`);
+});
+
+test("coarse: a weak match near the TIMECODE's own predicted delta confirms it", () => {
+    // Timestamps are 639s wrong but both files share a TC clock (tcDelta 0), so
+    // the timecode plan PREDICTS delta ≈ -639. A weak match landing near that
+    // prediction must set skipFull relative to the plan's own claim — not the
+    // timestamp position (the pre-1.3.1 behavior, which never confirmed here).
+    const geom = coarseGeom(639, { tcDelta: 0 });
+    const { result, queried } = runCoarse(geom, {
+        timecode: { score: 0.35, lagSec: 10 }, // implied delta -629, 10s from the TC claim
+        head: { score: 0.2, lagSec: 0 },
+    });
+    assert.ok(queried.includes("head"), "head should still run as a safety net");
+    assert.ok(!queried.includes("full"), "a TC-confirmed weak match should skip the full scan");
+    assert.strictEqual(result.chosen.label, "timecode");
+    assert.ok(Math.abs(result.coarseDelta - (-629)) < 0.01, `coarseDelta ${result.coarseDelta}`);
 });
 
 test("coarse: a strong predictor match stops immediately", () => {
@@ -401,4 +473,62 @@ test("parseTimecodeToSeconds accepts drop-frame separator and defaults fps", () 
 test("parseTimecodeToSeconds returns null for junk", () => {
     assert.strictEqual(dsp.parseTimecodeToSeconds("not-a-tc", 25), null);
     assert.strictEqual(dsp.parseTimecodeToSeconds(null, 25), null);
+});
+
+// ─── buildDriftProbe ──────────────────────────────────────────────────────────
+
+test("buildDriftProbe plans early/late windows inside a long overlap", () => {
+    // 2h overlap, both starting at 0; reference trimmed 30s into its source.
+    const ref = { resolvedStartSec: 0, resolvedEndSec: 7200, inPointSec: 30 };
+    const target = { resolvedStartSec: 0, resolvedEndSec: 7200, inPointSec: 0 };
+    const probe = dsp.buildDriftProbe(ref, target);
+    assert.ok(probe, "expected a drift probe for a 2h overlap");
+
+    // Early window 5% in: timeline 360s → ref source 390s, target source 360s.
+    assert.ok(Math.abs(probe.early.compareStartSec - 360) < 1e-9);
+    assert.ok(Math.abs(probe.early.refSourceOffsetSec - 390) < 1e-9);
+    assert.ok(Math.abs(probe.early.targetSourceOffsetSec - 360) < 1e-9);
+    assert.strictEqual(probe.early.compareDurationSec, dsp.FINE_TUNE_MAX_COMPARE_SEC);
+
+    // Late window 95% in, minus the window length: 6840 − 10 = 6830.
+    assert.ok(Math.abs(probe.late.compareStartSec - 6830) < 1e-9);
+    // Span between probes is what the ppm is computed over.
+    assert.ok(Math.abs(probe.spanSec - (6830 - 360)) < 1e-9);
+    // Both windows sit fully inside the overlap.
+    assert.ok(probe.late.compareStartSec + probe.late.compareDurationSec <= 7200);
+});
+
+test("buildDriftProbe respects partial overlap (offset clips)", () => {
+    // Target starts 600s into the reference; overlap = [600, 1800] = 1200s.
+    const ref = { resolvedStartSec: 0, resolvedEndSec: 1800, inPointSec: 0 };
+    const target = { resolvedStartSec: 600, resolvedEndSec: 1800, inPointSec: 0 };
+    const probe = dsp.buildDriftProbe(ref, target);
+    assert.ok(probe);
+    // Early window 5% into the overlap: 600 + 60 = 660 on the timeline; the
+    // target's source offset is measured from ITS OWN start (660 − 600 = 60).
+    assert.ok(Math.abs(probe.early.compareStartSec - 660) < 1e-9);
+    assert.ok(Math.abs(probe.early.refSourceOffsetSec - 660) < 1e-9);
+    assert.ok(Math.abs(probe.early.targetSourceOffsetSec - 60) < 1e-9);
+});
+
+test("buildDriftProbe returns null when the overlap is too short to matter", () => {
+    const ref = { resolvedStartSec: 0, resolvedEndSec: 500, inPointSec: 0 };
+    const target = { resolvedStartSec: 0, resolvedEndSec: 500, inPointSec: 0 };
+    assert.strictEqual(dsp.buildDriftProbe(ref, target), null);
+});
+
+// ─── escapeHtml ───────────────────────────────────────────────────────────────
+
+test("escapeHtml neutralizes markup in user-controlled names", () => {
+    assert.strictEqual(
+        dsp.escapeHtml(`<b onmouseover="x()">Day 1 & "cut"</b>`),
+        "&lt;b onmouseover=&quot;x()&quot;&gt;Day 1 &amp; &quot;cut&quot;&lt;/b&gt;"
+    );
+});
+
+test("escapeHtml passes plain text through and tolerates null/undefined", () => {
+    assert.strictEqual(dsp.escapeHtml("Sequence 01-SYNC"), "Sequence 01-SYNC");
+    assert.strictEqual(dsp.escapeHtml(null), "");
+    assert.strictEqual(dsp.escapeHtml(undefined), "");
+    assert.strictEqual(dsp.escapeHtml(42), "42");
 });

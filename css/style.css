@@ -471,7 +471,15 @@ button:disabled {
     display: none;
 }
 
-#clip-table thead th {
+.sync-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 10px;
+}
+
+#clip-table thead th,
+.sync-table thead th {
     background: var(--bg-input);
     color: var(--text-lo);
     font-weight: 500;
@@ -486,14 +494,18 @@ button:disabled {
     z-index: 1;
 }
 
-#clip-table tbody tr {
+#clip-table tbody tr,
+.sync-table tbody tr {
     border-bottom: 1px solid var(--border);
     transition: background 0.1s;
 }
-#clip-table tbody tr:last-child { border-bottom: none; }
-#clip-table tbody tr:hover { background: var(--bg-panel); }
+#clip-table tbody tr:last-child,
+.sync-table tbody tr:last-child { border-bottom: none; }
+#clip-table tbody tr:hover,
+.sync-table tbody tr:hover { background: var(--bg-panel); }
 
-#clip-table td {
+#clip-table td,
+.sync-table td {
     padding: 6px 8px;
     color: var(--text-mid);
     white-space: nowrap;
@@ -509,6 +521,73 @@ button:disabled {
 .cell-time  { color: var(--yellow); }
 .cell-src   { color: var(--text-lo); font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; }
 .cell-offset{ color: var(--text-lo); }
+.cell-via   { max-width: 90px; }
+
+/* ── Sync Results ───────────────────────────────────────────────────────────── */
+.results-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.results-head .card-label { margin-bottom: 4px; }
+
+.res-ok   { color: var(--green); }
+.res-info { color: var(--text-mid); }
+.res-warn { color: var(--yellow); }
+.res-bad  { color: var(--red); }
+
+.score-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 600;
+    border-radius: 4px;
+    padding: 0 6px;
+    border: 1px solid var(--border);
+}
+.score-high { color: var(--green);  border-color: var(--green);  background: #4af79a18; }
+.score-mid  { color: var(--yellow); border-color: var(--yellow); background: #f7c94a18; }
+.score-low  { color: var(--red);    border-color: var(--red);    background: #f75a5a18; }
+.score-none { color: var(--text-lo); }
+
+.drift-flag {
+    display: inline-block;
+    font-size: 8px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--yellow);
+    border: 1px solid var(--yellow);
+    border-radius: 3px;
+    padding: 0 3px;
+    margin-left: 4px;
+    cursor: help;
+}
+
+/* ── Mini buttons (inline actions: Cancel, Revert) ──────────────────────────── */
+.btn-mini {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-mid);
+    font-size: 9px;
+    padding: 2px 8px;
+    border-radius: 4px;
+}
+.btn-mini:not(:disabled):hover {
+    border-color: var(--border-lit);
+    color: var(--text-hi);
+}
+
+.btn-cancel {
+    margin-left: auto;   /* pushed to the right edge of the busy row */
+    color: var(--red);
+    border-color: var(--red);
+}
+.btn-cancel:not(:disabled):hover {
+    color: #fff;
+    background: var(--red);
+    border-color: var(--red);
+}
 
 /* ── Log ────────────────────────────────────────────────────────────────────── */
 .log-label {
@@ -555,4 +634,16 @@ button:disabled {
     color: var(--text-lo);
     display: flex;
     justify-content: space-between;
+    align-items: center;
 }
+
+/* ffmpeg / ffprobe availability, detected once at panel load */
+.tool-chip {
+    display: inline-block;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 4px;
+    cursor: default;
+}
+.tool-ok      { color: var(--green);  border-color: #4af79a55; }
+.tool-missing { color: var(--red);    border-color: var(--red); cursor: help; }

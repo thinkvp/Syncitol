@@ -86,6 +86,9 @@ function _getClipFileInfoImpl() {
 
     var result = [];
     var seenPaths = [];
+    // Clips we could not read (offline media, placeholders, no media path).
+    // Reported so missing clips don't just silently vanish from the scan.
+    var skipped = 0;
 
     function alreadySeen(p) {
         for (var i = 0; i < seenPaths.length; i++) {
@@ -117,7 +120,8 @@ function _getClipFileInfoImpl() {
             var clip = track.clips[c];
             try {
                 var filePath = clip.projectItem.getMediaPath();
-                if (filePath && !alreadySeen(filePath)) {
+                if (!filePath) { skipped++; continue; }
+                if (!alreadySeen(filePath)) {
                     seenPaths.push(filePath);
                     result.push({
                         filePath:      filePath,
@@ -128,7 +132,7 @@ function _getClipFileInfoImpl() {
                         durationTicks: clip.duration.ticks
                     });
                 }
-            } catch (e) { /* skip offline/placeholder clips */ }
+            } catch (e) { skipped++; /* offline/placeholder clip */ }
         }
     }
 
@@ -139,7 +143,8 @@ function _getClipFileInfoImpl() {
             var aclip = atrack.clips[ac];
             try {
                 var aPath = aclip.projectItem.getMediaPath();
-                if (aPath && !alreadySeen(aPath)) {
+                if (!aPath) { skipped++; continue; }
+                if (!alreadySeen(aPath)) {
                     seenPaths.push(aPath);
                     result.push({
                         filePath:      aPath,
@@ -149,11 +154,11 @@ function _getClipFileInfoImpl() {
                         durationTicks: aclip.duration.ticks
                     });
                 }
-            } catch (e) {}
+            } catch (e) { skipped++; }
         }
     }
 
-    return JSON.stringify(result);
+    return JSON.stringify({ clips: result, skipped: skipped });
 }
 
 /**
@@ -175,6 +180,7 @@ function _getFineTuneClipInfoImpl() {
     if (!seq) return JSON.stringify({ error: "No active sequence." });
 
     var result = [];
+    var skipped = 0;
 
     function collect(trackCollection, trackType) {
         for (var t = 0; t < trackCollection.numTracks; t++) {
@@ -183,7 +189,7 @@ function _getFineTuneClipInfoImpl() {
                 var clip = track.clips[c];
                 try {
                     var filePath = clip.projectItem.getMediaPath();
-                    if (!filePath) continue;
+                    if (!filePath) { skipped++; continue; }
 
                     result.push({
                         clipName:   clip.name,
@@ -195,7 +201,7 @@ function _getFineTuneClipInfoImpl() {
                         inPointSec: timeToSeconds(clip.inPoint),
                         startTicks: String(clip.start.ticks)
                     });
-                } catch (e) {}
+                } catch (e) { skipped++; }
             }
         }
     }
@@ -203,12 +209,14 @@ function _getFineTuneClipInfoImpl() {
     collect(seq.videoTracks, "video");
     collect(seq.audioTracks, "audio");
 
-    return JSON.stringify(result);
+    return JSON.stringify({ clips: result, skipped: skipped });
 }
 
 /**
  * Apply fine-tune shifts to matching timeline clips.
- * adjustmentsJSON: [{ filePath, startTicks, deltaSec }]
+ * adjustmentsJSON: either the legacy array [{ filePath, startTicks, deltaSec }]
+ * or { globalShiftSec, adjustments } where globalShiftSec moves EVERY clip
+ * (used by the panel's Revert to undo a previous boundary compensation).
  */
 function applyFineTuneAdjustments(adjustmentsJSON) {
     try {
@@ -221,14 +229,18 @@ function applyFineTuneAdjustments(adjustmentsJSON) {
 }
 
 function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
-    var adjustments;
+    var payload;
     try {
-        adjustments = JSON.parse(adjustmentsJSON);
+        payload = JSON.parse(adjustmentsJSON);
     } catch (e) {
         return JSON.stringify({ error: "Failed to parse fine tune payload JSON: " + e.message });
     }
 
-    if (!adjustments || adjustments.length === 0) {
+    // Accept both the legacy bare array and { globalShiftSec, adjustments }.
+    var adjustments = (payload && payload.adjustments) ? payload.adjustments : payload;
+    var globalShiftSec = (payload && payload.globalShiftSec) ? Number(payload.globalShiftSec) : 0;
+
+    if ((!adjustments || adjustments.length === 0) && Math.abs(globalShiftSec) < MIN_MOVE_SEC) {
         return JSON.stringify({ success: true, moved: [], errors: [] });
     }
 
@@ -236,15 +248,15 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
     if (!seq) return JSON.stringify({ error: "No active sequence." });
 
     var adjustmentMap = {};
-    for (var i = 0; i < adjustments.length; i++) {
+    for (var i = 0; i < (adjustments ? adjustments.length : 0); i++) {
         var adj = adjustments[i];
         if (adj && adj.filePath && adj.startTicks) {
             adjustmentMap[adj.filePath + "|" + String(adj.startTicks)] = Number(adj.deltaSec);
         }
     }
 
-    // ── Scan fine-tuned clips to find how far the whole sequence must shift
-    //    forward so no adjusted clip lands before position 0 ────────────────
+    // ── Scan every clip to find how far the whole sequence must shift forward
+    //    so no clip lands before position 0 after its (global + per-clip) move ─
     var compensateSec = 0;
     function scanForCompensation(trackCollection) {
         for (var t = 0; t < trackCollection.numTracks; t++) {
@@ -255,8 +267,8 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
                     var fp = clip.projectItem.getMediaPath();
                     if (!fp) continue;
                     var key = fp + "|" + String(clip.start.ticks);
-                    if (!(key in adjustmentMap)) continue;
-                    var resultSec = timeToSeconds(clip.start) + adjustmentMap[key];
+                    var delta = (key in adjustmentMap) ? adjustmentMap[key] : 0;
+                    var resultSec = timeToSeconds(clip.start) + globalShiftSec + delta;
                     if (resultSec < 0) compensateSec = Math.max(compensateSec, -resultSec);
                 } catch (e) {}
             }
@@ -268,8 +280,11 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
     var moved = [];
     var errors = [];
 
-    // ── Apply moves: fine-tuned clips get (delta + compensate),
-    //    every other clip gets (+compensate) so relative timing is preserved ─
+    // ── Apply moves: fine-tuned clips get (globalShift + delta + compensate),
+    //    every other clip gets (globalShift + compensate) so relative timing is
+    //    preserved. newStartTicks (read back after the move) is the exact key a
+    //    later Revert needs to find these clips again — computing it panel-side
+    //    would lose precision (tick counts exceed 2^53 past ~10 h).
     function moveTrackCollection(trackCollection, trackType) {
         for (var t = 0; t < trackCollection.numTracks; t++) {
             var track = trackCollection[t];
@@ -282,7 +297,7 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
                     var key = filePath + "|" + String(clip.start.ticks);
                     var inMap = (key in adjustmentMap);
                     var delta = inMap ? adjustmentMap[key] : 0;
-                    var totalDelta = delta + compensateSec;
+                    var totalDelta = globalShiftSec + delta + compensateSec;
 
                     if (Math.abs(totalDelta) < MIN_MOVE_SEC) continue;
 
@@ -292,11 +307,12 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
 
                     if (inMap) {
                         moved.push({
-                            clipName:   clip.name,
-                            filePath:   filePath,
-                            trackType:  trackType,
-                            trackIndex: t,
-                            deltaSec:   delta
+                            clipName:      clip.name,
+                            filePath:      filePath,
+                            trackType:     trackType,
+                            trackIndex:    t,
+                            deltaSec:      delta,
+                            newStartTicks: String(clip.start.ticks)
                         });
                     }
                 } catch (e) {
@@ -313,7 +329,8 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
         success: true,
         moved: moved,
         errors: errors,
-        compensateSec: compensateSec
+        compensateSec: compensateSec,
+        globalShiftSec: globalShiftSec
     });
 }
 

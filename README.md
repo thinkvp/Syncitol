@@ -48,7 +48,7 @@ real clock time. The **Detected Clips** table tags each row with the source used
 | **Premiere Pro** | 24 (2024), 25 (2025), 26 (2026) and later |
 | **CEP runtime** | CSXS 11.0+ |
 | **Node.js bridge** | CEP `--enable-nodejs` flag (already set in manifest) |
-| **ffmpeg / ffprobe** | `ffmpeg` is required for **Fine Tune Audio**; `ffprobe` (ships with ffmpeg) enables the embedded `creation_time` timing source. Both must be on the system PATH. Optional — the plugin falls back to `mtime` without them. |
+| **ffmpeg / ffprobe** | `ffmpeg` is required for **Fine Tune Audio**; `ffprobe` (ships with ffmpeg) enables the embedded `creation_time` timing source. Optional — the plugin falls back to `mtime` without them. Availability is detected when the panel opens and shown as ✓/✗ chips in the footer. On macOS the Homebrew locations (`/opt/homebrew/bin`, `/usr/local/bin`) are checked too, since GUI apps don't see the shell PATH. |
 | **OS** | macOS or Windows |
 
 ---
@@ -106,10 +106,19 @@ Go to **Window → Extensions → Syncitol**.
 ### Auto Sync (hands-off)
 
 Make your **original** sequence the active one (double-click it in the Project
-panel — not an already-built `-SYNC`), then click **⚡ Auto Sync**. It runs the
-whole pipeline in one go — **Scan → Build Sync → Fine Tune** — and stops with a
-clear message if a step can't proceed. The Manual steps below do the same thing
-in stages if you want to inspect the result between each one.
+panel — not an already-built `-SYNC`; Auto Sync refuses those to avoid building
+`X-SYNC-SYNC`), then click **⚡ Auto Sync**. It runs the whole pipeline in one
+go — **Scan → Build Sync → Fine Tune** — and stops with a clear message if a
+step can't proceed. A **✕ Cancel** button next to the busy spinner stops long
+audio scans at any point without applying partial adjustments.
+
+When it finishes, the **Sync Results** table summarizes the outcome: one row
+per track (coarse align) and per clip (fine pass) with the shift applied, the
+signal it matched via, and a color-coded confidence score — plus a **↩ Revert**
+button that undoes exactly the shifts the last fine tune applied.
+
+The Manual steps below do the same thing in stages if you want to inspect the
+result between each one.
 
 ### Manual sync (step by step)
 
@@ -127,7 +136,7 @@ Fine Tune aligns tracks using **audio waveform cross-correlation** via ffmpeg in
 
 It first picks a **reference track** automatically: the track with the most total recorded coverage (typically your continuous main camera, program recording, or a field-recorder WAV). Every other track is aligned to it. This is chosen by content, **not** by track position — so it does not matter whether your main camera is on V1, V2, or an audio track.
 
-1. **Coarse auto-align (large offsets)** — for each non-reference track it matches **one** representative clip (the longest) against the **full** reference recording by sliding a low-resolution envelope across it, finds the single offset, and shifts the **whole track** by it. Because device clocks can differ by minutes, this searches the entire reference rather than a fixed window — exactly what the old manual track-drag did, automated.
+1. **Coarse auto-align (large offsets)** — for each non-reference track it matches **one** representative clip (the longest) against the reference recording and shifts the **whole track** by the offset found. To avoid decoding hours of audio, the search runs in stages across all tracks, cheapest predictor first: a tight window around the **start-timecode** delta, then around the **Build position**, then around **offsets already proven by other tracks** (devices from one shoot share the same clock error — once one track finds its offset, the rest confirm theirs in seconds), then the **head region** of each file, and only as a last resort the **full** reference.
 2. **Fine residual** — each non-reference clip is then compared per-clip against the reference track to find the best sub-second shift, bringing every clip to 100%.
 
 Click **≈ Fine Tune Audio** once; both phases run in sequence. Only net shifts greater than **20 ms** are applied — smaller differences are considered already aligned.
@@ -135,10 +144,15 @@ Click **≈ Fine Tune Audio** once; both phases run in sequence. Only net shifts
 **How the fine phase works:**
 
 - Searches for the best lag within **±5 seconds** of the (coarse-aligned) position.
-- Extracts up to **20 seconds** of audio per comparison pair (needs at least **3 seconds** of overlap between clips).
-- Samples the overlap at three positions — centred (50%), early (20%), and late (80%) — to avoid locking onto an unrepresentative section.
-- If the centred window already produces a strong match (confidence ≥ 0.70), the remaining windows are skipped for speed.
+- Extracts up to **10 seconds** of audio per comparison pair (needs at least **3 seconds** of overlap between clips).
+- Samples the overlap at two positions — centred (50%) and early (20%) — to avoid locking onto an unrepresentative section.
+- If the centred window already produces a strong match (confidence ≥ 0.70), the alternate window is skipped for speed.
 - Each non-reference clip is compared against the reference track; the highest-confidence overlap determines the final shift.
+- On overlaps longer than **10 minutes** it additionally checks for **clock drift**: the residual lag is measured near both ends of the overlap, and if they diverge by more than 40 ms the panel reports the drift and rate (ppm). A single offset can't fix drift — split long clips before syncing when flagged.
+
+Decoded audio envelopes are **cached on disk** (invalidated automatically when a
+file changes), so re-running a sync on unchanged media skips the ffmpeg decode —
+by far the slowest part — and completes in seconds.
 
 > **Manual fallback:** for footage where a track has no usable overlapping audio (so coarse align can't lock), you can still drag that track roughly into place with the Selection tool before running Fine Tune.
 
@@ -153,8 +167,8 @@ Click **≈ Fine Tune Audio** once; both phases run in sequence. Only net shifts
 | **Local files only** | Timestamps are read from the local filesystem (`fs.statSync()`) and via `ffprobe`. Network drives or cloud-synced folders may not report reliable dates. |
 | **mtime fallback accuracy** | When falling back to `mtime`, some copy tools (rsync without `--times`, cloud sync apps) reset it. Use tools that preserve file dates, or rely on clips that carry embedded `creation_time`. |
 | **~1s fallback variance** | On the `mtime` fallback, filesystem timing means a clip's calculated start can be off by up to ~1 second; the coarse + fine Fine Tune passes correct the residual. Clips using embedded `creation_time` are more precise. |
-| **Undo granularity** | Premiere's ExtendScript exposes no undo-group API, so Build and Fine Tune each register several undo steps rather than one. Undo repeatedly, or delete the generated `-SYNC` sequence, to revert. |
-| **Camera clock drift** | If devices have different clocks, clips first land at their own absolute times; Fine Tune's coarse pass then corrects large whole-track offsets automatically (when the audio overlaps), and the fine pass polishes the residual. Devices whose audio shares no common sound can't be auto-aligned. |
+| **Undo granularity** | Premiere's ExtendScript exposes no undo-group API, so Build and Fine Tune each register several undo steps rather than one. Use the panel's **↩ Revert** button to undo the last fine tune's shifts in one click, or delete the generated `-SYNC` sequence to start over. |
+| **Camera clock drift** | If devices have different clock *settings*, clips first land at their own absolute times; Fine Tune's coarse pass then corrects large whole-track offsets automatically (when the audio overlaps), and the fine pass polishes the residual. Devices whose clocks run at different *rates* (drift) can't be fixed by an offset — the panel detects and reports drift on long overlaps so you can split the clips. Devices whose audio shares no common sound can't be auto-aligned. |
 | **Linked audio** | The plugin processes video-track clips; linked audio follows via Premiere's clip model. Audio-only tracks are handled on dedicated audio tracks. |
 | **Sequence must be active** | Double-click the sequence in the Project panel before scanning — the panel operates on the sequence currently open in the timeline. |
 
