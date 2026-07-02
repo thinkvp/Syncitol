@@ -13,7 +13,7 @@ Tested against **Adobe Premiere Pro 24, 25, and 26**.
 
 ![Syncitol panel screenshot](docs/screenshots/screenshot.jpg)
 
-> _Note: the screenshot above may show an earlier UI; the current panel leads with a one-click **⚡ Auto Sync** button._
+> _One-click **⚡ Auto Sync**, a **Sync Results** table showing each track/clip's shift, the signal it matched on (here `pek` — Premiere's own peak cache) and a confidence score, with **↩ Revert** to undo the last fine tune and an `ffmpeg`/`ffprobe` status readout in the footer._
 
 ---
 
