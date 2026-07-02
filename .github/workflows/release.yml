@@ -14,9 +14,9 @@ jobs:
   release:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
 
@@ -48,4 +48,12 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zxp --generate-notes --title "$GITHUB_REF_NAME"
+        # Creating a release in the GitHub UI also pushes the tag, which triggers
+        # this workflow — so the release may already exist (with hand-written
+        # notes) by the time we get here. In that case just attach the ZXP.
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.zxp --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.zxp --generate-notes --title "$GITHUB_REF_NAME"
+          fi
