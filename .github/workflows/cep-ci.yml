@@ -1,0 +1,31 @@
+name: CEP CI
+
+on:
+  push:
+    branches: [main]
+    paths: ['cep/**', '.github/workflows/cep-ci.yml']
+  pull_request:
+    paths: ['cep/**', '.github/workflows/cep-ci.yml']
+
+defaults:
+  run:
+    working-directory: cep
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Syntax check
+        run: npm run lint
+      - name: Unit tests
+        run: npm test
+      - name: Version consistency
+        run: npm run set-version:check

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+    <!-- Header -->
+    <div class="header">
+        <div class="header-icon">
+            <svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+                <defs>
+                    <clipPath id="capsuleClip">
+                        <rect x="2.24" y="6.08" width="11.52" height="3.84" rx="1.92" ry="1.92"/>
+                    </clipPath>
+                </defs>
+                <g transform="rotate(-45 8 8)">
+                    <rect x="2.24" y="6.08" width="11.52" height="3.84" rx="1.92" ry="1.92" fill="#F5F4FF"/>
+                    <g clip-path="url(#capsuleClip)">
+                        <rect x="2.24" y="6.08" width="5.76" height="3.84" fill="#F75A5A"/>
+                    </g>
+                    <rect x="2.24" y="6.08" width="11.52" height="3.84" rx="1.92" ry="1.92" fill="none" stroke="#C23D3D" stroke-width="0.32"/>
+                    <polyline points="2.88,8 4.8,8 5.76,6.08 6.72,9.92 7.68,6.72 8.64,9.28 9.6,8 13.12,8" fill="none" stroke="#4A9AF7" stroke-width="0.55" stroke-linecap="round" stroke-linejoin="round"/>
+                </g>
+            </svg>
+        </div>
+        <div class="header-text">
+            <div class="header-title">Syncitol</div>
+            <div class="header-sub">Automatic recording-time sync for Premiere Pro</div>
+        </div>
+        <div id="btn-instructions" class="btn btn-header-icon" title="Instructions">?</div>
+    </div>
+
+    <div class="body">
+
+        <!-- Active sequence info -->
+        <div class="card">
+            <div class="card-label">Active Sequence</div>
+            <div id="seq-info">Click "Auto Sync" or follow the manual steps to begin.</div>
+            <div id="busy-row" class="busy-row" style="display:none;">
+                <span class="busy-spinner"></span>
+                <span id="busy-text">Working…</span>
+                <div id="btn-cancel" class="btn btn-mini btn-cancel" title="Stop the current operation">✕ Cancel</div>
+            </div>
+            <div id="progress-wrap" style="display:none;"><div id="progress-bar"></div></div>
+        </div>
+
+        <!-- Action buttons -->
+        <div class="btn-row">
+            <div id="btn-auto" class="btn btn-primary">⚡ Auto Sync</div>
+        </div>
+
+        <!-- Tips card: shown once per install after a successful Auto Sync -->
+        <div id="tips-card" class="tips-card" style="display:none;">
+            <span class="tips-card-text">🎉 Synced! Syncitol is free — if it saved you time, consider <a id="tips-card-link" href="https://ko-fi.com/thinkvp">tipping on Ko-fi</a>.</span>
+            <div id="tips-card-close" class="btn btn-mini" title="Dismiss">✕</div>
+        </div>
+
+        <div class="card-label">Manual steps</div>
+        <div class="step-card">
+            <div class="step-row">
+                <span class="step-num">1</span>
+                <span class="step-desc">Read clips from the active sequence</span>
+                <div id="btn-refresh" class="btn btn-secondary">↺ Scan Sequence</div>
+            </div>
+            <div class="step-row">
+                <span class="step-num">2</span>
+                <span class="step-desc">Lay clips out by recording time</span>
+                <div id="btn-sync" class="btn btn-secondary is-disabled">⏱ Build Sync</div>
+            </div>
+            <div class="step-row">
+                <span class="step-num">3</span>
+                <span class="step-desc">Polish tracks you've aligned within ~5s</span>
+                <div id="btn-fine-tune" class="btn btn-secondary is-disabled">≈ Fine Tune</div>
+            </div>
+        </div>
+
+        <!-- Sync results summary (filled after a fine tune / Auto Sync) -->
+        <div id="results-section" style="display:none;">
+            <div class="results-head">
+                <div class="card-label">Sync Results</div>
+                <div id="btn-revert" class="btn btn-mini" style="display:none;" title="Undo the shifts applied by the last fine tune">↩ Revert</div>
+            </div>
+            <div class="table-wrap">
+                <table id="results-table" class="sync-table">
+                    <thead>
+                        <tr>
+                            <th>Item</th>
+                            <th>Result</th>
+                            <th>Via</th>
+                            <th>Score</th>
+                        </tr>
+                    </thead>
+                    <tbody id="results-body"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Clip preview table -->
+        <div class="clips-block">
+            <div class="card-label">Detected Clips</div>
+            <div class="table-wrap">
+                <table id="clip-table" class="sync-table" style="display:none;">
+                    <thead>
+                        <tr>
+                            <th>File</th>
+                            <th>Type</th>
+                            <th>Est. Start</th>
+                            <th>Offset</th>
+                        </tr>
+                    </thead>
+                    <tbody id="clip-body"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Log -->
+        <div>
+            <div class="card-label">Log</div>
+            <div id="log"></div>
+        </div>
+
+    </div>
+
+    <!-- Instructions panel -->
+    <div id="instructions-panel" class="instructions-panel">
+        <div class="instructions-header">
+            <span class="instructions-title">How to use Syncitol</span>
+            <div id="btn-instructions-close" class="btn btn-header-icon" title="Close">✕</div>
+        </div>
+        <div class="instructions-body">
+
+            <div class="ins-section">
+                <div class="ins-heading">How it works</div>
+                <p class="ins-text">Syncitol resolves each clip's <strong>record-start time</strong> from the best available source — the media's embedded <strong>creation time</strong> / <strong>timecode</strong>, read directly by the <strong>bundled FFmpeg decoder</strong>. If a file carries none, it falls back to the <strong>file modification date</strong> minus the clip's duration. Every clip is then placed on a new timeline so the gaps between recordings match real clock time, and the audio is fine-aligned by waveform.</p>
+                <p class="ins-text ins-note">No external install required — the FFmpeg audio decoder ships inside the plugin. The Detected Clips table tags each row <code>meta</code> (embedded metadata) or <code>mtime</code> (file date). On the <code>mtime</code> fallback, preserve file dates when copying media — if the OS updates <code>mtime</code> on copy the sync will be off.</p>
+                <p class="ins-text ins-note">Audio envelopes are cached on disk, so re-running a sync on unchanged media is much faster. When Premiere's own waveform cache (<code>.pek</code> peak files) covers the media, the coarse alignment reads it directly — milliseconds instead of minutes, no audio decoding.</p>
+            </div>
+
+            <div class="ins-section">
+                <div class="ins-heading">⚡ Auto Sync</div>
+                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>Scan → Build Sync → align</strong> (coarse whole-track + fine per-clip). Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code> — Auto Sync refuses those), then click Auto Sync. It stops with a clear message if a step can't proceed, and a <strong>✕ Cancel</strong> button next to the spinner stops long audio scans at any time. When it finishes, the <strong>Sync Results</strong> table shows each track and clip's shift, the signal it matched on, and a confidence score. The Manual steps below run the stages individually — note the manual Fine Tune does the <strong>fast fine pass only</strong>, so Auto Sync is what corrects large clock offsets.</p>
+            </div>
+
+            <div class="ins-section">
+                <div class="ins-heading">↺ Scan Sequence</div>
+                <p class="ins-text">Reads every clip's path, duration and type from your <strong>active sequence</strong>. Make the sequence you want to sync the active one first (double-click it in the Project panel).</p>
+            </div>
+
+            <div class="ins-section">
+                <div class="ins-heading">⏱ Build Sync</div>
+                <p class="ins-text">Creates a new sequence named <code>[original]-SYNC</code> and places every clip at its real-clock-time position, preserving track layout and A/V links.</p>
+                <p class="ins-text ins-note">Files should be stored locally — network or cloud-synced paths may not report a reliable modification date.</p>
+            </div>
+
+            <div class="ins-section">
+                <div class="ins-heading">≈ Fine Tune</div>
+                <p class="ins-text">The manual Fine Tune button runs the <strong>fine per-clip pass only</strong> (±5s) — fast, for when you're hands-on and have already nudged tracks into rough alignment. It auto-picks a <strong>reference track</strong> (the one with the most recorded coverage, on any track) and polishes every other clip to it via audio waveform cross-correlation. Only corrections larger than <code>20&nbsp;ms</code> are applied.</p>
+                <p class="ins-text ins-note">Large (minute-scale) clock offsets are handled by the <strong>coarse</strong> whole-track pass, which runs as part of <strong>⚡ Auto Sync</strong>. If a manual Fine Tune leaves a track far off, run Auto Sync instead — or drag the track within ~5s first.</p>
+                <p class="ins-text ins-note">After a fine tune, <strong>↩ Revert</strong> (in Sync Results) undoes exactly the shifts that were applied. On overlaps longer than 10 minutes the panel also checks for <strong>clock drift</strong> — devices whose clocks run at different rates — and warns with the measured drift (a single offset can't fix both ends; split long clips before syncing if flagged).</p>
+                <div class="ins-subheading">Fine pass</div>
+                <div class="ins-range-table">
+                    <div class="ins-range-row"><span class="ins-tag">±5s</span><span>Search range — clips must already be within this</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">10s</span><span>Max audio compared per pair (needs ≥3s overlap)</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">2×</span><span>Samples overlap at 50% and 20% through the window</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">Fast</span><span>Skips the alternate window when centred score ≥0.70</span></div>
+                </div>
+            </div>
+
+            <div class="ins-section">
+                <div class="ins-heading">Requirements</div>
+                <div class="ins-range-table">
+                    <div class="ins-range-row"><span class="ins-tag">Host</span><span>Adobe Premiere Pro 26.0+ (UXP hybrid-addon support)</span></div>
+                    <div class="ins-range-row"><span class="ins-tag">FFmpeg</span><span>Bundled native decoder — no PATH setup</span></div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+        <span>Syncitol UXP v1.0.0</span>
+        <span id="tool-status" class="tool-status"></span>
+        <span>Premiere Pro 26+</span>
+        <a id="footer-tips" href="https://ko-fi.com/thinkvp" title="Support development">Tips</a>
+    </div>
+
+    <script src="js/main.js"></script>
+</body>
+</html>

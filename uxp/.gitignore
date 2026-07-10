@@ -1,0 +1,14 @@
+# UXP Developer Tool local config (machine-specific)
+.uxprc
+
+# Dev-harness runtime files (js/selftest.js reads/writes these)
+debug-command.json
+debug-report.json
+
+# Build output — attach the .ccx to a GitHub Release instead of committing it
+dist/
+
+# Node / OS cruft
+node_modules/
+.DS_Store
+Thumbs.db
