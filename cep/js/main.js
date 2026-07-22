@@ -89,31 +89,6 @@ if (footerTips) {
     });
 }
 
-// ─── Tips card (shown once per install after a successful Auto Sync) ─────────
-const TIPS_DISMISSED_KEY = "syncitol-tips-dismissed";
-const tipsCard = document.getElementById("tips-card");
-const tipsCardClose = document.getElementById("tips-card-close");
-const tipsCardLink = document.getElementById("tips-card-link");
-
-function tipsDismissed() {
-    try { return localStorage.getItem(TIPS_DISMISSED_KEY) === "1"; }
-    catch (_) { return false; }
-}
-function dismissTipsCard() {
-    try { localStorage.setItem(TIPS_DISMISSED_KEY, "1"); } catch (_) {}
-    if (tipsCard) tipsCard.hidden = true;
-}
-function maybeShowTipsCard() {
-    if (tipsCard && !tipsDismissed()) tipsCard.hidden = false;
-}
-if (tipsCardClose) tipsCardClose.addEventListener("click", dismissTipsCard);
-if (tipsCardLink) {
-    tipsCardLink.addEventListener("click", (e) => {
-        e.preventDefault();
-        cep.util.openURLInDefaultBrowser(tipsCardLink.href);
-    });
-}
-
 // ─── Logging ─────────────────────────────────────────────────────────────────
 function log(msg, type = "info") {
     const entry = document.createElement("div");
@@ -1577,8 +1552,19 @@ async function refreshSequence() {
             log(`⚠ Mixed timing sources (${breakdown}). mtime-derived starts are less precise than embedded ones; use Fine Tune Audio to correct residual drift.`, "warn");
         }
 
-        // Global earliest recording — every clip is placed relative to this one
-        // shared wall-clock anchor (matches the Build logic).
+        // Per-track earliest recording — every clip is placed relative to its
+        // own track's earliest clip (not a global anchor). This way a device
+        // whose clock is set to the wrong date (factory reset, dead battery)
+        // doesn't push correctly-dated clips beyond the 24-hour limit.
+        const trackEarliestMs = {};
+        for (const clip of enriched) {
+            const tk = clip.trackType + "_" + clip.trackIndex;
+            if (!(tk in trackEarliestMs) || clip.recordStartMs < trackEarliestMs[tk]) {
+                trackEarliestMs[tk] = clip.recordStartMs;
+            }
+        }
+
+        // Also compute a global earliest for the info log only
         let globalEarliestMs = Infinity;
         for (const clip of enriched) {
             if (clip.recordStartMs < globalEarliestMs) globalEarliestMs = clip.recordStartMs;
@@ -1586,10 +1572,11 @@ async function refreshSequence() {
 
         setProgress(80);
 
-        // 4. Populate clip table (offset shown relative to the global earliest)
+        // 4. Populate clip table (offset relative to that track's earliest)
         clipBody.innerHTML = "";
         enriched.forEach(clip => {
-            const offsetMs = clip.recordStartMs - globalEarliestMs;
+            const tk = clip.trackType + "_" + clip.trackIndex;
+            const offsetMs = clip.recordStartMs - trackEarliestMs[tk];
             const tr = document.createElement("tr");
             const srcTag = isEmbeddedSource(clip.timingSource) ? "meta" : "mtime";
             tr.innerHTML = `
@@ -1602,12 +1589,24 @@ async function refreshSequence() {
         });
         clipTable.style.display = "table";
 
-        // 5. 24-hour span guard (whole sequence runs from the global earliest)
-        const maxEndMs = Math.max(...enriched.map(c => c.recordStartMs + c.durationSec * 1000));
-        const spanSec = (maxEndMs - globalEarliestMs) / 1000;
-        const hasSpanViolation = spanSec > MAX_SPAN_SEC;
+        // 5. 24-hour span guard (per track, matching the Build logic)
+        // When one device has a wildly wrong clock (years off) the per-track
+        // anchor keeps each track compact; the audio pass aligns tracks later.
+        const globalSpanSec = (Math.max(...enriched.map(c => c.recordStartMs + c.durationSec * 1000)) - globalEarliestMs) / 1000;
+        let hasSpanViolation = false;
+        for (const clip of enriched) {
+            const tk = clip.trackType + "_" + clip.trackIndex;
+            const endSec = (clip.recordStartMs - trackEarliestMs[tk]) / 1000 + clip.durationSec;
+            if (endSec > MAX_SPAN_SEC) {
+                hasSpanViolation = true;
+                break;
+            }
+        }
         if (hasSpanViolation) {
-            log(`\u26a0 Sequence spans ${(spanSec / 3600).toFixed(1)}h \u2014 exceeds Premiere\u2019s 24-hour maximum.`, "warn");
+            log(`\u26a0 A track exceeds Premiere\u2019s 24-hour maximum — process one recording day at a time.`, "warn");
+        }
+        if (!hasSpanViolation && globalSpanSec > MAX_SPAN_SEC) {
+            log(`\u2139 Device clocks differ by ${(globalSpanSec / 3600).toFixed(0)}h (likely a wrong date on one device) — per-track anchoring keeps each track compact; audio alignment will sync them.`, "info");
         }
 
         clipPayload = enriched;
@@ -1893,7 +1892,6 @@ async function autoSync() {
 
         await fineTuneAudio({ coarse: true });
         log(cancelRequested ? "Auto Sync cancelled." : "Auto Sync complete.", cancelRequested ? "warn" : "success");
-        if (!cancelRequested) maybeShowTipsCard();
     } catch (e) {
         if (e && e.cancelled) log("Auto Sync cancelled.", "warn");
         else log(`✗ Auto Sync: ${e.message}`, "error");

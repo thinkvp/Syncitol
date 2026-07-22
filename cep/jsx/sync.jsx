@@ -391,21 +391,25 @@ function _buildSyncSequenceImpl(payloadJSON) {
         });
     }
 
-    // ── 2. Global wall-clock anchoring ──────────────────────────────────────
-    // Every clip is placed at its absolute recording time relative to the single
-    // earliest recording across ALL tracks. Because record-start comes from
-    // embedded creation_time (or mtime) on a shared real-time clock, this lines
-    // the tracks up automatically; Fine Tune Audio then corrects any small
-    // residual clock drift between devices.
+    // ── 2. Per-track record-start anchoring ─────────────────────────────────
+    // Each track is anchored to its own earliest clip, not a global anchor
+    // across all tracks. This way a device whose clock is set to the wrong
+    // date (common after a factory reset or dead internal battery) doesn't
+    // push clips from correctly-dated devices beyond the 24-hour limit.
     //
-    // (Earlier versions anchored each track independently to t=0, which left
-    // tracks offset by the difference between their first clips — e.g. a program
-    // recorder and a camera that started minutes apart — and forced a manual
-    // drag to align. Trustworthy timestamps make that unnecessary.)
-    var globalEarliestMs = Number.MAX_VALUE;
+    // Within a single track the timestamps are always consistent (clips from
+    // the same device share the same clock, right or wrong), so the relative
+    // placement is correct. Cross-track alignment is handled by the audio-
+    // based coarse + fine tune passes, which find the real offset between
+    // tracks regardless of where Build initially places them.
+    var trackKeyOf = function(clip) {
+        return clip.trackType + "_" + clip.trackIndex;
+    };
+    var trackEarliestMs = {};
     for (var j = 0; j < enriched.length; j++) {
-        if (enriched[j].recordStartMs < globalEarliestMs) {
-            globalEarliestMs = enriched[j].recordStartMs;
+        var tk = trackKeyOf(enriched[j]);
+        if (!trackEarliestMs.hasOwnProperty(tk) || enriched[j].recordStartMs < trackEarliestMs[tk]) {
+            trackEarliestMs[tk] = enriched[j].recordStartMs;
         }
     }
 
@@ -413,7 +417,8 @@ function _buildSyncSequenceImpl(payloadJSON) {
     var spanError = null;
     for (var sp = 0; sp < enriched.length; sp++) {
         var spClip = enriched[sp];
-        var spEndSec = (spClip.recordStartMs - globalEarliestMs) / 1000 + spClip.durationSec;
+        var spk = trackKeyOf(spClip);
+        var spEndSec = (spClip.recordStartMs - trackEarliestMs[spk]) / 1000 + spClip.durationSec;
         if (spEndSec > MAX_SPAN_SEC) {
             spanError = (spClip.trackType === "video" ? "Video" : "Audio") +
                 " track " + (spClip.trackIndex + 1) + " spans " +
@@ -509,8 +514,10 @@ function _buildSyncSequenceImpl(payloadJSON) {
             if (!avGroups[path]) avGroups[path] = { video: [], audio: [] };
             avGroups[path][clipInfo.trackType].push(timelineClip);
 
-            // All tracks share one wall-clock anchor so they line up directly.
-            var targetOffsetSec = (recordStartByPath[path] - globalEarliestMs) / 1000;
+            // Per-track anchoring: place each clip relative to its own track's
+            // earliest recording. Cross-track offsets are resolved by the
+            // audio-based coarse + fine tune passes.
+            var targetOffsetSec = (recordStartByPath[path] - trackEarliestMs[trackKeyOf(clipInfo)]) / 1000;
             var currentStartSec = timeToSeconds(timelineClip.start);
             var deltaSec = targetOffsetSec - currentStartSec;
 

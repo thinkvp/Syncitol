@@ -1,6 +1,6 @@
 {
   "name": "syncitol",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Modification-date / metadata-based clip sync for Adobe Premiere Pro (CEP extension).",
   "private": true,
   "homepage": "https://github.com/thinkvp/Syncitol#readme",

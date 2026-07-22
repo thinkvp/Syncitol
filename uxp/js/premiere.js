@@ -269,8 +269,14 @@ async function applyShifts(shifts, opts) {
 // ─── Build a synced sequence ──────────────────────────────────────────────────
 // Clone the active sequence (preserves track layout + A/V links), make it active,
 // then reposition every clip to its record-time offset in ONE transaction.
-// `recordStartByPath`: { filePath -> recordStartMs }; globalEarliestMs anchors t=0.
-async function buildSyncSequence(recordStartByPath, globalEarliestMs, baseName) {
+// `clipPayload`: array of { filePath, trackType, trackIndex, recordStartMs, durationSec, … }
+// Each track anchors to its OWN earliest clip — a device whose clock is wrong
+// (factory reset, dead battery) won't push correctly-dated clips beyond 24 h.
+// Cross-track alignment is handled by the audio coarse + fine tune passes.
+const MAX_SPAN_SEC = 86400; // Premiere timelines cannot exceed 24 hours
+const MIN_PLACE_SEC = 0.001; // below this, a build placement delta is "already placed"
+
+async function buildSyncSequence(clipPayload, baseName) {
     const step = (m) => { try { console.log("[build] " + m); } catch (e) {} if (typeof buildSyncSequence.onStep === "function") buildSyncSequence.onStep(m); };
 
     step("1 getActiveProject");
@@ -281,6 +287,30 @@ async function buildSyncSequence(recordStartByPath, globalEarliestMs, baseName) 
 
     step("3 getActiveSequence");
     const active = await val(project.getActiveSequence());
+
+    // ── Per-track earliest recording ─────────────────────────────────────────
+    const trackKeyOf = (c) => `${c.trackType}_${c.trackIndex}`;
+    const trackEarliestMs = {};
+    for (const c of clipPayload) {
+        const tk = trackKeyOf(c);
+        if (!(tk in trackEarliestMs) || c.recordStartMs < trackEarliestMs[tk]) {
+            trackEarliestMs[tk] = c.recordStartMs;
+        }
+    }
+
+    // ── 24-hour span guard (per track) ───────────────────────────────────────
+    for (const c of clipPayload) {
+        const tk = trackKeyOf(c);
+        const endSec = (c.recordStartMs - trackEarliestMs[tk]) / 1000 + (c.durationSec || 0);
+        if (endSec > MAX_SPAN_SEC) {
+            const typeLabel = c.trackType === "video" ? "Video" : "Audio";
+            throw new Error(
+                `${typeLabel} track ${c.trackIndex + 1} spans ${Math.round(endSec / 3600)}h — ` +
+                `exceeds Premiere's 24-hour maximum. Process one recording day at a time.`);
+        }
+    }
+
+    // ── Clone + resolve ──────────────────────────────────────────────────────
     step("4 clone transaction");
     await lockedTransaction(project, "Syncitol: clone for sync", (compound) => {
         compound.addAction(active.createCloneAction());
@@ -295,7 +325,15 @@ async function buildSyncSequence(recordStartByPath, globalEarliestMs, baseName) 
     try { await val(project.openSequence(clone)); } catch (e) {} // surface its timeline tab
     try { await val(project.setActiveSequence(clone)); } catch (e) {}
 
-    // Reposition clips in the clone by record time.
+    // Build a quick lookup: filePath -> recordStartMs.
+    const recordStartByPath = {};
+    for (const c of clipPayload) {
+        if (!(c.filePath in recordStartByPath) || c.recordStartMs < recordStartByPath[c.filePath]) {
+            recordStartByPath[c.filePath] = c.recordStartMs;
+        }
+    }
+
+    // Reposition every clip instance in the clone by record time, per-track.
     step("7 scan clone");
     const scan = await scanSequence(clone);
     step("8 applyStarts (" + scan.clips.length + " clips)");
@@ -303,8 +341,11 @@ async function buildSyncSequence(recordStartByPath, globalEarliestMs, baseName) 
     for (const c of scan.clips) {
         const rs = recordStartByPath[c.filePath];
         if (rs === undefined || rs === null) continue;
-        const targetSec = (rs - globalEarliestMs) / 1000;
-        if (Math.abs(targetSec - c.startSec) < 0.001) continue;
+        const tk = trackKeyOf(c);
+        const earliest = trackEarliestMs[tk];
+        if (earliest === undefined) continue;
+        const targetSec = (rs - earliest) / 1000;
+        if (Math.abs(targetSec - c.startSec) < MIN_PLACE_SEC) continue;
         targets.push({ trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: targetSec - c.startSec });
     }
     const moved = await applyStarts(project, clone, targets, "Syncitol: place by record time");

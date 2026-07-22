@@ -871,15 +871,18 @@ async function refreshSequence() {
         log(`Sequence: "${scan.name}" — ${videoClips} video, ${audioClips} audio clips`);
         setProgress(30);
 
-        // Collapse timeline instances to unique source FILES (video preferred).
+        // Deduplicate to unique source FILES while preserving the FIRST instance's
+        // track info (needed for per-track anchoring). Video is preferred.
         const fileByPath = new Map();
         for (const c of scan.clips) {
             const cur = fileByPath.get(c.filePath);
             const durationSec = c.endSec - c.startSec;
             if (!cur) {
-                fileByPath.set(c.filePath, { filePath: c.filePath, trackType: c.trackType, durationSec });
+                fileByPath.set(c.filePath, {
+                    filePath: c.filePath, trackType: c.trackType, trackIndex: c.trackIndex, durationSec
+                });
             } else {
-                if (c.trackType === "video") cur.trackType = "video";
+                if (c.trackType === "video") { cur.trackType = "video"; cur.trackIndex = c.trackIndex; }
                 if (durationSec > cur.durationSec) cur.durationSec = durationSec;
             }
         }
@@ -918,7 +921,12 @@ async function refreshSequence() {
 
         if (!enriched.length) throw new Error("Could not read timestamps for any clips.");
 
-        // Mixed precise + mtime sources may not agree on the absolute clock.
+        // Mixed timing sources have different semantics (embedded record-start vs.
+        // mtime-derived), so clips from different sources may not agree on the
+        // absolute clock. Warn; Fine Tune Audio can correct the residual drift.
+        // Only warn when a precise embedded source is mixed with the mtime
+        // fallback — two embedded sources (creation_time + modification_date) are
+        // both accurate record starts and don't conflict.
         const usedSources = Object.keys(sourceCounts);
         const hasEmbedded = usedSources.some(isEmbeddedSource);
         const hasMtime = usedSources.includes("mtime");
@@ -927,7 +935,20 @@ async function refreshSequence() {
             log(`⚠ Mixed timing sources (${breakdown}). mtime-derived starts are less precise than embedded ones; use Fine Tune Audio to correct residual drift.`, "warn");
         }
 
-        // Global earliest recording — the shared wall-clock anchor.
+        // Per-track earliest recording — each track anchors to its own earliest
+        // clip, not a global anchor. This way a device whose clock is set to the
+        // wrong date (factory reset, dead battery) doesn't push correctly-dated
+        // clips beyond the 24-hour limit. Cross-track alignment is handled by
+        // the audio coarse + fine tune passes.
+        const trackEarliestMs = {};
+        for (const f of enriched) {
+            const tk = `${f.trackType}_${f.trackIndex}`;
+            if (!(tk in trackEarliestMs) || f.recordStartMs < trackEarliestMs[tk]) {
+                trackEarliestMs[tk] = f.recordStartMs;
+            }
+        }
+
+        // Compute global earliest for the info log only.
         let globalEarliestMs = Infinity;
         for (const f of enriched) {
             if (f.recordStartMs < globalEarliestMs) globalEarliestMs = f.recordStartMs;
@@ -935,10 +956,11 @@ async function refreshSequence() {
 
         setProgress(80);
 
-        // Populate the Detected Clips table (offset relative to the earliest).
+        // Populate the Detected Clips table (offset relative to that track's earliest).
         clipBody.innerHTML = "";
         enriched.forEach(f => {
-            const offsetMs = f.recordStartMs - globalEarliestMs;
+            const tk = `${f.trackType}_${f.trackIndex}`;
+            const offsetMs = f.recordStartMs - trackEarliestMs[tk];
             const tr = document.createElement("tr");
             const srcTag = isEmbeddedSource(f.timingSource) ? "meta" : "mtime";
             tr.innerHTML = `
@@ -951,12 +973,24 @@ async function refreshSequence() {
         });
         clipTable.style.display = "table";
 
-        // 24-hour span guard.
-        const maxEndMs = Math.max(...enriched.map(f => f.recordStartMs + f.durationSec * 1000));
-        const spanSec = (maxEndMs - globalEarliestMs) / 1000;
-        const hasSpanViolation = spanSec > dsp.MAX_SPAN_SEC;
+        // 24-hour span guard (per track, matching the Build logic).
+        // When one device has a wildly wrong clock (years off) the per-track
+        // anchor keeps each track compact; the audio pass aligns tracks later.
+        let hasSpanViolation = false;
+        for (const f of enriched) {
+            const tk = `${f.trackType}_${f.trackIndex}`;
+            const endSec = (f.recordStartMs - trackEarliestMs[tk]) / 1000 + f.durationSec;
+            if (endSec > dsp.MAX_SPAN_SEC) {
+                hasSpanViolation = true;
+                break;
+            }
+        }
+        const globalSpanSec = (Math.max(...enriched.map(f => f.recordStartMs + f.durationSec * 1000)) - globalEarliestMs) / 1000;
         if (hasSpanViolation) {
-            log(`⚠ Sequence spans ${(spanSec / 3600).toFixed(1)}h — exceeds Premiere's 24-hour maximum.`, "warn");
+            log(`\u26a0 A track exceeds Premiere\u2019s 24-hour maximum — process one recording day at a time.`, "warn");
+        }
+        if (!hasSpanViolation && globalSpanSec > dsp.MAX_SPAN_SEC) {
+            log(`\u2139 Device clocks differ by ${(globalSpanSec / 3600).toFixed(0)}h (likely a wrong date on one device) — per-track anchoring keeps each track compact; audio alignment will sync them.`, "info");
         }
 
         clipPayload = enriched;
@@ -965,10 +999,10 @@ async function refreshSequence() {
         setTimeout(() => setProgress(0, false), 600);
 
         if (hasSpanViolation) {
-            log("Build Sync Sequence is disabled — the sequence must fit within 24 hours. Process one recording day at a time.", "error");
+            log("Build Sync Sequence is disabled \u2014 the sequence must fit within 24 hours. Process one recording day at a time.", "error");
         } else {
             setDisabled(btnSync, false);
-            log(`Ready. Click "Build Sync" to create ${scan.name}-SYNC.`, "success");
+            log(`Ready. Click "Build Sync Sequence" to create ${scan.name}-SYNC.`, "success");
         }
 
         return !hasSpanViolation;
@@ -1002,14 +1036,7 @@ async function buildSync() {
     log("Building sync sequence…");
 
     try {
-        const recordStartByPath = {};
-        let globalEarliestMs = Infinity;
-        for (const f of clipPayload) {
-            recordStartByPath[f.filePath] = f.recordStartMs;
-            if (f.recordStartMs < globalEarliestMs) globalEarliestMs = f.recordStartMs;
-        }
-
-        const built = await premiere.buildSyncSequence(recordStartByPath, globalEarliestMs, scannedSeqName);
+        const built = await premiere.buildSyncSequence(clipPayload, scannedSeqName);
         setProgress(80);
 
         // Rename the clone to "<original>-SYNC".

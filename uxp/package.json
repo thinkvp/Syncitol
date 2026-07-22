@@ -1,6 +1,6 @@
 {
   "name": "syncitol-uxp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Recording-time + audio-waveform multicam sync for Premiere Pro (UXP plugin with a bundled FFmpeg native addon).",
   "private": true,
   "scripts": {
