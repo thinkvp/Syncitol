@@ -2,9 +2,18 @@ name: CEP Release
 
 # Push a tag like cep-v1.0.1 to build a signed ZXP and a Windows installer,
 # then publish (or attach to) a GitHub Release.
+#
+# You can also trigger the ZXP build manually via the Actions tab — useful
+# for attaching a missing ZXP to an existing release.
 on:
   push:
     tags: ['cep-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to attach to (e.g. cep-v1.1.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -22,6 +31,8 @@ jobs:
         with:
           node-version: 22
       - name: Check tag matches VERSION
+        # Skip tag check for manual runs — we trust the user's input.
+        if: github.event_name != 'workflow_dispatch'
         run: |
           tag="${GITHUB_REF_NAME#cep-v}"
           file="$(cat VERSION)"
@@ -29,6 +40,7 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match VERSION ($file)"; exit 1
           fi
       - name: Lint, test, version consistency
+        if: github.event_name != 'workflow_dispatch'
         run: |
           npm run lint
           npm test
@@ -57,14 +69,16 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          # On tag push we use GITHUB_REF_NAME; on manual dispatch we use the input.
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         # Creating a release in the GitHub UI also pushes the tag, which triggers
         # this workflow — so the release may already exist (with hand-written
         # notes) by the time we get here. In that case just attach the asset.
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/*.zxp --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/*.zxp --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.zxp --generate-notes --title "Syncitol CEP $GITHUB_REF_NAME"
+            gh release create "$RELEASE_TAG" dist/*.zxp --generate-notes --title "Syncitol CEP $RELEASE_TAG"
           fi
 
   build-installer:
@@ -91,10 +105,11 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         shell: bash
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/*.exe --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/*.exe --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.exe --generate-notes --title "Syncitol CEP $GITHUB_REF_NAME"
+            gh release create "$RELEASE_TAG" dist/*.exe --generate-notes --title "Syncitol CEP $RELEASE_TAG"
           fi
