@@ -8,6 +8,31 @@ Syncitol's version numbering resets to 1.0.0 with this release, alongside the
 new UXP version and the public GitHub launch. Earlier internal version
 history (up to 1.4.0) is preserved in [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
+## [1.2.0] - 2026-07-24
+
+### Added
+- **macOS UXP support:** the UXP plugin now ships a universal macOS addon
+  (arm64 + x86_64) alongside the existing Windows addon. Mac users on
+  Premiere 26+ can now use the UXP version with bundled FFmpeg — no system
+  install needed.
+- **Combined releases:** CEP and UXP now release together under a single
+  `v*` tag. Each release bundles all four artifacts: UXP `.ccx` (Windows +
+  macOS), CEP Windows installer `.exe`, CEP `.zxp`, and source archives.
+- **CEP ↔ UXP version sync:** CI enforces that both plugins stay at the
+  same version across all CI and release workflows.
+- CEP ZXP now included in every release alongside the Windows installer.
+- macOS addon build infrastructure: CMake build for `syncitol.uxpaddon`,
+  CI-friendly FFmpeg 8.1.2 static build script with audio-only LGPL config.
+- `workflow_dispatch` trigger on CEP release workflow for manual ZXP builds.
+
+### Changed
+- Documentation updated throughout for macOS UXP availability and combined
+  releases.
+- UXP `build-ccx.js` now includes macOS addons alongside Windows when
+  present — a single `.ccx` targets both platforms.
+- FFmpeg 8.1.2 x86 inline assembly disabled on macOS (`--disable-inline-asm`)
+  for Clang 16+ compatibility.
+
 ## [1.1.0] - 2026-07-22
 
 ### Changed
