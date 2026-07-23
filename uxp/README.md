@@ -3,9 +3,9 @@
 Recording-time + audio-waveform multicam sync for Premiere Pro — a UXP plugin
 with a bundled FFmpeg decoder.
 
-Part of the [Syncitol](../README.md) project. On macOS, or on Premiere 24/25,
-use the [CEP version](../cep/README.md) instead. Free — if this saves you a
-re-sync session, consider tipping on [Ko-fi](https://ko-fi.com/thinkvp).
+Part of the [Syncitol](../README.md) project. On Premiere 24/25, use the
+[CEP version](../cep/README.md) instead. Free — if this saves you a re-sync
+session, consider tipping on [Ko-fi](https://ko-fi.com/thinkvp).
 
 Syncitol resolves each clip's real recording start time (embedded
 creation-time/timecode metadata, falling back to file dates), lays every clip
@@ -13,14 +13,15 @@ out on a new timeline so gaps match real clock time, then fine-aligns the audio
 by waveform cross-correlation. One click ("Auto Sync") runs the whole pipeline.
 
 - **No ffmpeg install.** The decoder is a bundled native hybrid addon
-  (`win/x64/syncitol.uxpaddon`, 2.3 MB) — a trimmed, statically linked LGPL
-  FFmpeg 8.1.2 (audio demuxers/decoders only). `probe()` reads metadata,
-  `decodePcm()` decodes audio. No PATH setup, no external downloads.
-- **Tiny install.** `npm run build` produces a ~1.3 MB `.ccx`.
+  (`win/x64/syncitol.uxpaddon` / `mac/*/syncitol.uxpaddon`, ~2.3 MB each) — a
+trimmed, statically linked LGPL FFmpeg 8.1.2 (audio demuxers/decoders only).
+  `probe()` reads metadata, `decodePcm()` decodes audio. No PATH setup, no
+  external downloads.
+- **Tiny install.** `npm run build` produces a ~2-5 MB `.ccx` (platform addons).
 
 ## Status
 
-**Verified end-to-end on Premiere Pro 26.3 (Windows)** against a real 30-file
+**Verified end-to-end on Premiere Pro 26.3 (Windows, x64)** against a real 30-file
 two-camera shoot: Auto Sync (scan → build → coarse+fine align) syncs every
 file, multi-track A/V link groups survive the build, and the coarse pass
 resolves from Premiere's `.pek` peak cache with no audio decoding.
@@ -28,7 +29,7 @@ resolves from Premiere's `.pek` peak cache with no audio decoding.
 | Area | State |
 | --- | --- |
 | DSP / sync brain (`js/dsp.js`) | Envelope cross-correlation, coarse search policy, pek parsing, drift probes, learned-offset search — `npm test` 45/45 |
-| Native FFmpeg addon | Compiled, self-contained (only Windows system DLL imports), verified in-panel |
+| Native FFmpeg addon | Compiled for Windows (x64) and macOS (universal: arm64 + x86_64), self-contained, verified in-panel |
 | Host ops (`js/premiere.js`) | Verified live: scan, clone-based Build (**createMoveAction**, not createSetStartAction — see note), transactional shifts, undo = one step |
 | Engine (`js/main.js`) | Staged coarse (pek → timecode → timestamp → learned → head → full), fine pass with rail guard, clock-drift report, cancel, boundary compensation |
 | Caches | Envelope disk cache in the plugin data folder (30-day prune); `.pek`/`.mcdb` index via UXP fs |
@@ -68,19 +69,19 @@ resolves from Premiere's `.pek` peak cache with no audio decoding.
 
 ## Install (users)
 
-**Requires Premiere Pro 26.0+ on Windows x64.** The bundled FFmpeg decoder is
-a UXP hybrid addon; Premiere 25.x loads the panel but reports "Addon is not
-supported", so 26.0 is the real floor. macOS isn't supported yet — see
-[Licensing](#licensing) below for why, and use the [CEP version](../cep/README.md)
-there instead.
+**Requires Premiere Pro 26.0+ on Windows (x64) or macOS (arm64 / x86_64).**
+The bundled FFmpeg decoder is a UXP hybrid addon; Premiere 25.x loads the panel
+but reports "Addon is not supported", so 26.0 is the real floor. On older
+Premiere versions, use the [CEP version](../cep/README.md) instead.
 
 1. Download `Syncitol-UXP-<version>.ccx` from the
-   [Releases](https://github.com/thinkvp/Syncitol/releases) page (tagged `uxp-v*`).
+   [Releases](https://github.com/thinkvp/Syncitol/releases) page (tagged `v*`).
 2. Double-click it. Creative Cloud Desktop opens an **"Install a
    non-marketplace plugin"** dialog — click **Install**.
-3. Windows will prompt for your account credentials as part of installing the
-   addon (it needs filesystem access to read your media) — this is a normal
-   elevation prompt, not a malware warning.
+3. On Windows, you may be prompted for your account credentials as part of
+   installing the addon (it needs filesystem access to read your media) — this
+   is a normal elevation prompt, not a malware warning. On macOS, Creative
+   Cloud handles the install silently.
 4. Once you see "Syncitol is now installed", open (or restart) Premiere Pro
    and find the panel under **Window → UXP Plugins → Syncitol**.
 
@@ -98,10 +99,31 @@ treat it as an upgrade.
 ## Versioning & packaging
 
 - `node scripts/set-version.js 1.2.3` — updates manifest, package.json and the
-  panel footer together.
+  panel footer together. Also bump `cep/VERSION` to keep both plugins at the
+  same version (enforced by CI).
 - `npm run build` — stages the runtime files only and zips them (forward-slash
   entries) into `dist/Syncitol-UXP-<version>.ccx`, failing if the package is
   suspiciously large.
+
+### Releasing
+
+Push a single `v*` tag; both release workflows run in parallel and attach
+their artifacts to the same GitHub Release:
+
+```bash
+# In uxp/:
+node scripts/set-version.js 1.2.0
+# In cep/:
+npm run set-version 1.2.0
+# Commit and tag:
+git commit -am "Release v1.2.0"
+git tag v1.2.0
+git push --follow-tags
+```
+
+All four artifacts land on the same release: UXP `.ccx` (Windows + macOS
+addons bundled), CEP Windows installer `.exe`, and CEP `.zxp`. CI enforces
+that CEP and UXP versions match.
 
 ## Licensing
 
@@ -111,12 +133,13 @@ no GPL components enabled. FFmpeg source: https://ffmpeg.org. IBM Plex fonts
 under the OFL (`fonts/LICENSE.txt`). If distributed commercially, ship an
 offer to provide the FFmpeg build scripts/objects for relinking.
 
-### Why Windows-only for now
+## Build (native addon)
 
-A macOS build of `syncitol.uxpaddon` is technically straightforward — the
-native addon's CMake build already has a macOS branch (source lives in a
-separate build workspace, not this repo). The blocker is that Apple requires
-`.uxpaddon` binaries to be signed and notarized with a paid Apple Developer
-ID, even for free, independent (non-Marketplace) distribution — a $99/yr cost
-this free project isn't taking on right now. Mac users get the [CEP
-version](../cep/README.md) instead, which has no such requirement.
+The addon source lives under `native/`. Build scripts:
+
+- **macOS:** `bash scripts/build-ffmpeg-mac.sh universal` then
+  `cmake -S native -B native/build -DFFMPEG_ROOT=./ffmpeg-out/universal -DCMAKE_BUILD_TYPE=Release`
+- **Windows:** Visual Studio project at `native/uxp/win/syncitol.vcxproj`
+
+CI builds both platforms on tag push (`v*`); the resulting `.ccx` bundles
+addons for Windows (x64) and macOS (universal arm64+x86_64).

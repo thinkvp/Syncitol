@@ -1,17 +1,17 @@
 name: CEP Release
 
-# Push a tag like cep-v1.0.1 to build a signed ZXP and a Windows installer,
-# then publish (or attach to) a GitHub Release.
+# Push a tag like v1.0.1 to build a signed ZXP and a Windows installer,
+# then publish (or attach to) a GitHub Release alongside the UXP artifacts.
 #
 # You can also trigger the ZXP build manually via the Actions tab — useful
 # for attaching a missing ZXP to an existing release.
 on:
   push:
-    tags: ['cep-v*']
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag to attach to (e.g. cep-v1.1.0)'
+        description: 'Version tag to attach to (e.g. v1.1.0)'
         required: true
         type: string
 
@@ -34,7 +34,7 @@ jobs:
         # Skip tag check for manual runs — we trust the user's input.
         if: github.event_name != 'workflow_dispatch'
         run: |
-          tag="${GITHUB_REF_NAME#cep-v}"
+          tag="${GITHUB_REF_NAME#v}"
           file="$(cat VERSION)"
           if [ "$tag" != "$file" ]; then
             echo "Tag $GITHUB_REF_NAME does not match VERSION ($file)"; exit 1
@@ -45,6 +45,16 @@ jobs:
           npm run lint
           npm test
           npm run set-version:check
+      - name: CEP ↔ UXP version sync
+        shell: bash
+        run: |
+          cep_ver="$(cat VERSION)"
+          uxp_ver="$(node -p "require('../uxp/manifest.json').version")"
+          if [ "$cep_ver" != "$uxp_ver" ]; then
+            echo "CEP version ($cep_ver) != UXP version ($uxp_ver) — keep them in sync."
+            exit 1
+          fi
+          echo "CEP & UXP both at $cep_ver ✓"
 
   build-zxp:
     needs: verify
@@ -78,7 +88,7 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/*.zxp --clobber
           else
-            gh release create "$RELEASE_TAG" dist/*.zxp --generate-notes --title "Syncitol CEP $RELEASE_TAG"
+            gh release create "$RELEASE_TAG" dist/*.zxp --generate-notes --title "Syncitol $RELEASE_TAG"
           fi
 
   build-installer:
@@ -111,5 +121,5 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/*.exe --clobber
           else
-            gh release create "$RELEASE_TAG" dist/*.exe --generate-notes --title "Syncitol CEP $RELEASE_TAG"
+            gh release create "$RELEASE_TAG" dist/*.exe --generate-notes --title "Syncitol $RELEASE_TAG"
           fi

@@ -8,6 +8,15 @@ debug-report.json
 # Build output — attach the .ccx to a GitHub Release instead of committing it
 dist/
 
+# Native addon build artifacts
+native/build/
+ffmpeg-out/
+ffmpeg-8.1.2/
+ffmpeg.tar.xz
+
+# macOS addon — built by CI, not committed (Windows addon is committed)
+mac/
+
 # Node / OS cruft
 node_modules/
 .DS_Store

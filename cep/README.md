@@ -2,17 +2,17 @@
 
 [![CEP CI](https://github.com/thinkvp/Syncitol/actions/workflows/cep-ci.yml/badge.svg)](https://github.com/thinkvp/Syncitol/actions/workflows/cep-ci.yml)
 
-Part of the [Syncitol](../README.md) project. On Windows with Premiere 26+,
-the [UXP version](../uxp/README.md) is simpler (bundled FFmpeg, no system
-install). Free — if this saves you a re-sync session, consider tipping on
-[Ko-fi](https://ko-fi.com/thinkvp).
+Part of the [Syncitol](../README.md) project. On Premiere 26+
+(Windows or macOS), the [UXP version](../uxp/README.md) is simpler (bundled
+FFmpeg, no system install). Free — if this saves you a re-sync session,
+consider tipping on [Ko-fi](https://ko-fi.com/thinkvp).
 
 Rebuilds real-world recording timing on a new Premiere Pro timeline from each clip's **embedded recording time** (`creation_time`, falling back to file modification date), then refines the sync with **audio waveform matching** — no timecode, genlock, or slate required.
 
 Tested against **Adobe Premiere Pro 24, 25, and 26**.
 
 - **Repository:** <https://github.com/thinkvp/Syncitol>
-- **Download:** grab the latest release (tagged `cep-v*`) from the [Releases](https://github.com/thinkvp/Syncitol/releases) page, then see [Installation](#installation).
+- **Download:** grab the latest release (tagged `v*`) from the [Releases](https://github.com/thinkvp/Syncitol/releases) page, then see [Installation](#installation).
 
 ---
 
@@ -63,7 +63,7 @@ real clock time. The **Detected Clips** table tags each row with the source used
 ### Option A — Windows installer (recommended on Windows)
 
 1. Download `Syncitol-CEP-Setup-<version>.exe` from the
-   [Releases](https://github.com/thinkvp/Syncitol/releases) page (tagged `cep-v*`).
+   [Releases](https://github.com/thinkvp/Syncitol/releases) page (tagged `v*`).
 2. Run it. It's unsigned, so **Windows SmartScreen may show "Windows
    protected your PC"** — click **More info → Run anyway**. This is expected
    for a free, independent, open-source installer; the source is right here
@@ -256,13 +256,14 @@ Distribution is tag-driven — no manual signing or uploading:
 
 ```bash
 npm run set-version 1.2.0      # stamp VERSION + manifest + footer + package.json
-git commit -am "Release CEP v1.2.0"
-git tag cep-v1.2.0
+git commit -am "Release v1.2.0"
+git tag v1.2.0
 git push --follow-tags
 ```
 
 `cep-release.yml` then builds two release assets in parallel and attaches
-both to the same GitHub Release: a self-signed ZXP (fetches Adobe's
+both to the same GitHub Release (alongside the UXP `.ccx` built by
+`uxp-release.yml`): a self-signed ZXP (fetches Adobe's
 `ZXPSignCmd` on macOS) and a Windows installer `.exe` (via Inno Setup,
 built from the staged runtime files). It fails fast if the tag and `VERSION`
 disagree. For a properly verified ZXP publisher instead of a self-signed

@@ -27,3 +27,13 @@ jobs:
         run: npm run lint
       - name: Unit tests
         run: npm test
+      - name: CEP ↔ UXP version sync
+        shell: bash
+        run: |
+          uxp_ver="$(node -p "require('./manifest.json').version")"
+          cep_ver="$(cat ../cep/VERSION)"
+          if [ "$uxp_ver" != "$cep_ver" ]; then
+            echo "UXP version ($uxp_ver) != CEP version ($cep_ver) — keep them in sync."
+            exit 1
+          fi
+          echo "UXP & CEP both at $uxp_ver ✓"

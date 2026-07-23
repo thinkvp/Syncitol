@@ -1,17 +1,16 @@
 #!/usr/bin/env node
-/**
- * build-ccx.js — package the plugin as a minimal .ccx (a zip Creative Cloud
- * installs on double-click).
- *
- * Stages ONLY what the plugin needs at runtime:
- *   manifest.json, index.html (dev-harness script tag stripped),
- *   js/{dsp,audio,pek,premiere,main}.js, css/, fonts/, win/x64/syncitol.uxpaddon
- * Explicitly NOT staged: js/selftest.js, tests/, scripts/, node_modules/,
- * debug-*.json, docs — a previous package accidentally bundled a full shared
- * FFmpeg build and ballooned to 320 MB; this stays ~2.5 MB.
- *
- * Zero npm dependencies: staging via fs, zipping via PowerShell (Windows).
- */
+// build-ccx.js -- package the plugin as a minimal .ccx (a zip Creative Cloud
+// installs on double-click).
+//
+// Stages ONLY what the plugin needs at runtime:
+//   manifest.json, index.html (dev-harness script tag stripped),
+//   js/{dsp,audio,pek,premiere,main}.js, css/, fonts/,
+//   win/x64/syncitol.uxpaddon, mac/*/syncitol.uxpaddon
+// Explicitly NOT staged: js/selftest.js, tests/, scripts/, node_modules/,
+// debug-*.json, docs -- a previous package accidentally bundled a full shared
+// FFmpeg build and ballooned to 320 MB; this stays ~2-7 MB.
+//
+// Zero npm dependencies: staging via fs, zipping via PowerShell (Windows).
 "use strict";
 const fs = require("fs");
 const path = require("path");
@@ -48,8 +47,11 @@ fs.writeFileSync(path.join(STAGE, "index.html"), html);
 copy("css/style.css");
 for (const f of fs.readdirSync(path.join(ROOT, "fonts"))) copy(`fonts/${f}`);
 
-// The native addon — the whole FFmpeg story in 2.3 MB.
-copy("win/x64/syncitol.uxpaddon");
+// The native addon — the whole FFmpeg story in ~2.3 MB per platform.
+// Copy whichever platform addons exist so one .ccx can target both OSes.
+for (const p of ["win/x64/syncitol.uxpaddon", "mac/x64/syncitol.uxpaddon", "mac/arm64/syncitol.uxpaddon"]) {
+    if (fs.existsSync(path.join(ROOT, p))) copy(p);
+}
 
 // Zip the STAGE CONTENTS (manifest.json at archive root) → .ccx. Entry names
 // use forward slashes per the zip spec (Compress-Archive writes backslashes,
@@ -68,7 +70,7 @@ fs.rmSync(STAGE, { recursive: true, force: true });
 
 const mb = (fs.statSync(OUT).size / 1024 / 1024).toFixed(2);
 console.log(`build-ccx: ${path.relative(ROOT, OUT)} (${mb} MB)`);
-if (fs.statSync(OUT).size > 10 * 1024 * 1024) {
+if (fs.statSync(OUT).size > 15 * 1024 * 1024) {
     console.error("build-ccx: package is unexpectedly large — check the staged contents.");
     process.exit(1);
 }

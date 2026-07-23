@@ -1,11 +1,16 @@
 name: UXP Release
 
-# Push a tag like uxp-v1.0.1 to build the .ccx package and publish (or attach
-# to) a GitHub Release. No signing step — independent (non-Marketplace) .ccx
-# distribution doesn't require Adobe Developer Distribution portal signing.
+# Push a tag like v1.0.1 to build the .ccx package and publish (or attach to)
+# a GitHub Release alongside the CEP artifacts. No signing step — independent
+# (non-Marketplace) .ccx distribution doesn't require Adobe Developer
+# Distribution portal signing.
+#
+# Two jobs: build-addon-mac compiles the native FFmpeg addon for macOS, then
+# release builds the .ccx on Windows (bundling the pre-committed Windows addon
+# and the macOS addon artifact together).
 on:
   push:
-    tags: ['uxp-v*']
+    tags: ['v*']
 
 permissions:
   contents: write
@@ -15,7 +20,53 @@ defaults:
     working-directory: uxp
 
 jobs:
+  # ── macOS native addon ─────────────────────────────────────────────────
+  build-addon-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install nasm pkg-config
+
+      - name: Cache FFmpeg build
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-out
+          key: ffmpeg-mac-static-${{ hashFiles('uxp/scripts/build-ffmpeg-mac.sh') }}
+
+      - name: Build FFmpeg (static, audio-only)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o ffmpeg.tar.xz https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+          tar xf ffmpeg.tar.xz
+          FFMPEG_SRC_DIR="$PWD/ffmpeg-8.1.2" PREFIX_BASE="$PWD/ffmpeg-out" \
+            bash scripts/build-ffmpeg-mac.sh universal
+
+      - name: Build macOS addon
+        run: |
+          cmake -S native -B native/build \
+            -DFFMPEG_ROOT="$PWD/ffmpeg-out/universal" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build native/build
+          mkdir -p mac/x64 mac/arm64
+          # The universal binary works for both x64 and arm64; place in both
+          # dirs so build-ccx.js finds them.
+          cp native/build/syncitol.uxpaddon mac/x64/
+          cp native/build/syncitol.uxpaddon mac/arm64/
+
+      - name: Upload macOS addon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-addon
+          path: |
+            uxp/mac/x64/syncitol.uxpaddon
+            uxp/mac/arm64/syncitol.uxpaddon
+
+  # ── Package & release ──────────────────────────────────────────────────
   release:
+    needs: build-addon-mac
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,11 +77,37 @@ jobs:
       - name: Check tag matches manifest.json
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME#uxp-v}"
+          tag="${GITHUB_REF_NAME#v}"
           file="$(node -p "require('./manifest.json').version")"
           if [ "$tag" != "$file" ]; then
             echo "Tag $GITHUB_REF_NAME does not match manifest.json version ($file)"; exit 1
           fi
+      - name: CEP ↔ UXP version sync
+        shell: bash
+        run: |
+          uxp_ver="$(node -p "require('./manifest.json').version")"
+          cep_ver="$(cat ../cep/VERSION)"
+          if [ "$uxp_ver" != "$cep_ver" ]; then
+            echo "UXP version ($uxp_ver) != CEP version ($cep_ver) — keep them in sync."
+            exit 1
+          fi
+          echo "UXP & CEP both at $uxp_ver ✓"
+
+      - name: Download macOS addon
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-addon
+          # upload-artifact@v4 strips the common ancestor (uxp/mac/) from
+          # paths, so the artifact contains x64/... and arm64/.... Extract
+          # into uxp/mac to restore the prefix build-ccx.js expects.
+          path: uxp/mac
+
+      - name: Verify macOS addon present
+        shell: bash
+        run: |
+          test -f mac/x64/syncitol.uxpaddon || { echo "mac/x64 addon missing"; exit 1; }
+          test -f mac/arm64/syncitol.uxpaddon || { echo "mac/arm64 addon missing"; exit 1; }
+          echo "macOS addon ✓"
 
       - name: Lint, test, build
         run: |
@@ -49,5 +126,5 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/*.ccx --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.ccx --generate-notes --title "Syncitol UXP $GITHUB_REF_NAME"
+            gh release create "$GITHUB_REF_NAME" dist/*.ccx --generate-notes --title "Syncitol $GITHUB_REF_NAME"
           fi

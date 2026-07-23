@@ -29,3 +29,13 @@ jobs:
         run: npm test
       - name: Version consistency
         run: npm run set-version:check
+      - name: CEP ↔ UXP version sync
+        shell: bash
+        run: |
+          cep_ver="$(cat VERSION)"
+          uxp_ver="$(node -p "require('../uxp/manifest.json').version")"
+          if [ "$cep_ver" != "$uxp_ver" ]; then
+            echo "CEP version ($cep_ver) != UXP version ($uxp_ver) — keep them in sync."
+            exit 1
+          fi
+          echo "CEP & UXP both at $cep_ver ✓"
