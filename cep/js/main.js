@@ -752,11 +752,13 @@ function resolvePek(mediaPath) {
 
 // Coarse-rate envelope from a resolved .pek slice, deduped via the run cache
 // (the reference window is shared by every track).
-function getPekEnvelope(resolved, startSec, durSec) {
-    const key = `pek|${resolved.pekPath}|${startSec.toFixed(3)}|${durSec.toFixed(3)}`;
+// `channel` picks a single channel plane (null = the averaged mix).
+function getPekEnvelope(resolved, startSec, durSec, channel) {
+    const chanKey = (typeof channel === "number") ? channel : "mix";
+    const key = `pek|${resolved.pekPath}|${startSec.toFixed(3)}|${durSec.toFixed(3)}|${chanKey}`;
     if (envelopeCache.has(key)) return envelopeCache.get(key);
     const task = fs.promises.readFile(resolved.pekPath)
-        .then(buffer => pekToEnvelope(buffer, resolved.info, COARSE_ENVELOPE_RATE, startSec, durSec));
+        .then(buffer => pekToEnvelope(buffer, resolved.info, COARSE_ENVELOPE_RATE, startSec, durSec, channel));
     envelopeCache.set(key, task);
     return task;
 }
@@ -811,6 +813,19 @@ const COARSE_MATCH_OVERLAP_SEC = 60;
 // within minutes of each other, so their offsets agree to well under this (22 s
 // apart in the real-world log that motivated the feature).
 const COARSE_LEARNED_MARGIN_SEC = 120;
+// Reference clips tried per track, longest first. Matching against only the
+// longest one silently fails whenever a track's recording belongs to a different
+// session than that clip (see analyzeCoarseAlign).
+const COARSE_MAX_REF_CANDIDATES = 4;
+// How far into a clip to hunt for distinctive audio. Recorders left running
+// before the shoot open with minutes of room tone, and a flat probe correlates
+// with any other quiet stretch — a confident-looking match at an arbitrary offset.
+const COARSE_PROBE_SCAN_SEC = 30 * 60;
+const COARSE_VERIFY_MARGIN_SEC = 120;  // ± reference searched around the confirmation point
+const COARSE_VERIFY_TOL_SEC = 10;      // second probe must agree with the first within this
+const COARSE_VERIFY_MIN_SCORE = 0.25;  // the confirmation only has to corroborate, not be pristine
+const COARSE_MAX_RELAY_CANDIDATES = 24; // reference channels scanned per probe window in the relay pass (pek-only, ~0.2s each)
+const COARSE_RELAY_PROBE_SEGMENTS = 4;  // relay probe windows spread across the target (best per quarter)
 
 const COARSE_CFG = {
     minOverlapSec: COARSE_MIN_OVERLAP_SEC,
@@ -821,7 +836,8 @@ const COARSE_CFG = {
     minScore: COARSE_MIN_SCORE,
     strongScore: COARSE_STRONG_SCORE,
     confirmNearSec: COARSE_CONFIRM_NEAR_SEC,
-    learnedMarginSec: COARSE_LEARNED_MARGIN_SEC
+    learnedMarginSec: COARSE_LEARNED_MARGIN_SEC,
+    verifyMarginSec: COARSE_VERIFY_MARGIN_SEC
 };
 
 function trackKeyOf(anchor) {
@@ -836,6 +852,34 @@ function longestAnchor(list) {
         if (dur > bestDur) { bestDur = dur; best = a; }
     }
     return best;
+}
+
+function byDurationDesc(a, b) {
+    return (b.resolvedEndSec - b.resolvedStartSec) - (a.resolvedEndSec - a.resolvedStartSec);
+}
+
+// Files whose record-start is not trustworthy evidence of WHERE they belong:
+// mtime-derived starts in a sequence whose devices disagree about the date (a
+// factory reset or dead clock battery puts one recorder years off). Build can
+// only place such a clip arbitrarily, so a weak match at its Build position is
+// coincidence, not confirmation — the coarse pass must demand a strong score.
+// Returns an empty set when the payload is unavailable (manual Fine Tune) or
+// when every clock agrees, leaving the normal thresholds in force.
+function untrustedTimingPaths() {
+    const out = new Set();
+    if (!clipPayload || !clipPayload.length) return out;
+    let earliestMs = Infinity;
+    let latestEndMs = -Infinity;
+    for (const f of clipPayload) {
+        if (f.recordStartMs < earliestMs) earliestMs = f.recordStartMs;
+        const endMs = f.recordStartMs + (f.durationSec || 0) * 1000;
+        if (endMs > latestEndMs) latestEndMs = endMs;
+    }
+    if ((latestEndMs - earliestMs) / 1000 <= MAX_SPAN_SEC) return out; // clocks agree
+    for (const f of clipPayload) {
+        if (!isEmbeddedSource(f.timingSource)) out.add(f.filePath);
+    }
+    return out;
 }
 
 // Shift whole tracks by one large offset found from a single representative clip.
@@ -865,41 +909,71 @@ async function analyzeCoarseAlign(anchors, onProgress) {
     const envOpts = { sampleRate: COARSE_SAMPLE_RATE, windowSamples: COARSE_WINDOW_SAMPLES };
     const cfg = COARSE_CFG;
 
+    // Clips whose Build position rests on an untrusted clock (see helper).
+    const untrustedPaths = untrustedTimingPaths();
+
     // ── One job per track ─────────────────────────────────────────────────────
     // Tracks whose setup fails (no reference, too short) are reported immediately;
     // the rest carry per-track search state through the stages below.
+    //
+    // Each job carries SEVERAL reference candidates — the clips on the reference
+    // track, longest first — and scores every one independently. Matching against
+    // only the longest reference clip silently fails whenever a track's recording
+    // belongs to a different session than that clip: a second recorder that only
+    // ran in the afternoon could only ever be compared against a morning
+    // reference, so the search had no correct answer available and settled on the
+    // best noise peak. Trying each candidate lets the right session win on merit.
     const jobs = [];
     for (const group of trackGroups.values()) {
         const trackLabel = `${group[0].trackType} track ${group[0].trackIndex + 1}`;
         const targetLayer = group[0].layerOrder;
 
-        // Reference = longest recording on any lower layer (the continuous
-        // program/board recording in a typical multicam setup).
-        const reference = longestAnchor(anchors.filter(a => a.layerOrder < targetLayer));
         // Representative target = longest clip on this track (most audio to match).
         const target = longestAnchor(group);
+        // Reference candidates = recordings on any lower layer, longest first.
+        const pool = anchors.filter(a => a.layerOrder < targetLayer).sort(byDurationDesc);
 
-        if (!reference || !target) {
+        if (!pool.length || !target) {
             log(`Coarse align: ${trackLabel} — no reference recording, leaving to fine pass.`);
             results.push({ scope: "track", label: trackLabel, status: "skipped", detail: "no reference recording — left to fine pass" });
             continue;
         }
 
-        const refDurationFull = Math.min(reference.resolvedEndSec - reference.resolvedStartSec, COARSE_REF_MAX_SEC);
         const tgtAvail = target.resolvedEndSec - target.resolvedStartSec;
         const probeShort = Math.min(tgtAvail, COARSE_TARGET_MAX_SEC);
-        if (probeShort < COARSE_MIN_OVERLAP_SEC || refDurationFull < COARSE_MIN_OVERLAP_SEC) {
+        const usable = pool.filter(r =>
+            Math.min(r.resolvedEndSec - r.resolvedStartSec, COARSE_REF_MAX_SEC) >= COARSE_MIN_OVERLAP_SEC);
+        if (probeShort < COARSE_MIN_OVERLAP_SEC || !usable.length) {
             log(`Coarse align: ${trackLabel} — clips too short to match, leaving to fine pass.`);
             results.push({ scope: "track", label: trackLabel, status: "skipped", detail: "clips too short to match — left to fine pass" });
             continue;
         }
 
+        const candidates = usable.slice(0, COARSE_MAX_REF_CANDIDATES);
+        if (usable.length > candidates.length) {
+            const dropped = usable.length - candidates.length;
+            log(`Coarse align: ${trackLabel} — searching the ${candidates.length} longest of ${usable.length} reference clips; ${dropped} shorter one${dropped !== 1 ? "s" : ""} not searched.`, "info");
+        }
+
+        // No trustworthy Build position → a weak "timestamp" prediction is not
+        // evidence. Raising minScore to strongScore makes the prediction branch of
+        // coarseResolve demand the same confidence as a blind match.
+        const distrusted = untrustedPaths.has(target.filePath);
+        if (distrusted) {
+            log(`Coarse align: ${trackLabel} — ${target.clipName} has an unreliable clock; its Build position won't be trusted on a weak score.`, "info");
+        }
+
         jobs.push({
-            group, trackLabel, reference, target, refDurationFull, tgtAvail,
-            geom: null, plans: null,
-            state: createCoarseState(),
+            group, trackLabel, target, tgtAvail,
+            cfg: distrusted ? Object.assign({}, cfg, { minScore: cfg.strongScore }) : cfg,
+            cands: candidates.map(reference => ({
+                reference,
+                refDurationFull: Math.min(reference.resolvedEndSec - reference.resolvedStartSec, COARSE_REF_MAX_SEC),
+                geom: null, plans: null,
+                state: createCoarseState(),
+                triedLearned: new Set()  // learned offsets this candidate has checked
+            })),
             lines: [],                // buffered log lines, flushed as one block
-            triedLearned: new Set(),  // learned offsets this track has already checked
             done: false,              // matched strongly — stop searching
             failed: false,            // decode error — leave to the fine pass
             finalized: false
@@ -907,32 +981,65 @@ async function analyzeCoarseAlign(anchors, onProgress) {
     }
     if (!jobs.length) return { deltaByKey, notes, results };
 
-    // Metadata-only geometry + plan list per job (cheap ffprobe reads). All of the
-    // window math and selection policy is pure and lives (tested) in dsp.js; this
-    // function only drives the async ffmpeg matcher.
+    // Envelope of the target's opening stretch, for choosing where to probe.
+    // Premiere's peak cache gives it away free; otherwise decode at the coarse rate.
+    async function targetScanEnvelope(job, scanSec) {
+        try {
+            const p = await resolvePek(job.target.filePath);
+            if (p) {
+                const env = await getPekEnvelope(p, job.target.inPointSec, scanSec);
+                if (env && env.length) return env;
+            }
+        } catch (e) {
+            if (e && e.cancelled) throw e; // peaks are opportunistic
+        }
+        return getEnvelope(job.target.filePath, job.target.inPointSec, scanSec, envOpts);
+    }
+
+    // Metadata-only geometry + plan list per candidate (cheap ffprobe reads), plus
+    // the content-picked probe position for this track. All of the window math and
+    // selection policy is pure and lives (tested) in dsp.js; this function only
+    // drives the async ffmpeg matcher.
     await Promise.all(jobs.map(async (job) => {
+        // Probe the most distinctive audio in the clip rather than its head — a
+        // silent lead-in has no structure to match and yields confident nonsense.
+        const probeShort = Math.min(job.tgtAvail, COARSE_TARGET_MAX_SEC);
+        job.probeWindows = [];
+        try {
+            const env = await targetScanEnvelope(job, Math.min(job.tgtAvail, COARSE_PROBE_SCAN_SEC));
+            if (env && env.length) {
+                job.probeWindows = pickProbeWindows(env, COARSE_ENVELOPE_RATE, probeShort, 2);
+            }
+        } catch (e) {
+            if (e && e.cancelled) throw e;
+            // Fall back to probing the head — no worse than the old behaviour.
+        }
+        const probeOffset = job.probeWindows.length ? job.probeWindows[0].offsetSec : 0;
+        job.probeOffsetSec = probeOffset;
+        if (probeOffset >= 1) {
+            log(`Coarse align: ${job.trackLabel} — probing ${job.target.clipName} from +${formatDuration(probeOffset * 1000)} in (its most distinctive audio; the clip opens quietly).`, "info");
+        }
+
         // Start-timecode delta (no audio): when both files carry a usable TC, this
         // is the reference source offset that lines up with the target's in-point.
-        let tcDelta = null;
-        try {
-            const [tcRef, tcTgt] = await Promise.all([
-                probeStartTimecode(job.reference.filePath),
-                probeStartTimecode(job.target.filePath)
-            ]);
+        // Geometry is expressed as if the clip STARTED at the probe point, so the
+        // existing lag→delta math needs no changes.
+        const tcTgt = await probeStartTimecode(job.target.filePath);
+        for (const cand of job.cands) {
+            let tcDelta = null;
+            const tcRef = await probeStartTimecode(cand.reference.filePath);
             if (tcRef !== null && tcTgt !== null) tcDelta = tcTgt - tcRef;
-        } catch (e) {
-            if (e && e.cancelled) throw e; // timecode is otherwise optional
+            cand.geom = {
+                refInPointSec: cand.reference.inPointSec,
+                refDurationFull: cand.refDurationFull,
+                refResolvedStartSec: cand.reference.resolvedStartSec,
+                targetInPointSec: job.target.inPointSec + probeOffset,
+                targetResolvedStartSec: job.target.resolvedStartSec + probeOffset,
+                targetAvailSec: job.tgtAvail - probeOffset,
+                tcDelta
+            };
+            cand.plans = planCoarseSearch(cand.geom, job.cfg);
         }
-        job.geom = {
-            refInPointSec: job.reference.inPointSec,
-            refDurationFull: job.refDurationFull,
-            refResolvedStartSec: job.reference.resolvedStartSec,
-            targetInPointSec: job.target.inPointSec,
-            targetResolvedStartSec: job.target.resolvedStartSec,
-            targetAvailSec: job.tgtAvail,
-            tcDelta
-        };
-        job.plans = planCoarseSearch(job.geom, cfg);
     }));
 
     // Whole-track offsets confirmed STRONGLY on some track — near-free search
@@ -940,10 +1047,25 @@ async function analyzeCoarseAlign(anchors, onProgress) {
     // family (two cameras in the motivating log were 22 s apart at ~-630 s).
     const learnedDeltas = [];
 
-    function matchPlan(job, plan) {
+    // Relay candidates read from Premiere's peak cache (and possibly a single
+    // channel of it); ordinary candidates decode audio. Peak-derived and
+    // decode-derived envelopes must never be correlated against each other — they
+    // measure different things — so a candidate's kind drives BOTH sides.
+    function refEnvFor(cand, winStart, winDur) {
+        return cand.pek
+            ? getPekEnvelope(cand.pek, winStart, winDur, cand.channel)
+            : getEnvelope(cand.reference.filePath, winStart, winDur, envOpts);
+    }
+    function tgtEnvFor(job, cand, startSec, durSec) {
+        return (cand.pek && job.targetPek)
+            ? getPekEnvelope(job.targetPek, startSec, durSec, null)
+            : getEnvelope(job.target.filePath, startSec, durSec, envOpts);
+    }
+
+    function matchPlan(job, cand, plan) {
         return Promise.all([
-            getEnvelope(job.reference.filePath, plan.winStart, plan.winDur, envOpts),
-            getEnvelope(job.target.filePath, job.target.inPointSec, plan.probeDur, envOpts)
+            refEnvFor(cand, plan.winStart, plan.winDur),
+            tgtEnvFor(job, cand, cand.geom.targetInPointSec, plan.probeDur)
         ]).then(([refEnvelope, targetEnvelope]) => slideMatch(refEnvelope, targetEnvelope, {
             envelopeRate: COARSE_ENVELOPE_RATE,
             // Demand real overlap so a window's artificial mid-reference edge
@@ -954,43 +1076,232 @@ async function analyzeCoarseAlign(anchors, onProgress) {
 
     // Premiere peak-file fast path: when BOTH files carry a trusted .pek, match
     // the probe against the whole reference straight from the cached peaks — no
-    // audio decode at all. Returns true on a strong match.
+    // audio decode at all. Tries each reference candidate; true on a strong match.
     async function tryPekCoarse(job) {
-        const [refPek, tgtPek] = await Promise.all([
-            resolvePek(job.reference.filePath),
-            resolvePek(job.target.filePath)
-        ]);
-        if (!refPek || !tgtPek) return false;
+        const tgtPek = await resolvePek(job.target.filePath);
+        if (!tgtPek) return false;
 
-        const probeDur = Math.min(job.geom.targetAvailSec, COARSE_TARGET_MAX_SEC);
-        const plan = {
-            label: "pek", winStart: job.geom.refInPointSec, winDur: job.geom.refDurationFull,
-            probeDur, predicts: false, predictedDeltaSec: 0
-        };
-        const [refEnv, tgtEnv] = await Promise.all([
-            getPekEnvelope(refPek, plan.winStart, plan.winDur),
-            getPekEnvelope(tgtPek, job.geom.targetInPointSec, probeDur)
-        ]);
-        if (!refEnv.length || !tgtEnv.length) return false;
+        for (const cand of job.cands) {
+            const refPek = await resolvePek(cand.reference.filePath);
+            if (!refPek) continue;
 
-        const candidate = slideMatch(refEnv, tgtEnv, {
-            envelopeRate: COARSE_ENVELOPE_RATE,
-            minOverlapSec: Math.min(probeDur, COARSE_MATCH_OVERLAP_SEC)
-        });
-        return coarseConsider(job.state, plan, candidate, job.geom, cfg);
-    }
+            const probeDur = Math.min(cand.geom.targetAvailSec, COARSE_TARGET_MAX_SEC);
+            const plan = {
+                label: "pek", winStart: cand.geom.refInPointSec, winDur: cand.geom.refDurationFull,
+                probeDur, predicts: false, predictedDeltaSec: 0
+            };
+            const [refEnv, tgtEnv] = await Promise.all([
+                getPekEnvelope(refPek, plan.winStart, plan.winDur),
+                getPekEnvelope(tgtPek, cand.geom.targetInPointSec, probeDur)
+            ]);
+            if (!refEnv.length || !tgtEnv.length) continue;
 
-    // Check every learned offset this job hasn't tried yet; true = strong match.
-    async function tryLearnedHints(job) {
-        for (const learned of [...learnedDeltas]) {
-            const hintKey = Math.round(learned / 10); // offsets within ~10s are one lead
-            if (job.triedLearned.has(hintKey)) continue;
-            job.triedLearned.add(hintKey);
-            const plan = planLearnedSearch(job.geom, cfg, learned);
-            if (!plan) continue;
-            if (coarseConsider(job.state, plan, await matchPlan(job, plan), job.geom, cfg)) return true;
+            const candidate = slideMatch(refEnv, tgtEnv, {
+                envelopeRate: COARSE_ENVELOPE_RATE,
+                minOverlapSec: Math.min(probeDur, COARSE_MATCH_OVERLAP_SEC)
+            });
+            if (coarseConsider(cand.state, plan, candidate, cand.geom, job.cfg)) return true;
         }
         return false;
+    }
+
+    // Check every learned offset each candidate hasn't tried yet; true = strong match.
+    async function tryLearnedHints(job) {
+        for (const cand of job.cands) {
+            for (const learned of [...learnedDeltas]) {
+                const hintKey = Math.round(learned / 10); // offsets within ~10s are one lead
+                if (cand.triedLearned.has(hintKey)) continue;
+                cand.triedLearned.add(hintKey);
+                const plan = planLearnedSearch(cand.geom, job.cfg, learned);
+                if (!plan) continue;
+                if (coarseConsider(cand.state, plan, await matchPlan(job, cand, plan), cand.geom, job.cfg)) return true;
+            }
+        }
+        return false;
+    }
+
+    // ── Relay matching ────────────────────────────────────────────────────────
+    // A track that matched nothing on the reference track gets a second attempt
+    // against the tracks that DID resolve. Two lav mics on different people
+    // correlate poorly — each is dominated by its own wearer — but a lav recorder
+    // correlates almost perfectly with the camera channel that recorded the same
+    // mic. Those camera tracks are already positioned, so they are sound
+    // references even though they aren't the reference track.
+    //
+    // Multi-channel sources are searched ONE CHANNEL AT A TIME: a 4-channel camera
+    // mix buries any single lav under the other three, which is exactly why the
+    // averaged comparison scored 0.25.
+    //
+    // Peak-file only, on both sides. That keeps a whole-file scan cheap enough to
+    // run across many channels, and peak-derived envelopes must not be correlated
+    // against decoded ones anyway.
+    async function relayMatch(job, relayRefs) {
+        job.targetPek = await resolvePek(job.target.filePath);
+        if (!job.targetPek) {
+            job.relayNote = `no peak file for ${job.target.clipName} — open it in Premiere to build one`;
+            return;
+        }
+
+        const probeDur = Math.min(job.tgtAvail, COARSE_TARGET_MAX_SEC);
+
+        // Probe windows spread across the WHOLE recording, not just its loudest
+        // stretch. The most distinctive audio can predate every other device — a
+        // recorder started 20 minutes before the cameras is at its liveliest
+        // while nothing else was rolling, and a probe from there can never match
+        // any reference. The peak file makes a full-length envelope nearly free.
+        const fullEnv = await getPekEnvelope(job.targetPek, job.target.inPointSec, job.tgtAvail, null);
+        if (!fullEnv || !fullEnv.length) { job.relayNote = "target peak file held no usable audio"; return; }
+        const windows = pickProbeWindowsSpread(fullEnv, COARSE_ENVELOPE_RATE, probeDur, COARSE_RELAY_PROBE_SEGMENTS);
+        if (!windows.length) { job.relayNote = "no usable probe window in the target"; return; }
+        job.probeWindows = windows; // verification draws its second point from these
+
+        // Resolve peak files up front so channels can be scanned ROUND-ROBIN —
+        // channel 1 of every file before channel 2 of any. Walking one file's
+        // channels exhaustively before moving on lets long wrong-session files
+        // burn the whole budget first (observed: a morning MXF's channels plus
+        // the wavs consumed every slot and the afternoon MXF that actually held
+        // the matching mic channel was never compared).
+        const files = [];
+        for (const ref of relayRefs) {
+            const refPek = await resolvePek(ref.filePath);
+            if (!refPek) continue;
+            const refDurationFull = Math.min(ref.resolvedEndSec - ref.resolvedStartSec, COARSE_REF_MAX_SEC);
+            if (refDurationFull < COARSE_MIN_OVERLAP_SEC) continue;
+            files.push({
+                ref, refPek, refDurationFull,
+                chanCount: Math.max(1, (refPek.info && refPek.info.channels) || 1)
+            });
+        }
+        if (!files.length) { job.relayNote = "no peak files on the already-aligned tracks"; return; }
+        log(`Coarse align: ${job.trackLabel} — relay references: ${files.map(f => `${f.ref.clipName} (${f.chanCount}ch)`).join(", ")}.`, "info");
+        log(`Coarse align: ${job.trackLabel} — relay probe windows at ${windows.map(w => `+${formatDuration(w.offsetSec * 1000)}`).join(", ")} into ${job.target.clipName}.`, "info");
+
+        const queue = [];
+        const maxChan = Math.max(...files.map(f => f.chanCount));
+        for (let c = 0; c < maxChan; c += 1) {
+            for (const f of files) {
+                if (c < f.chanCount) queue.push({ file: f, channel: f.chanCount > 1 ? c : null });
+            }
+        }
+
+        const cands = [];
+        let strong = false;
+        let scannedTotal = 0;
+        for (const win of windows) {
+            if (strong) break;
+            const probeStart = job.target.inPointSec + win.offsetSec;
+            const tgtEnv = await getPekEnvelope(job.targetPek, probeStart, probeDur, null);
+            if (!tgtEnv || !tgtEnv.length) continue;
+
+            let scanned = 0;
+            for (const item of queue) {
+                if (strong || scanned >= COARSE_MAX_RELAY_CANDIDATES) break;
+                scanned += 1;
+                scannedTotal += 1;
+                const file = item.file;
+                const channel = item.channel;
+                const geom = {
+                    refInPointSec: file.ref.inPointSec,
+                    refDurationFull: file.refDurationFull,
+                    refResolvedStartSec: file.ref.resolvedStartSec,
+                    targetInPointSec: probeStart,
+                    targetResolvedStartSec: job.target.resolvedStartSec + win.offsetSec,
+                    targetAvailSec: job.tgtAvail - win.offsetSec,
+                    tcDelta: null
+                };
+
+                const refEnv = await getPekEnvelope(file.refPek, geom.refInPointSec, geom.refDurationFull, channel);
+                if (!refEnv || !refEnv.length) continue;
+
+                const m = slideMatch(refEnv, tgtEnv, {
+                    envelopeRate: COARSE_ENVELOPE_RATE,
+                    minOverlapSec: Math.min(probeDur, COARSE_MATCH_OVERLAP_SEC)
+                });
+                // predicts:false — a blind scan, so coarseResolve demands a STRONG
+                // score. Relay must not resurrect the weak matches we just rejected.
+                const plan = {
+                    label: channel === null ? "relay" : `relay ch${channel + 1}`,
+                    winStart: geom.refInPointSec, winDur: geom.refDurationFull,
+                    probeDur, predicts: false, predictedDeltaSec: 0
+                };
+                const state = createCoarseState();
+                if (coarseConsider(state, plan, m, geom, job.cfg)) strong = true;
+                cands.push({ reference: file.ref, channel, pek: file.refPek, geom, state, plans: [plan] });
+            }
+        }
+
+        if (!cands.length) { job.relayNote = "no peak files on the already-aligned tracks"; return; }
+        if (!strong && scannedTotal < windows.length * queue.length) {
+            log(`Coarse align: ${job.trackLabel} — relay stopped after ${scannedTotal} of ${windows.length * queue.length} window×channel comparisons (the cap); the rest were not searched.`, "warn");
+        }
+        if (!strong) {
+            const ranked = cands
+                .filter(c => c.state.best)
+                .sort((a, b) => b.state.best.score - a.state.best.score)
+                .slice(0, 3)
+                .map(c => `${c.reference.clipName}${(c.channel === null || c.channel === undefined) ? "" : ` ch${c.channel + 1}`} ${c.state.best.score.toFixed(2)}`);
+            if (ranked.length) log(`Coarse align: ${job.trackLabel} — relay best candidates: ${ranked.join(" · ")}.`, "info");
+        }
+
+        // Hand the job its relay candidates and re-run confirmation on them.
+        job.cands = cands;
+        job.relayScanned = scanned;
+        job.verified = false;
+        job.verifyOk = null;
+        job.verifyRejected = null;
+        job.verifyNote = null;
+        await verifyJob(job);
+    }
+
+    // Confirm a job's winning offset against a SECOND, independent stretch of the
+    // same recording. A peak that came from room tone rather than shared content
+    // won't reproduce the same offset elsewhere in the file, so this is what turns
+    // a confidently-wrong shift into an honest "couldn't match". Best-effort: when
+    // there's no usable second window we accept the offset and say so.
+    async function verifyJob(job) {
+        if (job.failed || job.verified) return;
+        job.verified = true;
+
+        const pick = coarseResolveBest(job.cands, job.cfg);
+        if (!pick.result || Math.abs(pick.result.coarseDelta) < COARSE_MIN_APPLY_SEC) return;
+
+        const cand = job.cands[pick.index];
+        // The confirmation must come from a window OTHER than the one the winning
+        // candidate matched with. Candidates can be probed from different windows
+        // (the relay retries several spread across the clip), so derive each
+        // candidate's own probe origin from its geometry instead of assuming the
+        // first window.
+        const originOffset = cand.geom.targetInPointSec - job.target.inPointSec;
+        const second = (job.probeWindows || []).find(w => Math.abs(w.offsetSec - originOffset) > 1);
+        if (!second) { job.verifyNote = "no second window with usable content"; return; }
+
+        const probeDur = Math.min(cand.geom.targetAvailSec, COARSE_TARGET_MAX_SEC);
+        // probeWindows offsets are measured from the clip's in-point; geom's probe
+        // origin already includes the winning window's offset.
+        const probe2Rel = second.offsetSec - originOffset;
+        const plan = planCoarseVerify(cand.geom, job.cfg, pick.result.coarseDelta, probe2Rel, probeDur);
+        if (!plan) { job.verifyNote = "the second window falls outside the reference"; return; }
+
+        try {
+            const [refEnv, tgtEnv] = await Promise.all([
+                refEnvFor(cand, plan.winStart, plan.winDur),
+                tgtEnvFor(job, cand, job.target.inPointSec + second.offsetSec, probeDur)
+            ]);
+            const m = slideMatch(refEnv, tgtEnv, {
+                envelopeRate: COARSE_ENVELOPE_RATE,
+                minOverlapSec: Math.min(probeDur, COARSE_MATCH_OVERLAP_SEC)
+            });
+            if (!m) { job.verifyNote = "the second window produced no usable match"; return; }
+            const disagreeSec = Math.abs(m.lagSec - plan.expectedLagSec);
+            if (m.score >= COARSE_VERIFY_MIN_SCORE && disagreeSec <= COARSE_VERIFY_TOL_SEC) {
+                job.verifyOk = { score: m.score, disagreeSec };
+            } else {
+                job.verifyRejected = { score: m.score, disagreeSec };
+            }
+        } catch (e) {
+            if (e && e.cancelled) throw e;
+            job.verifyNote = e.message; // confirmation is best-effort
+        }
     }
 
     // Resolve a finished job: apply the chosen shift, flush its buffered log lines
@@ -998,32 +1309,57 @@ async function analyzeCoarseAlign(anchors, onProgress) {
     function finalizeJob(job) {
         job.finalized = true;
         if (!job.failed) {
-            const result = coarseResolve(job.state, job.geom, cfg);
-            if (!result.chosen) {
-                job.lines.push([`Coarse align: ${job.trackLabel} — no confident match for ${job.target.clipName} (best score ${result.best ? result.best.score.toFixed(2) : "n/a"}), leaving to fine pass.`, "warn"]);
+            // Score every reference candidate and keep the most confident one — the
+            // right session wins on audio content, not on being the longest clip.
+            const pick = coarseResolveBest(job.cands, job.cfg);
+
+            if (pick.result && job.verifyRejected) {
+                // The offset looked confident but didn't hold up elsewhere in the
+                // recording — almost always a match on room tone. Leave the track
+                // where it is rather than move it somewhere confidently wrong.
+                const v = job.verifyRejected;
+                job.lines.push([`Coarse align: ${job.trackLabel} — ${job.target.clipName} matched ${job.cands[pick.index].reference.clipName} at ${formatSignedSeconds(pick.result.coarseDelta)} (score ${pick.result.chosen.score.toFixed(2)}), but a second stretch of the recording disagrees by ${formatDuration(v.disagreeSec * 1000)} (score ${v.score.toFixed(2)}) — rejecting it and leaving the track to the fine pass.`, "warn"]);
                 results.push({
                     scope: "track", label: job.trackLabel, status: "unmatched",
-                    score: result.best ? result.best.score : null,
+                    score: pick.result.chosen.score,
+                    detail: `offset failed second-window confirmation (${v.disagreeSec.toFixed(1)}s apart)`
+                });
+            } else if (!pick.result) {
+                job.lines.push([`Coarse align: ${job.trackLabel} — no confident match for ${job.target.clipName} (best score ${pick.best ? pick.best.score.toFixed(2) : "n/a"} across ${job.cands.length} reference clip${job.cands.length !== 1 ? "s" : ""}), leaving to fine pass.`, "warn"]);
+                results.push({
+                    scope: "track", label: job.trackLabel, status: "unmatched",
+                    score: pick.best ? pick.best.score : null,
                     detail: `no confident match for ${job.target.clipName}`
                 });
-            } else if (Math.abs(result.coarseDelta) < COARSE_MIN_APPLY_SEC) {
-                job.lines.push([`Coarse align: ${job.trackLabel} already aligned (match score ${result.chosen.score.toFixed(2)}).`]);
+            } else if (Math.abs(pick.result.coarseDelta) < COARSE_MIN_APPLY_SEC) {
+                job.matched = true;
+                job.lines.push([`Coarse align: ${job.trackLabel} already aligned (match score ${pick.result.chosen.score.toFixed(2)}).`]);
                 results.push({
                     scope: "track", label: job.trackLabel, status: "aligned",
-                    score: result.chosen.score, method: result.chosen.label
+                    score: pick.result.chosen.score, method: pick.result.chosen.label
                 });
             } else {
+                job.matched = true;
+                const delta = pick.result.coarseDelta;
+                const winner = job.cands[pick.index];
+                const refName = winner.channel === null || winner.channel === undefined
+                    ? winner.reference.clipName
+                    : `${winner.reference.clipName} ch${winner.channel + 1}`;
                 for (const anchor of job.group) {
-                    anchor.resolvedStartSec += result.coarseDelta;
-                    anchor.resolvedEndSec += result.coarseDelta;
-                    deltaByKey.set(anchor.key, (deltaByKey.get(anchor.key) || 0) + result.coarseDelta);
+                    anchor.resolvedStartSec += delta;
+                    anchor.resolvedEndSec += delta;
+                    deltaByKey.set(anchor.key, (deltaByKey.get(anchor.key) || 0) + delta);
                 }
-                job.lines.push([`Coarse align: ${job.trackLabel} shifted ${formatSignedSeconds(result.coarseDelta)} to match ${job.target.clipName} against ${job.reference.clipName} via ${result.chosen.label} (score ${result.chosen.score.toFixed(2)}).`, "success"]);
+                const confirm = job.verifyOk
+                    ? `, confirmed at a second point (score ${job.verifyOk.score.toFixed(2)})`
+                    : (job.verifyNote ? `, unconfirmed — ${job.verifyNote}` : "");
+                job.lines.push([`Coarse align: ${job.trackLabel} shifted ${formatSignedSeconds(delta)} to match ${job.target.clipName} against ${refName} via ${pick.result.chosen.label} (score ${pick.result.chosen.score.toFixed(2)}${confirm}).`, "success"]);
                 results.push({
                     scope: "track", label: job.trackLabel, status: "shifted",
-                    deltaSec: result.coarseDelta, score: result.chosen.score, method: result.chosen.label
+                    deltaSec: delta, score: pick.result.chosen.score,
+                    method: `${pick.result.chosen.label} · ${refName}`
                 });
-                if (result.chosen.score >= COARSE_STRONG_SCORE) learnedDeltas.push(result.coarseDelta);
+                if (pick.result.chosen.score >= COARSE_STRONG_SCORE) learnedDeltas.push(delta);
             }
         }
         for (const [msg, type] of job.lines) log(msg, type);
@@ -1042,12 +1378,12 @@ async function analyzeCoarseAlign(anchors, onProgress) {
             // peaks are opportunistic — fall through to the audio stages
         }
     });
+    const pekDone = jobs.filter(j => j.done && !j.finalized);
+    await mapPool(pekDone, SYNC_CONCURRENCY, verifyJob);
     let pekMatched = 0;
-    for (const job of jobs) {
-        if (job.done && !job.finalized) {
-            finalizeJob(job);
-            pekMatched += 1;
-        }
+    for (const job of pekDone) {
+        finalizeJob(job);
+        pekMatched += 1;
     }
     if (pekMatched > 0) {
         notes.push(`Coarse align: ${pekMatched} of ${jobs.length} track${jobs.length !== 1 ? "s" : ""} matched from Premiere's peak-file cache — no audio decoded.`);
@@ -1076,13 +1412,16 @@ async function analyzeCoarseAlign(anchors, onProgress) {
                     job.done = true;
                 }
                 if (!job.done) {
-                    for (const plan of job.plans) {
-                        if (stageLabels.indexOf(plan.label) === -1) continue;
-                        if (plan.label === "full" && job.state.skipFull) continue; // prediction confirmed — skip the costly full scan
-                        if (coarseConsider(job.state, plan, await matchPlan(job, plan), job.geom, cfg)) {
-                            job.done = true;
-                            break;
+                    for (const cand of job.cands) {
+                        for (const plan of cand.plans) {
+                            if (stageLabels.indexOf(plan.label) === -1) continue;
+                            if (plan.label === "full" && cand.state.skipFull) continue; // prediction confirmed — skip the costly full scan
+                            if (coarseConsider(cand.state, plan, await matchPlan(job, cand, plan), cand.geom, job.cfg)) {
+                                job.done = true;
+                                break;
+                            }
                         }
+                        if (job.done) break;
                     }
                 }
             } catch (e) {
@@ -1095,16 +1434,52 @@ async function analyzeCoarseAlign(anchors, onProgress) {
             if (onProgress) onProgress(units, totalUnits);
         });
 
-        // Publish freshly-confident offsets before the next (blind) stage.
-        for (const job of jobs) {
-            if ((job.done || job.failed) && !job.finalized) finalizeJob(job);
-        }
+        // Confirm, then publish freshly-confident offsets before the next (blind)
+        // stage — an unconfirmed offset must not become a hint for other tracks.
+        const settled = jobs.filter(j => (j.done || j.failed) && !j.finalized);
+        await mapPool(settled, SYNC_CONCURRENCY, verifyJob);
+        for (const job of settled) finalizeJob(job);
     }
 
     // Tracks that exhausted every stage: accept a near-prediction match or give up.
+    const remaining = jobs.filter(j => !j.finalized);
+    await mapPool(remaining, SYNC_CONCURRENCY, verifyJob);
+
+    // ── Relay pass ────────────────────────────────────────────────────────────
+    // Anything still unmatched (or whose match failed confirmation) is retried
+    // against the tracks that DID resolve, channel by channel.
+    const resolvedAnchors = [];
     for (const job of jobs) {
-        if (!job.finalized) finalizeJob(job);
+        if (job.finalized && job.matched) resolvedAnchors.push(...job.group);
     }
+    // The reference track's own clips are positioned by definition — include them
+    // so their individual channels get a per-channel retry too (the main pass
+    // only ever compared their downmixed mix).
+    resolvedAnchors.push(...anchors.filter(a => a.layerOrder === baseLayer));
+    resolvedAnchors.sort(byDurationDesc);
+
+    const needsRelay = remaining.filter(job => {
+        if (job.failed) return false;
+        const pick = coarseResolveBest(job.cands, job.cfg);
+        return !pick.result || !!job.verifyRejected;
+    });
+
+    if (needsRelay.length && resolvedAnchors.length) {
+        for (const job of needsRelay) {
+            const refs = resolvedAnchors.filter(a => trackKeyOf(a) !== trackKeyOf(job.target));
+            if (!refs.length) continue;
+            log(`Coarse align: ${job.trackLabel} — retrying ${job.target.clipName} against the tracks that did align, one channel at a time.`, "info");
+            try {
+                await relayMatch(job, refs);
+            } catch (e) {
+                if (e && e.cancelled) throw e;
+                job.relayNote = e.message;
+            }
+            if (job.relayNote) log(`Coarse align: ${job.trackLabel} — relay unavailable: ${job.relayNote}`, "warn");
+        }
+    }
+
+    for (const job of remaining) finalizeJob(job);
 
     return { deltaByKey, notes, results };
 }
@@ -1316,6 +1691,7 @@ async function analyzeFineTune(anchors, onProgress) {
             const deltaSec = -(bestPair.lagSec);
             row.score = bestPair.score;
             row.method = bestPair.reference.clipName;
+            let appliedDelta = 0;
             if (Math.abs(deltaSec) < FINE_TUNE_MIN_APPLY_SEC) {
                 lines.push([`${target.clipName} already aligned (delta < 20 ms)`, "info"]);
                 row.status = "aligned";
@@ -1324,11 +1700,11 @@ async function analyzeFineTune(anchors, onProgress) {
                 adjustment = {
                     clipName: target.clipName,
                     filePath: target.filePath,
-                    startTicks: target.startTicks,
                     deltaSec: roundedDelta,
                     referenceName: bestPair.reference.clipName,
                     score: bestPair.score
                 };
+                appliedDelta = roundedDelta;
                 target.resolvedStartSec += roundedDelta;
                 target.resolvedEndSec += roundedDelta;
                 lines.push([`✓ ${target.clipName}: shift ${formatSignedSeconds(roundedDelta)} vs ${bestPair.reference.clipName} (score ${bestPair.score.toFixed(2)}, ${bestPair.attempts.length} window${bestPair.attempts.length !== 1 ? "s" : ""})`, "success"]);
@@ -1338,12 +1714,27 @@ async function analyzeFineTune(anchors, onProgress) {
 
             // Long overlap and a solid match: also check whether the two devices'
             // clocks RUN at different rates (drift), which one offset can't fix.
+            // Beyond DRIFT_IMPLAUSIBLE_PPM the two ends disagree by more than any
+            // real device pair can, which means the windows matched noise rather
+            // than shared audio — discard the shift instead of locking it in.
             try {
                 const drift = await measureDrift(bestPair.reference, target);
                 if (drift) {
                     row.driftSec = drift.driftSec;
                     row.driftPpm = drift.ppm;
-                    lines.push([`⚠ ${target.clipName}: clock drift ${formatSignedSeconds(drift.driftSec)} across ${formatDuration(drift.spanSec * 1000)} (~${drift.ppm} ppm) vs ${bestPair.reference.clipName} — the tail may be audibly off; consider splitting long clips before syncing.`, "warn"]);
+                    if (Math.abs(drift.ppm) >= DRIFT_IMPLAUSIBLE_PPM) {
+                        if (appliedDelta) {
+                            target.resolvedStartSec -= appliedDelta;
+                            target.resolvedEndSec -= appliedDelta;
+                        }
+                        adjustment = null;
+                        lines.push([`⚠ Skip ${target.clipName}: the match vs ${bestPair.reference.clipName} implies ${drift.ppm} ppm drift across ${formatDuration(drift.spanSec * 1000)} — far beyond any real device, so it is not the same audio. Left in place.`, "warn"]);
+                        row.status = "unmatched";
+                        delete row.deltaSec;
+                        row.detail = `rejected: implausible ${drift.ppm} ppm drift vs ${bestPair.reference.clipName}`;
+                    } else {
+                        lines.push([`⚠ ${target.clipName}: clock drift ${formatSignedSeconds(drift.driftSec)} across ${formatDuration(drift.spanSec * 1000)} (~${drift.ppm} ppm) vs ${bestPair.reference.clipName} — the tail may be audibly off; consider splitting long clips before syncing.`, "warn"]);
+                    }
                 }
             } catch (e) {
                 if (e && e.cancelled) throw e;
@@ -1770,14 +2161,15 @@ async function fineTuneAudio(opts = {}) {
         fine.notes.forEach(msg => log(msg));
         syncRows.push(...fine.results);
 
-        // Merge coarse + fine deltas per clip so each clip moves exactly once.
+        // Merge coarse + fine deltas per FILE so each file moves exactly once.
+        // (Anchor keys are file paths — one shift covers every timeline instance
+        // of the file, keeping linked A/V together.)
         const totalByKey = new Map();
         for (const [key, d] of coarseDeltaByKey) {
             totalByKey.set(key, (totalByKey.get(key) || 0) + d);
         }
         for (const adj of fine.adjustments) {
-            const key = `${adj.filePath}|${adj.startTicks}`;
-            totalByKey.set(key, (totalByKey.get(key) || 0) + adj.deltaSec);
+            totalByKey.set(adj.filePath, (totalByKey.get(adj.filePath) || 0) + adj.deltaSec);
         }
 
         const anchorByKey = new Map(anchors.map(a => [a.key, a]));
@@ -1787,7 +2179,7 @@ async function fineTuneAudio(opts = {}) {
             if (Math.abs(rounded) < FINE_TUNE_MIN_APPLY_SEC) continue;
             const anchor = anchorByKey.get(key);
             if (!anchor) continue;
-            adjustments.push({ filePath: anchor.filePath, startTicks: anchor.startTicks, deltaSec: rounded });
+            adjustments.push({ filePath: anchor.filePath, deltaSec: rounded });
         }
 
         if (!adjustments.length) {
@@ -1816,16 +2208,14 @@ async function fineTuneAudio(opts = {}) {
         }
 
         // Stash the exact inverse so one click can undo this fine tune: each
-        // moved clip gets −delta (matched by its post-move start ticks), and the
-        // whole sequence un-shifts the boundary compensation.
+        // moved file gets −delta (matched by file path), and the whole sequence
+        // un-shifts the boundary compensation.
         if (apply.moved && apply.moved.length) {
+            const revertByPath = new Map();
+            for (const m of apply.moved) revertByPath.set(m.filePath, -m.deltaSec);
             setRevertAvailable({
                 globalShiftSec: -(apply.compensateSec || 0),
-                adjustments: apply.moved.map(m => ({
-                    filePath: m.filePath,
-                    startTicks: m.newStartTicks,
-                    deltaSec: -m.deltaSec
-                }))
+                adjustments: [...revertByPath].map(([filePath, deltaSec]) => ({ filePath, deltaSec }))
             });
         }
 

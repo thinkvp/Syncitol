@@ -133,7 +133,7 @@ test("slideMatch honours a raised overlap floor (rejects short edge matches)", (
 const COARSE_CFG = {
     minOverlapSec: 8, targetMaxSec: 120, tcConfirmSec: 30, predictMarginSec: 300,
     headSec: 720, minScore: 0.3, strongScore: 0.5, confirmNearSec: 90,
-    learnedMarginSec: 120,
+    learnedMarginSec: 120, verifyMarginSec: 120,
 };
 
 // A reference 2h long; target placed `tsErrorSec` later than truth on the timeline.
@@ -333,6 +333,211 @@ test("coarse: nothing confident leaves the track to the fine pass", () => {
     assert.strictEqual(result.coarseDelta, null);
 });
 
+// ─── pickProbeWindows / planCoarseVerify ──────────────────────────────────────
+
+// A recorder left running before the shoot: `silenceSec` of room tone, then real
+// content. Room tone still has noise — the point is that its SPREAD is tiny.
+function leadInSilenceEnvelope(silenceSec, contentSec, rate) {
+    const env = new Float32Array(Math.round((silenceSec + contentSec) * rate));
+    const quiet = Math.round(silenceSec * rate);
+    for (let i = 0; i < env.length; i += 1) {
+        env[i] = i < quiet
+            ? 20 + ((i % 7) - 3)                     // room tone: ~20 ±3
+            : 3000 + 2500 * Math.sin(i / 9);         // speech: large swings
+    }
+    return env;
+}
+
+test("pickProbeWindows skips a silent lead-in and probes the real content", () => {
+    const rate = 10;
+    const env = leadInSilenceEnvelope(300, 600, rate); // 5 min silence, 10 min content
+    const [best] = dsp.pickProbeWindows(env, rate, 120, 1);
+    assert.ok(best, "a window must be selected");
+    // The probe must be essentially all content — not merely straddling the
+    // boundary, which is what a variance-ranked pick does (it maximises spread by
+    // wasting half the probe on room tone). Landing a frame or two early to catch
+    // the onset edge is fine and mildly useful.
+    const silentFraction = Math.max(0, 300 - best.offsetSec) / 120;
+    assert.ok(silentFraction < 0.02,
+        `probe should be nearly all content; ${(silentFraction * 100).toFixed(1)}% was room tone (offset ${best.offsetSec}s)`);
+    // The old behaviour probed at offset 0 — pure room tone.
+    assert.ok(best.offsetSec > 0, "the head of this clip is silence and must not be chosen");
+});
+
+test("pickProbeWindows returns non-overlapping windows, best first", () => {
+    const rate = 10;
+    const env = leadInSilenceEnvelope(60, 900, rate);
+    const picks = dsp.pickProbeWindows(env, rate, 120, 2);
+    assert.strictEqual(picks.length, 2);
+    assert.ok(picks[0].activity >= picks[1].activity, "windows must be ranked by activity");
+    assert.ok(Math.abs(picks[0].offsetSec - picks[1].offsetSec) >= 120,
+        "the confirmation window must not overlap the probe window");
+});
+
+test("pickProbeWindows rates room tone far below real content", () => {
+    const rate = 10;
+    const env = leadInSilenceEnvelope(300, 600, rate);
+    const quiet = dsp.pickProbeWindows(env.slice(0, 300 * rate), rate, 120, 1)[0];
+    const loud = dsp.pickProbeWindows(env.slice(300 * rate), rate, 120, 1)[0];
+    assert.ok(loud.activity > quiet.activity * 10,
+        `content ${loud.activity} should dwarf room tone ${quiet.activity}`);
+});
+
+test("pickProbeWindows returns nothing when the clip is shorter than the probe", () => {
+    assert.deepStrictEqual(dsp.pickProbeWindows(new Float32Array(100), 10, 120, 2), []);
+});
+
+test("pickProbeWindows is stable on a perfectly flat envelope", () => {
+    const env = new Float32Array(3000).fill(1200); // constant, loud
+    const [best] = dsp.pickProbeWindows(env, 10, 60, 1);
+    assert.ok(best, "a window is still returned");
+    assert.ok(Number.isFinite(best.activity) && best.activity >= 0, `activity ${best.activity}`);
+});
+
+test("pickProbeWindowsSpread returns one window per region, covering the whole clip", () => {
+    // The failure this guards: a recorder started ~20 min before the cameras has
+    // its LOUDEST audio in that solo stretch, so every top-N window clustered
+    // there — and a probe from there can never match any camera. Spread picking
+    // must surface windows from later regions too.
+    const rate = 10;
+    const total = 6000; // 100 min
+    const env = new Float32Array(total * rate);
+    for (let i = 0; i < env.length; i += 1) {
+        const t = i / rate;
+        const loudness = t < 1500 ? 4000 : 1500; // head solo stretch is loudest
+        env[i] = loudness + loudness * 0.8 * Math.sin(i / 7);
+    }
+    const wins = dsp.pickProbeWindowsSpread(env, rate, 120, 4);
+    assert.strictEqual(wins.length, 4);
+    // Best-first: the loud head region wins overall…
+    assert.ok(wins[0].offsetSec < 1500, `top window should be in the head, got ${wins[0].offsetSec}`);
+    // …but every quarter contributes a window, so retries reach the later regions.
+    const quarters = new Set(wins.map(w => Math.min(3, Math.floor(w.offsetSec / (total / 4)))));
+    assert.strictEqual(quarters.size, 4, `windows must span all quarters, got offsets ${wins.map(w => Math.round(w.offsetSec)).join(", ")}`);
+});
+
+test("pickProbeWindowsSpread falls back to plain picking on short clips", () => {
+    const rate = 10;
+    const env = leadInSilenceEnvelope(60, 240, rate); // 5 min total < 4 segments × 2 min
+    const wins = dsp.pickProbeWindowsSpread(env, rate, 120, 4);
+    assert.ok(wins.length >= 1, "short clips still yield windows");
+    for (let i = 1; i < wins.length; i += 1) {
+        assert.ok(Math.abs(wins[0].offsetSec - wins[i].offsetSec) >= 120, "fallback windows must not overlap");
+    }
+});
+
+test("pickProbeWindowsSpread returns nothing when the clip is shorter than the probe", () => {
+    assert.deepStrictEqual(dsp.pickProbeWindowsSpread(new Float32Array(100), 10, 120, 4), []);
+});
+
+test("planCoarseVerify aims at where the second probe should land", () => {
+    // Reference source 0..7200 at timeline 0; target probe origin at timeline 100.
+    // A -40s shift puts the probe at timeline 60; a second probe 300s later in the
+    // recording therefore belongs at timeline 360 → reference source 360.
+    const geom = {
+        refInPointSec: 0, refDurationFull: 7200, refResolvedStartSec: 0,
+        targetInPointSec: 0, targetResolvedStartSec: 100, targetAvailSec: 3600, tcDelta: null
+    };
+    const plan = dsp.planCoarseVerify(geom, COARSE_CFG, -40, 300, 120);
+    assert.ok(plan);
+    // Window is centred on 360 with the configured margin either side.
+    assert.strictEqual(plan.winStart, 360 - COARSE_CFG.verifyMarginSec);
+    assert.ok(Math.abs(plan.expectedLagSec - COARSE_CFG.verifyMarginSec) < 1e-9,
+        `a correct offset should produce lag ${COARSE_CFG.verifyMarginSec}, got ${plan.expectedLagSec}`);
+});
+
+test("planCoarseVerify declines when the reference doesn't reach the second probe", () => {
+    const geom = {
+        refInPointSec: 0, refDurationFull: 600, refResolvedStartSec: 0,
+        targetInPointSec: 0, targetResolvedStartSec: 0, targetAvailSec: 3600, tcDelta: null
+    };
+    // Second probe sits 5000s in — far past the end of a 600s reference.
+    assert.strictEqual(dsp.planCoarseVerify(geom, COARSE_CFG, 0, 5000, 120), null);
+});
+
+test("planCoarseVerify handles a confirmation window EARLIER than the probe", () => {
+    const geom = {
+        refInPointSec: 0, refDurationFull: 7200, refResolvedStartSec: 0,
+        targetInPointSec: 0, targetResolvedStartSec: 1000, targetAvailSec: 3600, tcDelta: null
+    };
+    const plan = dsp.planCoarseVerify(geom, COARSE_CFG, 0, -400, 120);
+    assert.ok(plan, "a negative relative offset is valid");
+    assert.strictEqual(plan.winStart, 600 - COARSE_CFG.verifyMarginSec);
+});
+
+// ─── coarseResolveBest (multi-candidate reference selection) ──────────────────
+
+// Build a resolved candidate by driving `state` through a scripted matcher, the
+// way analyzeCoarseAlign does per reference candidate.
+function candidate(geom, byLabel, cfg) {
+    cfg = cfg || COARSE_CFG;
+    const state = dsp.createCoarseState();
+    for (const plan of dsp.planCoarseSearch(geom, cfg)) {
+        if (plan.label === "full" && state.skipFull) continue;
+        const c = byLabel[plan.label] || null;
+        if (dsp.coarseConsider(state, plan, c, geom, cfg)) break;
+    }
+    return { state, geom };
+}
+
+test("coarseResolveBest picks the reference candidate the audio actually matches", () => {
+    // The real-world failure: a second recorder that ran only in the afternoon.
+    // Candidate 0 is the LONGEST reference clip (the morning file) — unrelated
+    // content, so only a noise peak. Candidate 1 is the afternoon file it was
+    // actually recorded alongside. Scoring only candidate 0 (the pre-fix
+    // behavior) locked in the 0.48 noise match and parked the clip hours away.
+    const morning = candidate(coarseGeom(0), { timestamp: { score: 0.48, lagSec: 12 } });
+    const afternoon = candidate(coarseGeom(0), { timestamp: { score: 0.91, lagSec: -4 } });
+
+    const pick = dsp.coarseResolveBest([morning, afternoon], COARSE_CFG);
+    assert.strictEqual(pick.index, 1, "the higher-scoring reference must win");
+    assert.strictEqual(pick.result.chosen.score, 0.91);
+    assert.ok(Math.abs(pick.result.coarseDelta - (-4)) < 0.01, `delta ${pick.result.coarseDelta}`);
+
+    // Scoring the longest candidate alone is what produced the wrong answer.
+    const aloneDelta = dsp.coarseResolve(morning.state, morning.geom, COARSE_CFG).coarseDelta;
+    assert.ok(Math.abs(aloneDelta - 12) < 0.01, `single-candidate delta ${aloneDelta}`);
+});
+
+test("coarseResolveBest reports the best score seen when NO candidate is confident", () => {
+    const a = candidate(coarseGeom(0), { timestamp: { score: 0.11, lagSec: 3 }, head: { score: 0.18, lagSec: 0 } });
+    const b = candidate(coarseGeom(0), { timestamp: { score: 0.22, lagSec: 9 }, head: { score: 0.07, lagSec: 0 } });
+
+    const pick = dsp.coarseResolveBest([a, b], COARSE_CFG);
+    assert.strictEqual(pick.result, null);
+    assert.strictEqual(pick.index, -1);
+    assert.strictEqual(pick.best.score, 0.22, "best-seen drives the 'no confident match' message");
+});
+
+test("coarseResolveBest tolerates an empty candidate list", () => {
+    const pick = dsp.coarseResolveBest([], COARSE_CFG);
+    assert.strictEqual(pick.result, null);
+    assert.strictEqual(pick.index, -1);
+    assert.strictEqual(pick.best, null);
+});
+
+test("an untrusted clock stops a weak Build-position match from being accepted", () => {
+    // The guard analyzeCoarseAlign applies to mtime-derived clips in a sequence
+    // whose devices disagree about the date: raise minScore to strongScore so a
+    // prediction from a meaningless Build position can't qualify on the low bar.
+    const byLabel = { timestamp: { score: 0.42, lagSec: 30 }, head: { score: 0.2, lagSec: 0 }, full: { score: 0.2, lagSec: 0 } };
+
+    const trusting = candidate(coarseGeom(0), byLabel, COARSE_CFG);
+    assert.strictEqual(dsp.coarseResolve(trusting.state, trusting.geom, COARSE_CFG).chosen.score, 0.42,
+        "normally a 0.42 prediction clears the 0.30 bar");
+
+    const strictCfg = Object.assign({}, COARSE_CFG, { minScore: COARSE_CFG.strongScore });
+    const guarded = candidate(coarseGeom(0), byLabel, strictCfg);
+    assert.strictEqual(dsp.coarseResolve(guarded.state, guarded.geom, strictCfg).chosen, null,
+        "with an untrusted clock the same weak prediction is rejected");
+});
+
+test("DRIFT_IMPLAUSIBLE_PPM sits far above real hardware drift", () => {
+    // Two consumer crystals at ±100 ppm each give ~200 ppm relative worst case.
+    // The rejection bar must clear that, or good syncs get thrown away.
+    assert.ok(dsp.DRIFT_IMPLAUSIBLE_PPM > 200, "must not reject plausible hardware drift");
+});
+
 // ─── buildEnvelope ────────────────────────────────────────────────────────────
 
 function pcmBuffer(samples) {
@@ -404,6 +609,40 @@ test("buildFineTuneAnchors prefers the video instance when a key has both", () =
     assert.strictEqual(anchors[0].clipName, "B.mov");
     // Only one track, so it is the reference.
     assert.strictEqual(anchors[0].layerOrder, 0);
+});
+
+test("buildFineTuneAnchors collapses a file's instances to ONE anchor even at different positions", () => {
+    // Regression: a buggy Build once placed a camera's video and its linked
+    // audio at different timeline positions. Fine tune must still treat them as
+    // one file (one anchor → one shift for every instance) — computing separate
+    // shifts for video vs audio of the SAME file tears A/V apart permanently.
+    const clips = [
+        { filePath: "camB", startTicks: "9000", clipName: "B-audio", trackType: "audio", trackIndex: 2, startSec: 120, endSec: 130, inPointSec: 0 },
+        { filePath: "camB", startTicks: "300", clipName: "B.mov", trackType: "video", trackIndex: 1, startSec: 0, endSec: 10, inPointSec: 0 },
+        { filePath: "wav", startTicks: "1", clipName: "REC.wav", trackType: "audio", trackIndex: 4, startSec: 0, endSec: 60, inPointSec: 0 },
+    ];
+    const anchors = dsp.buildFineTuneAnchors(clips);
+    assert.strictEqual(anchors.length, 2);
+    const camB = anchors.find(a => a.filePath === "camB");
+    // Video-preferred: the anchor reflects the video instance.
+    assert.strictEqual(camB.trackType, "video");
+    assert.strictEqual(camB.clipName, "B.mov");
+    assert.strictEqual(camB.startSec, 0);
+    // Anchor identity is the file path — the apply step fans one delta out to
+    // every instance of the file.
+    assert.strictEqual(camB.key, "camB");
+});
+
+test("buildFineTuneAnchors anchors same-type duplicates at the earliest instance", () => {
+    const clips = [
+        { filePath: "wav", startTicks: "500", clipName: "REC.wav", trackType: "audio", trackIndex: 4, startSec: 50, endSec: 110, inPointSec: 0 },
+        { filePath: "wav", startTicks: "10", clipName: "REC.wav", trackType: "audio", trackIndex: 5, startSec: 1, endSec: 61, inPointSec: 0 },
+        { filePath: "camA", startTicks: "1", clipName: "A.mov", trackType: "video", trackIndex: 0, startSec: 0, endSec: 200, inPointSec: 0 },
+    ];
+    const anchors = dsp.buildFineTuneAnchors(clips);
+    const wav = anchors.find(a => a.filePath === "wav");
+    assert.strictEqual(wav.startSec, 1);
+    assert.strictEqual(wav.trackIndex, 5);
 });
 
 test("buildFineTuneAnchors skips clips without filePath or startTicks", () => {
@@ -571,6 +810,60 @@ test("pekToEnvelope reads channel PLANES and averages them", () => {
     assert.strictEqual(env.length, blocks);
     assert.strictEqual(env[10], 20);   // (10 + 30) / 2
     assert.strictEqual(env[100], 200); // (100 + 300) / 2
+});
+
+test("pekToEnvelope can isolate ONE channel plane instead of the mix", () => {
+    // A 4-channel camera file: each channel carries a different microphone.
+    const blocks = 375;
+    const buf = makePek(4, blocks, 48000, (c, b) => (c + 1) * b);
+    const info = dsp.parsePekInfo(buf);
+
+    // The averaged mix blends all four — 1x + 2x + 3x + 4x over 4 = 2.5x.
+    const mix = dsp.pekToEnvelope(buf, info, 187.5, 0, null);
+    assert.strictEqual(mix[10], 25);
+
+    // Each channel read alone returns exactly that microphone's amplitude. This
+    // is what lets a lav recorder match the camera channel holding the same mic
+    // instead of drowning in the other three.
+    for (let c = 0; c < 4; c += 1) {
+        const only = dsp.pekToEnvelope(buf, info, 187.5, 0, null, c);
+        assert.strictEqual(only.length, blocks);
+        assert.strictEqual(only[10], (c + 1) * 10, `channel ${c} plane`);
+    }
+});
+
+test("pekToEnvelope falls back to the mix for an out-of-range channel", () => {
+    const buf = makePek(2, 375, 48000, (c, b) => (c === 0 ? b : 3 * b));
+    const info = dsp.parsePekInfo(buf);
+    const mix = dsp.pekToEnvelope(buf, info, 187.5, 0, null)[10];
+    assert.strictEqual(dsp.pekToEnvelope(buf, info, 187.5, 0, null, 7)[10], mix, "channel 7 of 2");
+    assert.strictEqual(dsp.pekToEnvelope(buf, info, 187.5, 0, null, -1)[10], mix, "negative channel");
+});
+
+test("isolating the right channel beats the mix at recovering an offset", () => {
+    // ch1 holds the same mic as the "recorder"; ch0/2/3 hold unrelated content.
+    // Matching against the 4-channel MIX is what scored 0.25 in the field.
+    const blocks = 1500;
+    const rate = 187.5;
+    const mic = b => 1000 + 900 * Math.sin(b / 11);
+    const other = (c, b) => 1000 + 900 * Math.sin((b / (3 + c)) + c * 2.1);
+    const shift = 200; // blocks
+
+    const camera = makePek(4, blocks, 48000, (c, b) => (c === 1 ? mic(b) : other(c, b)));
+    const recorder = makePek(1, blocks - shift, 48000, (c, b) => mic(b + shift));
+    const camInfo = dsp.parsePekInfo(camera);
+    const recInfo = dsp.parsePekInfo(recorder);
+
+    const tgt = dsp.pekToEnvelope(recorder, recInfo, rate, 0, null);
+    const viaMix = dsp.slideMatch(dsp.pekToEnvelope(camera, camInfo, rate, 0, null), tgt,
+        { envelopeRate: rate, minOverlapSec: 1 });
+    const viaCh1 = dsp.slideMatch(dsp.pekToEnvelope(camera, camInfo, rate, 0, null, 1), tgt,
+        { envelopeRate: rate, minOverlapSec: 1 });
+
+    assert.ok(viaCh1.score > viaMix.score,
+        `channel ${viaCh1.score.toFixed(2)} should beat mix ${viaMix.score.toFixed(2)}`);
+    assert.ok(Math.abs(viaCh1.lagSec - (shift / rate)) < 0.05,
+        `channel read must recover the true offset, got ${viaCh1.lagSec}s`);
 });
 
 test("pekToEnvelope slices by time and aggregates to the target rate", () => {

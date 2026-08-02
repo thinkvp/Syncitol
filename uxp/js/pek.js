@@ -170,11 +170,13 @@ function readPekBytes(pekPath) {
     return task;
 }
 
-function getPekEnvelope(resolved, startSec, durSec, envelopeRate) {
-    const key = `pek|${resolved.pekPath}|${startSec.toFixed(3)}|${durSec.toFixed(3)}|${envelopeRate}`;
+// `channel` picks a single channel plane (null = the averaged mix).
+function getPekEnvelope(resolved, startSec, durSec, envelopeRate, channel) {
+    const chanKey = (typeof channel === "number") ? channel : "mix";
+    const key = `pek|${resolved.pekPath}|${startSec.toFixed(3)}|${durSec.toFixed(3)}|${envelopeRate}|${chanKey}`;
     if (runCache.has(key)) return runCache.get(key);
     const task = readPekBytes(resolved.pekPath)
-        .then(buffer => dsp.pekToEnvelope(buffer, resolved.info, envelopeRate, startSec, durSec));
+        .then(buffer => dsp.pekToEnvelope(buffer, resolved.info, envelopeRate, startSec, durSec, channel));
     runCache.set(key, task);
     return task;
 }

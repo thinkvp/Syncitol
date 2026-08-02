@@ -245,21 +245,30 @@ async function applyStarts(project, sequence, targets, undoLabel) {
     return applied;
 }
 
-// Match shifts (filePath|startTicks -> deltaSec) to scanned clips, then move them
-// by track position.
+// Match shifts (filePath -> deltaSec) to scanned clips, then move them by track
+// position. EVERY timeline instance of a file gets the same delta — a clip's
+// video and its linked audio must never move separately.
 async function applyShifts(shifts, opts) {
     opts = opts || {};
     const project = await getActiveProject();
     const sequence = await val(project.getActiveSequence());
     const scan = await scanSequence(sequence);
-    const byKey = new Map();
-    for (const s of shifts) byKey.set(`${s.filePath}|${s.startTicks}`, s.deltaSec);
+    const byPath = new Map();
+    for (const s of shifts) byPath.set(s.filePath, s.deltaSec);
+
+    // t=0 guard per FILE: if any instance would land before 0, skip the whole
+    // file — moving only some of its instances would split linked A/V.
+    const blocked = new Set();
+    for (const c of scan.clips) {
+        const d = byPath.get(c.filePath);
+        if (d !== undefined && c.startSec + d < 0) blocked.add(c.filePath);
+    }
 
     const targets = [];
     for (const c of scan.clips) {
-        const d = byKey.get(`${c.filePath}|${c.startTicks}`);
+        if (blocked.has(c.filePath)) continue;
+        const d = byPath.get(c.filePath);
         if (d === undefined || Math.abs(d) < 0.0005) continue;
-        if (c.startSec + d < 0) continue; // never move a clip before t=0
         targets.push({ trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: d });
     }
     const applied = await applyStarts(project, sequence, targets, "Syncitol: align clips");
@@ -325,28 +334,52 @@ async function buildSyncSequence(clipPayload, baseName) {
     try { await val(project.openSequence(clone)); } catch (e) {} // surface its timeline tab
     try { await val(project.setActiveSequence(clone)); } catch (e) {}
 
-    // Build a quick lookup: filePath -> recordStartMs.
-    const recordStartByPath = {};
+    // clipPayload is one entry per source FILE (video-preferred), so its own
+    // track key is always present in trackEarliestMs.
+    const entryByPath = {};
     for (const c of clipPayload) {
-        if (!(c.filePath in recordStartByPath) || c.recordStartMs < recordStartByPath[c.filePath]) {
-            recordStartByPath[c.filePath] = c.recordStartMs;
+        if (!(c.filePath in entryByPath)) entryByPath[c.filePath] = c;
+    }
+
+    // Reposition by record time with ONE delta per FILE: anchor each file to
+    // its payload track's earliest recording, derive the delta from the file's
+    // primary timeline instance, then move EVERY instance of that file by that
+    // same delta. Moving instances rigidly keeps a clip's video and its linked
+    // audio together — anchoring each timeline track independently (v1.1.0)
+    // skipped or misplaced camera audio on tracks the deduped payload never
+    // mentioned, splitting A/V.
+    step("7 scan clone");
+    const scan = await scanSequence(clone);
+
+    // Primary instance per file: earliest instance on the payload entry's own
+    // track; fallback to the earliest instance on any track.
+    const primaryByPath = {};
+    for (const c of scan.clips) {
+        const entry = entryByPath[c.filePath];
+        if (!entry) continue;
+        const onEntryTrack = c.trackType === entry.trackType && c.trackIndex === entry.trackIndex;
+        const cur = primaryByPath[c.filePath];
+        if (!cur || (onEntryTrack && !cur.onEntryTrack) ||
+            (onEntryTrack === cur.onEntryTrack && c.startSec < cur.startSec)) {
+            primaryByPath[c.filePath] = { startSec: c.startSec, onEntryTrack };
         }
     }
 
-    // Reposition every clip instance in the clone by record time, per-track.
-    step("7 scan clone");
-    const scan = await scanSequence(clone);
+    const deltaByPath = {};
+    for (const path in entryByPath) {
+        const entry = entryByPath[path];
+        const primary = primaryByPath[path];
+        if (!primary) continue; // file not present in the clone
+        const targetSec = (entry.recordStartMs - trackEarliestMs[trackKeyOf(entry)]) / 1000;
+        deltaByPath[path] = targetSec - primary.startSec;
+    }
+
     step("8 applyStarts (" + scan.clips.length + " clips)");
     const targets = [];
     for (const c of scan.clips) {
-        const rs = recordStartByPath[c.filePath];
-        if (rs === undefined || rs === null) continue;
-        const tk = trackKeyOf(c);
-        const earliest = trackEarliestMs[tk];
-        if (earliest === undefined) continue;
-        const targetSec = (rs - earliest) / 1000;
-        if (Math.abs(targetSec - c.startSec) < MIN_PLACE_SEC) continue;
-        targets.push({ trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: targetSec - c.startSec });
+        const d = deltaByPath[c.filePath];
+        if (d === undefined || Math.abs(d) < MIN_PLACE_SEC) continue;
+        targets.push({ trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: d });
     }
     const moved = await applyStarts(project, clone, targets, "Syncitol: place by record time");
     return { sequence: clone, name: await val(clone.name), placed: moved, total: scan.clips.length };

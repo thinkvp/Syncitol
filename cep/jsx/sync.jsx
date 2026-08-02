@@ -214,9 +214,12 @@ function _getFineTuneClipInfoImpl() {
 
 /**
  * Apply fine-tune shifts to matching timeline clips.
- * adjustmentsJSON: either the legacy array [{ filePath, startTicks, deltaSec }]
- * or { globalShiftSec, adjustments } where globalShiftSec moves EVERY clip
+ * adjustmentsJSON: either the bare array [{ filePath, deltaSec }] or
+ * { globalShiftSec, adjustments } where globalShiftSec moves EVERY clip
  * (used by the panel's Revert to undo a previous boundary compensation).
+ * Shifts are matched by source file path: EVERY timeline instance of a file
+ * gets the same delta — a clip's video and its linked audio must never move
+ * separately.
  */
 function applyFineTuneAdjustments(adjustmentsJSON) {
     try {
@@ -247,11 +250,11 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
     var seq = app.project.activeSequence;
     if (!seq) return JSON.stringify({ error: "No active sequence." });
 
-    var adjustmentMap = {};
+    var adjustmentMap = {}; // filePath -> deltaSec
     for (var i = 0; i < (adjustments ? adjustments.length : 0); i++) {
         var adj = adjustments[i];
-        if (adj && adj.filePath && adj.startTicks) {
-            adjustmentMap[adj.filePath + "|" + String(adj.startTicks)] = Number(adj.deltaSec);
+        if (adj && adj.filePath) {
+            adjustmentMap[adj.filePath] = Number(adj.deltaSec);
         }
     }
 
@@ -266,8 +269,7 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
                 try {
                     var fp = clip.projectItem.getMediaPath();
                     if (!fp) continue;
-                    var key = fp + "|" + String(clip.start.ticks);
-                    var delta = (key in adjustmentMap) ? adjustmentMap[key] : 0;
+                    var delta = (fp in adjustmentMap) ? adjustmentMap[fp] : 0;
                     var resultSec = timeToSeconds(clip.start) + globalShiftSec + delta;
                     if (resultSec < 0) compensateSec = Math.max(compensateSec, -resultSec);
                 } catch (e) {}
@@ -282,9 +284,8 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
 
     // ── Apply moves: fine-tuned clips get (globalShift + delta + compensate),
     //    every other clip gets (globalShift + compensate) so relative timing is
-    //    preserved. newStartTicks (read back after the move) is the exact key a
-    //    later Revert needs to find these clips again — computing it panel-side
-    //    would lose precision (tick counts exceed 2^53 past ~10 h).
+    //    preserved. Matching is by file path, so a later Revert only needs each
+    //    moved file's path and −delta.
     function moveTrackCollection(trackCollection, trackType) {
         for (var t = 0; t < trackCollection.numTracks; t++) {
             var track = trackCollection[t];
@@ -294,9 +295,8 @@ function _applyFineTuneAdjustmentsImpl(adjustmentsJSON) {
                     var filePath = clip.projectItem.getMediaPath();
                     if (!filePath) continue;
 
-                    var key = filePath + "|" + String(clip.start.ticks);
-                    var inMap = (key in adjustmentMap);
-                    var delta = inMap ? adjustmentMap[key] : 0;
+                    var inMap = (filePath in adjustmentMap);
+                    var delta = inMap ? adjustmentMap[filePath] : 0;
                     var totalDelta = globalShiftSec + delta + compensateSec;
 
                     if (Math.abs(totalDelta) < MIN_MOVE_SEC) continue;
@@ -469,11 +469,18 @@ function _buildSyncSequenceImpl(payloadJSON) {
     } catch (e) {}
 
     // ── 4. Move each existing clip instance to its calculated offset ───────
-    var recordStartByPath = {};
+    // ONE delta per FILE: anchor each file to its payload track's earliest
+    // recording, derive the delta from the file's primary timeline instance,
+    // then move EVERY instance of that file by that same delta. Rigid per-file
+    // moves keep a clip's video and its linked audio together — anchoring each
+    // timeline track independently (v1.1.0) produced undefined anchors (NaN
+    // moves) for camera-audio tracks the per-file payload never mentioned,
+    // splitting A/V.
+    var entryByPath = {};
     for (var rp = 0; rp < enriched.length; rp++) {
         var rec = enriched[rp];
-        if (!recordStartByPath.hasOwnProperty(rec.filePath) || rec.recordStartMs < recordStartByPath[rec.filePath]) {
-            recordStartByPath[rec.filePath] = rec.recordStartMs;
+        if (!entryByPath.hasOwnProperty(rec.filePath)) {
+            entryByPath[rec.filePath] = rec;
         }
     }
 
@@ -497,48 +504,83 @@ function _buildSyncSequenceImpl(payloadJSON) {
     var errors = [];
     var avGroups = {}; // path -> { video: [trackItems], audio: [trackItems] }
 
+    // Pass 1: group instances per source and find each file's PRIMARY instance
+    // (earliest instance on the payload entry's own track; fallback: earliest
+    // instance on any track). Also captured before the MIN_PLACE skip so items
+    // that don't need moving are still part of their re-link group.
+    var primaryByPath = {}; // path -> { startSec, onEntryTrack }
     for (var k = 0; k < clipInstances.length; k++) {
         var clipInfo = clipInstances[k];
         var timelineClip = clipInfo.clip;
 
         try {
             var path = timelineClip.projectItem.getMediaPath();
-            if (!path || !recordStartByPath.hasOwnProperty(path)) {
+            if (!path || !entryByPath.hasOwnProperty(path)) {
                 continue;
             }
 
             // Remember each source's video + audio track items so we can re-link them
             // after moving (move() repositions items independently, which unlinks A/V
-            // whose audio spans multiple tracks). Captured before the MIN_PLACE skip
-            // so items that don't need moving are still part of their group.
+            // whose audio spans multiple tracks).
             if (!avGroups[path]) avGroups[path] = { video: [], audio: [] };
             avGroups[path][clipInfo.trackType].push(timelineClip);
 
-            // Per-track anchoring: place each clip relative to its own track's
-            // earliest recording. Cross-track offsets are resolved by the
-            // audio-based coarse + fine tune passes.
-            var targetOffsetSec = (recordStartByPath[path] - trackEarliestMs[trackKeyOf(clipInfo)]) / 1000;
-            var currentStartSec = timeToSeconds(timelineClip.start);
-            var deltaSec = targetOffsetSec - currentStartSec;
+            var entry = entryByPath[path];
+            var onEntryTrack = clipInfo.trackType === entry.trackType && clipInfo.trackIndex === entry.trackIndex;
+            var instStartSec = timeToSeconds(timelineClip.start);
+            var curPrimary = primaryByPath.hasOwnProperty(path) ? primaryByPath[path] : null;
+            if (!curPrimary ||
+                (onEntryTrack && !curPrimary.onEntryTrack) ||
+                (onEntryTrack === curPrimary.onEntryTrack && instStartSec < curPrimary.startSec)) {
+                primaryByPath[path] = { startSec: instStartSec, onEntryTrack: onEntryTrack };
+            }
+        } catch (e3a) {
+            errors.push("Failed to inspect clip on " + clipInfo.trackType + " track " + (clipInfo.trackIndex + 1) + ": " + e3a.message);
+        }
+    }
 
+    // Per-file delta: payload-track anchoring (each entry's own track key is
+    // guaranteed present in trackEarliestMs because that entry contributed it).
+    // Cross-device offsets are resolved by the audio coarse + fine tune passes.
+    var deltaSecByPath = {};
+    for (var dp in entryByPath) {
+        if (!entryByPath.hasOwnProperty(dp) || !primaryByPath.hasOwnProperty(dp)) continue;
+        var dpEntry = entryByPath[dp];
+        var dpTargetSec = (dpEntry.recordStartMs - trackEarliestMs[trackKeyOf(dpEntry)]) / 1000;
+        deltaSecByPath[dp] = dpTargetSec - primaryByPath[dp].startSec;
+    }
+
+    // Pass 2: move every instance of each file by that file's single delta.
+    for (var mv = 0; mv < clipInstances.length; mv++) {
+        var mvInfo = clipInstances[mv];
+        var mvClip = mvInfo.clip;
+
+        try {
+            var mvPath = mvClip.projectItem.getMediaPath();
+            if (!mvPath || !deltaSecByPath.hasOwnProperty(mvPath)) {
+                continue;
+            }
+
+            var deltaSec = deltaSecByPath[mvPath];
             if (Math.abs(deltaSec) < MIN_PLACE_SEC) {
                 continue;
             }
 
+            var newStartSec = timeToSeconds(mvClip.start) + deltaSec;
             var deltaTime = new Time();
             deltaTime.seconds = deltaSec;
-            timelineClip.move(deltaTime);
+            mvClip.move(deltaTime);
 
             placed.push({
-                clipName:      timelineClip.name,
-                trackType:     clipInfo.trackType,
-                trackIndex:    clipInfo.trackIndex,
-                offsetSec:     targetOffsetSec,
-                offsetTicks:   String(Math.round(targetOffsetSec * TICKS_PER_SECOND)),
-                recordStartMs: recordStartByPath[path]
+                clipName:      mvClip.name,
+                trackType:     mvInfo.trackType,
+                trackIndex:    mvInfo.trackIndex,
+                offsetSec:     newStartSec,
+                offsetTicks:   String(Math.round(newStartSec * TICKS_PER_SECOND)),
+                recordStartMs: entryByPath[mvPath].recordStartMs
             });
         } catch (e3) {
-            errors.push("Failed to move clip on " + clipInfo.trackType + " track " + (clipInfo.trackIndex + 1) + ": " + e3.message);
+            errors.push("Failed to move clip on " + mvInfo.trackType + " track " + (mvInfo.trackIndex + 1) + ": " + e3.message);
         }
     }
 

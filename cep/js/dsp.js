@@ -66,6 +66,13 @@
     // Report only when the ends diverge by more than this (the 100 Hz envelope
     // resolves ~10 ms per end, so anything under 40 ms is measurement noise).
     var DRIFT_MIN_REPORT_SEC = 0.04;
+    // Above this, the two ends disagree by more than any real pair of devices can
+    // drift apart (cheap consumer crystals are ±100 ppm each, so ~200 ppm relative
+    // is the realistic worst case; 500 ppm is 1.8 s per hour). A "match" implying
+    // this much drift is not the same audio at all — it's correlated noise — so it
+    // is rejected rather than reported. Deliberately far above real drift: a false
+    // rejection re-breaks a good sync, which is worse than an unflagged slow drift.
+    var DRIFT_IMPLAUSIBLE_PPM = 500;
 
     // ─── Envelope extraction ──────────────────────────────────────────────────
     // Aggregate signed 16-bit LE PCM into a mean-absolute-amplitude envelope,
@@ -227,13 +234,16 @@
     }
 
     // ─── Fine-tune anchor planning ────────────────────────────────────────────
-    // Collapse timeline clip instances to one anchor per (filePath, startTicks),
-    // then mark which track is the reference. The reference is the track with the
-    // most total recorded coverage (typically the continuous main-camera/program
-    // recording or a field-recorder WAV) — everything else is aligned to it. This
-    // is chosen by content, NOT by track position, so it works no matter which
-    // track the main recording sits on. Anchors get layerOrder 0 (reference) or
-    // 1 (everything else); the coarse and fine passes align layer-1 clips to the
+    // Collapse timeline clip instances to one anchor per source FILE, then mark
+    // which track is the reference. One anchor per file guarantees the coarse and
+    // fine passes compute ONE shift per file, which the apply step gives to every
+    // timeline instance of that file — a clip's video and its linked audio can
+    // never be shifted apart. The reference is the track with the most total
+    // recorded coverage (typically the continuous main-camera/program recording
+    // or a field-recorder WAV) — everything else is aligned to it. This is chosen
+    // by content, NOT by track position, so it works no matter which track the
+    // main recording sits on. Anchors get layerOrder 0 (reference) or 1
+    // (everything else); the coarse and fine passes align layer-1 clips to the
     // layer-0 reference.
     function buildFineTuneAnchors(clips) {
         var byKey = {};
@@ -242,7 +252,7 @@
         for (var c = 0; c < clips.length; c += 1) {
             var clip = clips[c];
             if (!clip.filePath || !clip.startTicks) continue;
-            var key = clip.filePath + "|" + clip.startTicks;
+            var key = clip.filePath;
 
             if (!Object.prototype.hasOwnProperty.call(byKey, key)) {
                 byKey[key] = {
@@ -262,10 +272,15 @@
                 continue;
             }
 
-            // A clip may appear on both a video track and its linked audio track;
-            // prefer the video instance so the anchor reflects the video track.
+            // A file usually appears on both a video track and its linked audio
+            // track(s); prefer the video instance so the anchor reflects the
+            // video track, then the earliest instance of that type.
             var existing = byKey[key];
-            if (clip.trackType === "video" && existing.trackType !== "video") {
+            var better =
+                (clip.trackType === "video" && existing.trackType !== "video") ||
+                (clip.trackType === existing.trackType && clip.startSec < existing.startSec);
+            if (better) {
+                existing.startTicks = clip.startTicks;
                 existing.clipName = clip.clipName;
                 existing.trackType = clip.trackType;
                 existing.trackIndex = clip.trackIndex;
@@ -421,7 +436,16 @@
     // from a parsed .pek: mean over channels of per-block (max − min) / 2,
     // aggregated per target frame. Pass durSec null/undefined for "to the end".
     // Returns a Float32Array (possibly empty when the slice is out of range).
-    function pekToEnvelope(buffer, info, targetRate, startSec, durSec) {
+    // `channel` selects ONE channel plane instead of averaging all of them. A
+    // 4-channel camera file carries a different microphone on each channel, and
+    // the average buries any single one under the other three — so a lav recorder
+    // correlates weakly with the mix but almost perfectly with the channel that
+    // recorded the same mic. Pass null/undefined for the averaged mix.
+    function pekToEnvelope(buffer, info, targetRate, startSec, durSec, channel) {
+        var single = (typeof channel === "number" && channel >= 0 && channel < info.channels);
+        var firstChan = single ? channel : 0;
+        var lastChan = single ? channel + 1 : info.channels;
+        var chanCount = lastChan - firstChan;
         var startBlock = Math.max(0, Math.floor((startSec || 0) * info.blockRate));
         var endBlock = (durSec === null || durSec === undefined)
             ? info.blocks
@@ -437,14 +461,14 @@
             if (b1 > endBlock) b1 = endBlock;
             var sum = 0;
             for (var b = b0; b < b1; b += 1) {
-                for (var c = 0; c < info.channels; c += 1) {
+                for (var c = firstChan; c < lastChan; c += 1) {
                     var base = PEK_HEADER_BYTES + ((c * info.blocks) + b) * 4;
                     var hi = buffer.readInt16LE(base);
                     var lo = buffer.readInt16LE(base + 2);
                     sum += (hi >= lo ? hi - lo : lo - hi) / 2;
                 }
             }
-            env[f] = sum / ((b1 - b0) * info.channels);
+            env[f] = sum / ((b1 - b0) * chanCount);
         }
         return env;
     }
@@ -573,6 +597,126 @@
         return plans;
     }
 
+    // ─── Probe window selection ───────────────────────────────────────────────
+    // Choose WHERE in a clip to take the coarse probe. Probing the head of the
+    // clip — the old behaviour — fails badly on recorders that were started early
+    // and left running: the first minutes are room tone, and a flat probe has no
+    // structure to match on, so the correlation locks onto whichever quiet stretch
+    // of the reference best fits its noise floor. That produces a high-scoring
+    // match at an arbitrary offset (observed: 0.85 landing ~3 minutes out).
+    //
+    // Instead, rank every candidate window by its mean frame-to-frame ACTIVITY —
+    // the average absolute change between neighbouring envelope frames. Speech and
+    // music change constantly, so activity stays high across the whole window;
+    // room tone barely moves and scores near zero.
+    //
+    // Activity is used in preference to plain variance because variance peaks on a
+    // window that merely STRADDLES the silence→content boundary: one enormous step
+    // maximises the spread while half the probe is still useless. A single step
+    // contributes almost nothing to a mean over ~1200 frames, so activity picks a
+    // window that is dynamic throughout.
+    //
+    // `envelope` is a mean-amplitude envelope at `envelopeRate` Hz. Returns
+    // [{ offsetSec, activity }], non-overlapping and best first, so callers can
+    // take [0] to probe and [1] as an independent confirmation point. Empty when
+    // the envelope is shorter than one window. Linear in the envelope length.
+    function pickProbeWindows(envelope, envelopeRate, probeDurSec, count) {
+        var n = envelope.length;
+        var w = Math.max(2, Math.round(probeDurSec * envelopeRate));
+        if (n < w) return [];
+        count = count || 1;
+
+        var act = new Float64Array(n - 1);
+        for (var i = 0; i < n - 1; i += 1) {
+            act[i] = Math.abs(envelope[i + 1] - envelope[i]);
+        }
+
+        var lastStart = n - w;
+        var span = w - 1; // activity samples that fall inside one window
+        var scores = new Float64Array(lastStart + 1);
+        var sum = 0;
+        for (var j = 0; j < span; j += 1) sum += act[j];
+        scores[0] = sum / span;
+        for (var s = 1; s <= lastStart; s += 1) {
+            sum += act[s + span - 1] - act[s - 1];
+            scores[s] = sum / span;
+        }
+
+        // Greedily take the most active windows that don't overlap each other.
+        var picked = [];
+        var taken = [];
+        for (var k = 0; k < count; k += 1) {
+            var bestIdx = -1;
+            var bestScore = -1;
+            for (var c = 0; c <= lastStart; c += 1) {
+                if (scores[c] <= bestScore) continue;
+                var clash = false;
+                for (var t = 0; t < taken.length; t += 1) {
+                    if (Math.abs(c - taken[t]) < w) { clash = true; break; }
+                }
+                if (clash) continue;
+                bestScore = scores[c];
+                bestIdx = c;
+            }
+            if (bestIdx < 0) break;
+            taken.push(bestIdx);
+            picked.push({ offsetSec: bestIdx / envelopeRate, activity: bestScore });
+        }
+        return picked;
+    }
+
+    // Best window per equal SEGMENT of the clip, sorted most-active first. The
+    // single most-active window can sit in a stretch no other device recorded —
+    // a recorder started 20 minutes before the cameras has its loudest audio
+    // while nothing else was rolling, and a probe from there can never match
+    // anything. Spreading candidate windows across the whole recording lets a
+    // retry escape such a region. Falls back to the plain top-N pick when the
+    // clip is too short to segment.
+    function pickProbeWindowsSpread(envelope, envelopeRate, probeDurSec, segments) {
+        var n = envelope.length;
+        var w = Math.max(2, Math.round(probeDurSec * envelopeRate));
+        if (n < w) return [];
+        segments = Math.max(1, segments || 4);
+        var segLen = Math.floor(n / segments);
+        if (segLen < w) return pickProbeWindows(envelope, envelopeRate, probeDurSec, segments);
+
+        var picked = [];
+        for (var s = 0; s < segments; s += 1) {
+            var start = s * segLen;
+            var end = (s === segments - 1) ? n : (start + segLen);
+            var seg = Array.prototype.slice.call(envelope, start, end);
+            var best = pickProbeWindows(seg, envelopeRate, probeDurSec, 1)[0];
+            if (best) picked.push({ offsetSec: best.offsetSec + (start / envelopeRate), activity: best.activity });
+        }
+        picked.sort(function (a, b) { return b.activity - a.activity; });
+        return picked;
+    }
+
+    // Fallback half-width for the confirmation search when cfg omits it, so a
+    // partial config can never silently produce NaN window bounds.
+    var COARSE_VERIFY_MARGIN_DEFAULT_SEC = 120;
+
+    // Plan the confirmation window for an already-chosen coarse offset, using a
+    // SECOND probe taken from a different part of the same recording. A peak
+    // driven by silence or room tone won't reproduce the same offset elsewhere in
+    // the file; a genuine alignment will. `probe2RelSec` is the second probe's
+    // position relative to geom's probe origin (geom.targetInPointSec), and may
+    // be negative when the better window sits earlier. Returns { winStart, winDur,
+    // expectedLagSec } — the reference window to search and the lag a correct
+    // offset should produce — or null when the reference doesn't reach that far.
+    function planCoarseVerify(geom, cfg, coarseDeltaSec, probe2RelSec, probe2DurSec) {
+        var timelinePos = geom.targetResolvedStartSec + coarseDeltaSec + probe2RelSec;
+        var refSrc = geom.refInPointSec + (timelinePos - geom.refResolvedStartSec);
+        var refMin = geom.refInPointSec;
+        var refMax = geom.refInPointSec + geom.refDurationFull;
+        var margin = (cfg && cfg.verifyMarginSec) || COARSE_VERIFY_MARGIN_DEFAULT_SEC;
+
+        var start = Math.max(refMin, refSrc - margin);
+        var end = Math.min(refMax, refSrc + probe2DurSec + margin);
+        if (end - start < probe2DurSec) return null; // not enough reference there
+        return { winStart: start, winDur: end - start, expectedLagSec: refSrc - start };
+    }
+
     // Plan a bounded confirm window around an offset LEARNED from another track.
     // Devices from one shoot usually share the same clock-error family (in a real
     // log, two cameras' true offsets were -641.8s and -619.7s — 22s apart), so once
@@ -642,6 +786,32 @@
         return { chosen: chosen, best: state.best, coarseDelta: coarseDelta };
     }
 
+    // Resolve a whole track's search across SEVERAL reference candidates, keeping
+    // the most confident one. A track is matched against every clip on the
+    // reference track, not just the longest: when a recording belongs to a
+    // different session than the longest reference clip (a second recorder that
+    // ran only in the afternoon vs. a morning reference), that one comparison has
+    // no correct answer available and settles on the best noise peak. Scoring each
+    // candidate independently lets the right session win on audio content.
+    //
+    // `cands` is [{ state, geom }] in candidate order. Returns { index, result,
+    // best } — index -1 and result null when no candidate reached a confident
+    // match; `best` is the highest score seen anywhere, for the failure message.
+    function coarseResolveBest(cands, cfg) {
+        var winner = null;
+        var winnerIndex = -1;
+        var best = null;
+        for (var i = 0; i < cands.length; i += 1) {
+            var r = coarseResolve(cands[i].state, cands[i].geom, cfg);
+            if (r.best && (!best || r.best.score > best.score)) best = r.best;
+            if (r.chosen && (!winner || r.chosen.score > winner.chosen.score)) {
+                winner = r;
+                winnerIndex = i;
+            }
+        }
+        return { index: winnerIndex, result: winner, best: best };
+    }
+
     return {
         TICKS_PER_SECOND: TICKS_PER_SECOND,
         MAX_SPAN_SEC: MAX_SPAN_SEC,
@@ -658,6 +828,7 @@
         DRIFT_MIN_OVERLAP_SEC: DRIFT_MIN_OVERLAP_SEC,
         DRIFT_EDGE_FRACTION: DRIFT_EDGE_FRACTION,
         DRIFT_MIN_REPORT_SEC: DRIFT_MIN_REPORT_SEC,
+        DRIFT_IMPLAUSIBLE_PPM: DRIFT_IMPLAUSIBLE_PPM,
         PEK_MAGIC: PEK_MAGIC,
         PEK_HEADER_BYTES: PEK_HEADER_BYTES,
         PEK_SAMPLES_PER_BLOCK: PEK_SAMPLES_PER_BLOCK,
@@ -679,8 +850,12 @@
         parseTimecodeToSeconds: parseTimecodeToSeconds,
         planCoarseSearch: planCoarseSearch,
         planLearnedSearch: planLearnedSearch,
+        pickProbeWindows: pickProbeWindows,
+        pickProbeWindowsSpread: pickProbeWindowsSpread,
+        planCoarseVerify: planCoarseVerify,
         createCoarseState: createCoarseState,
         coarseConsider: coarseConsider,
-        coarseResolve: coarseResolve
+        coarseResolve: coarseResolve,
+        coarseResolveBest: coarseResolveBest
     };
 });
