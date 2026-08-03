@@ -8,6 +8,60 @@ Syncitol's version numbering resets to 1.0.0 with this release, alongside the
 new UXP version and the public GitHub launch. Earlier internal version
 history (up to 1.4.0) is preserved in [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
+## [1.3.0] - 2026-08-03
+
+### Fixed
+- **A/V links no longer break on Build.** A clip's video could be moved to
+  its record-time position while its linked audio stayed behind, and Fine
+  Tune would then shift the two apart further still. Per-track anchoring
+  (1.1.0) placed each timeline instance from its own track's anchor, but
+  camera-audio tracks are absent from the per-file clip list, so their
+  anchor was undefined — the UXP panel silently skipped those clips and
+  the CEP panel moved them by `NaN`.
+
+  All placement and alignment is now keyed by **source file**: one delta
+  per file, applied to every timeline instance of it. A clip's video and
+  audio can no longer be moved independently.
+- **Coarse align now compares against every clip on the reference track,**
+  not just the longest one. A recording belonging to a different session
+  than that single clip had no correct answer available and settled on
+  whatever noise peak scored highest.
+- **Clips that open with silence are no longer misaligned.** Probes were
+  taken from the head of a clip; recorders left running before a shoot
+  begin with minutes of room tone, and a flat probe correlates with any
+  other quiet stretch — producing a confident-looking match minutes out of
+  position. Probe windows are now chosen by audio content.
+- A fine-tune match implying more than 500 ppm of clock drift is now
+  rejected rather than reported. No real pair of devices drifts that far
+  apart, so such a match is correlated noise, not shared audio.
+
+### Added
+- **Offset confirmation.** Every coarse offset is re-checked against a
+  second, independent stretch of the same recording before it is applied.
+  A match that came from room tone won't reproduce elsewhere in the file,
+  so it is now reported honestly instead of silently applied. Confirmation
+  runs before an offset is published as a hint to other tracks.
+- **Per-channel relay matching.** Tracks that match nothing on the
+  reference track are retried against the tracks that did align, one audio
+  channel at a time. A lav recorder correlates poorly with a different lav
+  — each is dominated by its own wearer — but almost perfectly with the
+  camera channel that recorded the same microphone, which a multi-channel
+  mix buries under the other channels. Runs entirely off Premiere's peak
+  cache, so no media is decoded.
+- Relay probe windows are spread across the whole recording, so a recorder
+  that started before the cameras isn't stuck probing a stretch nothing
+  else was rolling for.
+- Clips whose record-start came from file mtime in a project where device
+  clocks disagree about the date no longer have their Build position
+  trusted on a weak match score.
+- The log now names the reference clip and channel behind each match, the
+  probe positions used, and — when alignment fails — the best-scoring
+  candidates, so an unexpected result can be diagnosed from the log alone.
+
+### Changed
+- Sync Results now shows which reference clip (and channel) each track
+  matched against, not just the search method.
+
 ## [1.2.0] - 2026-07-24
 
 ### Added
