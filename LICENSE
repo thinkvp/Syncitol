@@ -20,9 +20,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Applies to the Syncitol source code in both uxp/ and cep/. Third-party
-bundled components have their own licenses:
-  - IBM Plex fonts (uxp/fonts/, cep/fonts/) — SIL Open Font License 1.1,
-    see fonts/LICENSE.txt in each folder.
+Applies to the Syncitol source code in uxp/. Third-party bundled components
+have their own licenses:
+  - IBM Plex fonts (uxp/fonts/) — SIL Open Font License 1.1, see
+    uxp/fonts/LICENSE.txt.
   - FFmpeg (statically linked into uxp/win/x64/syncitol.uxpaddon) — LGPL 2.1+,
     built without --enable-gpl. See uxp/README.md for details.

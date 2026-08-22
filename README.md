@@ -14,41 +14,38 @@ If Syncitol saves you a re-sync session, consider tipping on
 
 ![Syncitol panel screenshot](docs/screenshots/uxp-panel.png)
 
-## Which version do I need?
+## Requirements
 
-Syncitol ships as two separate plugins, built for different Premiere generations:
+| | |
+|---|---|
+| **Premiere Pro** | 26.0 or later |
+| **OS** | Windows (x64) or macOS (arm64 / x86_64) |
+| **ffmpeg** | Bundled — no install needed |
+| **Install** | Download the `.ccx`, double-click |
 
-| | [`uxp/`](uxp/) — UXP plugin | [`cep/`](cep/) — CEP extension |
-|---|---|---|
-| **Premiere Pro** | 26.0+ | 24, 25, 26+ |
-| **OS** | Windows, macOS | Windows or macOS |
-| **ffmpeg** | Bundled — no install needed | System install needed (Fine Tune Audio only) |
-| **Install** | Download `.ccx`, double-click | Windows installer `.exe`, or ZXP via extension manager |
+Syncitol is a UXP plugin. The bundled FFmpeg decoder is a UXP *hybrid* addon,
+which Premiere only loads from 26.0 onward — on 25.x the panel opens but the
+decoder reports "Addon is not supported".
 
-- **On Windows or macOS with Premiere 26+:** use the **UXP** version — simpler,
-  self-contained, and it's where Adobe's extensibility platform is headed.
-- **On an older Premiere (24/25):** use the **CEP** version.
-
-### Why two versions?
-
-Adobe is moving Premiere's plugin platform from CEP to UXP. UXP hybrid plugins
-(the kind Syncitol needs for its bundled FFmpeg decoder) require Premiere 26+,
-while CEP extensions work back to Premiere 24. UXP is where Adobe's platform is
-headed; CEP covers older installs. Both are maintained and kept at the same
-version.
+> **Premiere 24/25 users:** Syncitol previously also shipped as a CEP
+> extension for older Premiere generations. That version is discontinued and
+> is no longer developed or released. The last CEP builds remain downloadable
+> from the [v1.3.0 release](https://github.com/thinkvp/Syncitol/releases/tag/v1.3.0)
+> and earlier, unsupported and as-is.
 
 ## Download
 
-Grab the latest release for your platform from
+Grab the latest release from
 **[Releases](https://github.com/thinkvp/Syncitol/releases)** — each release
-(tagged `v*`) bundles all artifacts: the UXP `.ccx`, CEP Windows installer
-`.exe`, and CEP `.zxp`.
+(tagged `v*`) ships `Syncitol-UXP-<version>.ccx`, with the Windows and macOS
+native addons bundled in.
 
-See [`uxp/README.md`](uxp/README.md) or [`cep/README.md`](cep/README.md) for
-exact install steps.
+See [`uxp/README.md`](uxp/README.md) for exact install steps.
 
 ## License
 
 [MIT](LICENSE) for Syncitol's own code. Bundled third-party components (IBM
 Plex fonts, FFmpeg) keep their own licenses — see [`LICENSE`](LICENSE) for
 details.
+
+Release history: [`CHANGELOG.md`](CHANGELOG.md).

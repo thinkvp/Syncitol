@@ -3,9 +3,8 @@
 Recording-time + audio-waveform multicam sync for Premiere Pro — a UXP plugin
 with a bundled FFmpeg decoder.
 
-Part of the [Syncitol](../README.md) project. On Premiere 24/25, use the
-[CEP version](../cep/README.md) instead. Free — if this saves you a re-sync
-session, consider tipping on [Ko-fi](https://ko-fi.com/thinkvp).
+Part of the [Syncitol](../README.md) project. Free — if this saves you a
+re-sync session, consider tipping on [Ko-fi](https://ko-fi.com/thinkvp).
 
 Syncitol resolves each clip's real recording start time (embedded
 creation-time/timecode metadata, falling back to file dates), lays every clip
@@ -71,8 +70,8 @@ resolves from Premiere's `.pek` peak cache with no audio decoding.
 
 **Requires Premiere Pro 26.0+ on Windows (x64) or macOS (arm64 / x86_64).**
 The bundled FFmpeg decoder is a UXP hybrid addon; Premiere 25.x loads the panel
-but reports "Addon is not supported", so 26.0 is the real floor. On older
-Premiere versions, use the [CEP version](../cep/README.md) instead.
+but reports "Addon is not supported", so 26.0 is the real floor. Premiere
+versions below 26.0 are not supported.
 
 1. Download `Syncitol-UXP-<version>.ccx` from the
    [Releases](https://github.com/thinkvp/Syncitol/releases) page (tagged `v*`).
@@ -99,31 +98,28 @@ treat it as an upgrade.
 ## Versioning & packaging
 
 - `node scripts/set-version.js 1.2.3` — updates manifest, package.json and the
-  panel footer together. Also bump `cep/VERSION` to keep both plugins at the
-  same version (enforced by CI).
+  panel footer together.
 - `npm run build` — stages the runtime files only and zips them (forward-slash
   entries) into `dist/Syncitol-UXP-<version>.ccx`, failing if the package is
   suspiciously large.
 
 ### Releasing
 
-Push a single `v*` tag; both release workflows run in parallel and attach
-their artifacts to the same GitHub Release:
+Push a `v*` tag; the release workflow builds the macOS addon, packages the
+`.ccx`, and attaches it to the GitHub Release:
 
 ```bash
 # In uxp/:
 node scripts/set-version.js 1.2.0
-# In cep/:
-npm run set-version 1.2.0
 # Commit and tag:
 git commit -am "Release v1.2.0"
 git tag v1.2.0
 git push --follow-tags
 ```
 
-All four artifacts land on the same release: UXP `.ccx` (Windows + macOS
-addons bundled), CEP Windows installer `.exe`, and CEP `.zxp`. CI enforces
-that CEP and UXP versions match.
+The release carries one artifact: the UXP `.ccx`, with the Windows and macOS
+native addons bundled. CI fails the release if the tag doesn't match
+`manifest.json`.
 
 ## Licensing
 

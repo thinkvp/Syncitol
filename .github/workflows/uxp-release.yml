@@ -1,9 +1,8 @@
 name: UXP Release
 
 # Push a tag like v1.0.1 to build the .ccx package and publish (or attach to)
-# a GitHub Release alongside the CEP artifacts. No signing step — independent
-# (non-Marketplace) .ccx distribution doesn't require Adobe Developer
-# Distribution portal signing.
+# a GitHub Release. No signing step — independent (non-Marketplace) .ccx
+# distribution doesn't require Adobe Developer Distribution portal signing.
 #
 # Two jobs: build-addon-mac compiles the native FFmpeg addon for macOS, then
 # release builds the .ccx on Windows (bundling the pre-committed Windows addon
@@ -82,16 +81,6 @@ jobs:
           if [ "$tag" != "$file" ]; then
             echo "Tag $GITHUB_REF_NAME does not match manifest.json version ($file)"; exit 1
           fi
-      - name: CEP ↔ UXP version sync
-        shell: bash
-        run: |
-          uxp_ver="$(node -p "require('./manifest.json').version")"
-          cep_ver="$(cat ../cep/VERSION)"
-          if [ "$uxp_ver" != "$cep_ver" ]; then
-            echo "UXP version ($uxp_ver) != CEP version ($cep_ver) — keep them in sync."
-            exit 1
-          fi
-          echo "UXP & CEP both at $uxp_ver ✓"
 
       - name: Download macOS addon
         uses: actions/download-artifact@v4

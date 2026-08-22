@@ -8,6 +8,20 @@ Syncitol's version numbering resets to 1.0.0 with this release, alongside the
 new UXP version and the public GitHub launch. Earlier internal version
 history (up to 1.4.0) is preserved in [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
+## [Unreleased]
+
+### Removed
+- **The CEP extension is discontinued.** Syncitol is now a UXP-only plugin
+  requiring Premiere Pro 26.0+. The `cep/` tree, its CI and release
+  workflows, and the CEP ↔ UXP version-sync gate have been removed from the
+  repository. Existing releases keep their CEP `.zxp` and Windows installer
+  `.exe` assets — they remain downloadable, unsupported and as-is — but no
+  further CEP builds will be published.
+
+### Changed
+- The changelog moved from `cep/CHANGELOG.md` to the repository root, where
+  it now covers the UXP plugin alone.
+
 ## [1.3.0] - 2026-08-03
 
 ### Fixed
