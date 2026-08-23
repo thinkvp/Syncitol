@@ -25,4 +25,4 @@ have their own licenses:
   - IBM Plex fonts (uxp/fonts/) — SIL Open Font License 1.1, see
     uxp/fonts/LICENSE.txt.
   - FFmpeg (statically linked into uxp/win/x64/syncitol.uxpaddon) — LGPL 2.1+,
-    built without --enable-gpl. See uxp/README.md for details.
+    built without --enable-gpl. See README.md for details.

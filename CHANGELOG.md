@@ -21,6 +21,15 @@ history (up to 1.4.0) is preserved in [CHANGELOG-legacy.md](CHANGELOG-legacy.md)
 ### Changed
 - The changelog moved from `cep/CHANGELOG.md` to the repository root, where
   it now covers the UXP plugin alone.
+- `uxp/README.md` was folded into the root `README.md`. With one plugin left
+  there is no reason to send users a directory deeper for install steps.
+
+### Documentation
+- **Documented the macOS security prompt.** On first run after installing,
+  Premiere reports that it can't load the plugin until Syncitol is approved
+  under System Settings → Privacy & Security → Allow Anyway. The addon is
+  unsigned because notarization requires a paid Apple Developer membership,
+  which this free plugin does not carry.
 
 ## [1.3.0] - 2026-08-03
 
