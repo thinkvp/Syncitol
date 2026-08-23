@@ -117,16 +117,15 @@ body {
     gap: 12px;
 }
 /* Each block keeps its natural height. Without this, UXP's flex column shrinks
-   the children when the content is taller than the panel — squashing the
-   step-card (cutting off Fine Tune) and overlapping the Log onto Detected
-   Clips. Pinned to natural height, the content overflows and `.body` scrolls. */
+   the children when the content is taller than the panel — squashing blocks
+   and overlapping the Log onto Detected Clips. Pinned to natural height, the
+   content overflows and `.body` scrolls. */
 .body > * { flex-shrink: 0; }
 
 /* Breathing room around the primary action and after each major block. UXP
    honors these margins where it drops the column `gap`, and a little extra is
    what was asked for. */
 .btn-row { margin-top: 6px; margin-bottom: 6px; }
-.step-card { margin-bottom: 10px; }
 #results-section { margin-bottom: 10px; }
 .clips-block { margin-bottom: 10px; }
 
@@ -241,20 +240,6 @@ body {
 .tips-card-text a:hover { color: #7dffbd; }
 #tips-card-close { flex-shrink: 0; }
 
-.btn-secondary {
-    background-color: var(--bg-card);
-    border: 1px solid var(--border);
-    color: var(--text-mid);
-    min-width: 124px;
-    text-align: center;
-    flex-shrink: 0;
-}
-.btn-secondary:not(.is-disabled):hover {
-    border-color: var(--border-lit);
-    color: var(--text-hi);
-    background-color: var(--bg-panel);
-}
-
 .btn-header-icon {
     background-color: transparent;
     border: 1px solid var(--border);
@@ -274,44 +259,6 @@ body {
     line-height: 22px;
 }
 .btn-header-icon:hover { border-color: var(--accent); color: var(--accent); background-color: var(--accent-glow); }
-
-/* ── Manual steps ───────────────────────────────────────────────────────────── */
-.step-card {
-    background-color: var(--bg-panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    overflow: hidden;
-}
-.step-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 9px 12px;
-}
-.step-row + .step-row { border-top: 1px solid var(--border); }
-.step-num {
-    font-family: var(--mono);
-    font-size: 9px;
-    font-weight: 600;
-    color: var(--text-hi);
-    background-color: var(--bg-input);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    width: 18px;
-    height: 18px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    margin-right: 10px; /* UXP ignores the row's flex gap */
-}
-.step-desc {
-    flex: 1;
-    min-width: 0;
-    font-size: 11px;
-    color: var(--text-mid);
-    line-height: 1.4;
-}
 
 /* ── Mini buttons (inline actions: Cancel, Revert) ──────────────────────────── */
 .btn-mini {

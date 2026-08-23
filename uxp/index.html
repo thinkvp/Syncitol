@@ -37,7 +37,7 @@
         <!-- Active sequence info -->
         <div class="card">
             <div class="card-label">Active Sequence</div>
-            <div id="seq-info">Click "Auto Sync" or follow the manual steps to begin.</div>
+            <div id="seq-info">Click "Auto Sync" to begin.</div>
             <div id="busy-row" class="busy-row" style="display:none;">
                 <span class="busy-spinner"></span>
                 <span id="busy-text">Working…</span>
@@ -53,27 +53,8 @@
 
         <!-- Tips card: shown once per install after a successful Auto Sync -->
         <div id="tips-card" class="tips-card" style="display:none;">
-            <span class="tips-card-text">🎉 Synced! Syncitol is free — if it saved you time, consider <a id="tips-card-link" href="https://ko-fi.com/thinkvp">tipping on Ko-fi</a>.</span>
+            <span class="tips-card-text">🎉 <span id="tips-card-stats">Synced!</span> Syncitol is free — if it saved you time, consider <a id="tips-card-link" href="https://ko-fi.com/thinkvp">tipping on Ko-fi</a>.</span>
             <div id="tips-card-close" class="btn btn-mini" title="Dismiss">✕</div>
-        </div>
-
-        <div class="card-label">Manual steps</div>
-        <div class="step-card">
-            <div class="step-row">
-                <span class="step-num">1</span>
-                <span class="step-desc">Read clips from the active sequence</span>
-                <div id="btn-refresh" class="btn btn-secondary">↺ Scan Sequence</div>
-            </div>
-            <div class="step-row">
-                <span class="step-num">2</span>
-                <span class="step-desc">Lay clips out by recording time</span>
-                <div id="btn-sync" class="btn btn-secondary is-disabled">⏱ Build Sync</div>
-            </div>
-            <div class="step-row">
-                <span class="step-num">3</span>
-                <span class="step-desc">Polish tracks you've aligned within ~5s</span>
-                <div id="btn-fine-tune" class="btn btn-secondary is-disabled">≈ Fine Tune</div>
-            </div>
         </div>
 
         <!-- Sync results summary (filled after a fine tune / Auto Sync) -->
@@ -140,25 +121,13 @@
 
             <div class="ins-section">
                 <div class="ins-heading">⚡ Auto Sync</div>
-                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>Scan → Build Sync → align</strong> (coarse whole-track + fine per-clip). Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code> — Auto Sync refuses those), then click Auto Sync. It stops with a clear message if a step can't proceed, and a <strong>✕ Cancel</strong> button next to the spinner stops long audio scans at any time. When it finishes, the <strong>Sync Results</strong> table shows each track and clip's shift, the signal it matched on, and a confidence score. The Manual steps below run the stages individually — note the manual Fine Tune does the <strong>fast fine pass only</strong>, so Auto Sync is what corrects large clock offsets.</p>
+                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>scan → build sync sequence → align</strong> (coarse whole-track + fine per-clip). Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code> — Auto Sync refuses those), then click Auto Sync. It stops with a clear message if a step can't proceed, and a <strong>✕ Cancel</strong> button next to the spinner stops long audio scans at any time. When it finishes, the <strong>Sync Results</strong> table shows each track and clip's shift, the signal it matched on, and a confidence score.</p>
             </div>
 
             <div class="ins-section">
-                <div class="ins-heading">↺ Scan Sequence</div>
-                <p class="ins-text">Reads every clip's path, duration and type from your <strong>active sequence</strong>. Make the sequence you want to sync the active one first (double-click it in the Project panel).</p>
-            </div>
-
-            <div class="ins-section">
-                <div class="ins-heading">⏱ Build Sync</div>
-                <p class="ins-text">Creates a new sequence named <code>[original]-SYNC</code> and places every clip at its real-clock-time position, preserving track layout and A/V links.</p>
-                <p class="ins-text ins-note">Files should be stored locally — network or cloud-synced paths may not report a reliable modification date.</p>
-            </div>
-
-            <div class="ins-section">
-                <div class="ins-heading">≈ Fine Tune</div>
-                <p class="ins-text">The manual Fine Tune button runs the <strong>fine per-clip pass only</strong> (±5s) — fast, for when you're hands-on and have already nudged tracks into rough alignment. It auto-picks a <strong>reference track</strong> (the one with the most recorded coverage, on any track) and polishes every other clip to it via audio waveform cross-correlation. Only corrections larger than <code>20&nbsp;ms</code> are applied.</p>
-                <p class="ins-text ins-note">Large (minute-scale) clock offsets are handled by the <strong>coarse</strong> whole-track pass, which runs as part of <strong>⚡ Auto Sync</strong>. If a manual Fine Tune leaves a track far off, run Auto Sync instead — or drag the track within ~5s first.</p>
-                <p class="ins-text ins-note">After a fine tune, <strong>↩ Revert</strong> (in Sync Results) undoes exactly the shifts that were applied. On overlaps longer than 10 minutes the panel also checks for <strong>clock drift</strong> — devices whose clocks run at different rates — and warns with the measured drift (a single offset can't fix both ends; split long clips before syncing if flagged).</p>
+                <div class="ins-heading">Align: coarse + fine</div>
+                <p class="ins-text">Auto Sync aligns audio in two automatic phases. The <strong>coarse</strong> pass shifts each whole track to correct minute-scale clock offsets between devices. The <strong>fine</strong> pass then polishes every clip's position within <code>±5s</code> via audio waveform cross-correlation, using an auto-picked <strong>reference track</strong> (the one with the most recorded coverage, on any track). Only corrections larger than <code>20&nbsp;ms</code> are applied.</p>
+                <p class="ins-text ins-note">After Auto Sync, <strong>↩ Revert</strong> (in Sync Results) undoes exactly the shifts the fine pass applied. On overlaps longer than 10 minutes the panel also checks for <strong>clock drift</strong> — devices whose clocks run at different rates — and warns with the measured drift (a single offset can't fix both ends; split long clips before syncing if flagged).</p>
                 <div class="ins-subheading">Fine pass</div>
                 <div class="ins-range-table">
                     <div class="ins-range-row"><span class="ins-tag">±5s</span><span>Search range — clips must already be within this</span></div>
@@ -181,7 +150,7 @@
 
     <!-- Footer -->
     <div class="footer">
-        <span>Syncitol UXP v1.3.0</span>
+        <span>Syncitol UXP v1.4.0</span>
         <span id="tool-status" class="tool-status"></span>
         <span>Premiere Pro 26+</span>
         <a id="footer-tips" href="https://ko-fi.com/thinkvp" title="Support development">Tips</a>

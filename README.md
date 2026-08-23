@@ -83,7 +83,7 @@ resolves from Premiere's `.pek` peak cache with no audio decoding.
 | Host ops (`uxp/js/premiere.js`) | Verified live: scan, clone-based Build (**createMoveAction**, not createSetStartAction — see note), transactional shifts, undo = one step |
 | Engine (`uxp/js/main.js`) | Staged coarse (pek → timecode → timestamp → learned → head → full), fine pass with rail guard, clock-drift report, cancel, boundary compensation |
 | Caches | Envelope disk cache in the plugin data folder (30-day prune); `.pek`/`.mcdb` index via UXP fs |
-| UI | Auto Sync, manual steps, Detected Clips + Sync Results tables, score badges, Revert, Cancel, active-sequence polling, instructions overlay |
+| UI | Auto Sync, Detected Clips + Sync Results tables, score badges, Revert, Cancel, active-sequence polling, instructions overlay |
 | Packaging | `npm run build` → `uxp/dist/Syncitol-UXP-<version>.ccx` (minimal staging; never bundles native sources or shared FFmpeg DLLs) |
 
 ---

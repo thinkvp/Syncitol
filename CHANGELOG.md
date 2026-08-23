@@ -4,13 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project adheres to Semantic Versioning.
 
-Syncitol's version numbering resets to 1.0.0 with this release, alongside the
-new UXP version and the public GitHub launch. Earlier internal version
-history (up to 1.4.0) is preserved in [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
+Syncitol's version numbering reset to 1.0.0 at the public GitHub launch.
+The earlier internal history is a **separate 1.x line** that ran to its own
+1.4.0 before that reset — unrelated to the 1.4.0 below — and is preserved in
+[CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
-## [Unreleased]
+## [1.4.0] - 2026-08-23
 
 ### Removed
+- **Manual steps are gone.** The panel's three-step card (Scan Sequence /
+  Build Sync / Fine Tune) and its instructions sections have been removed;
+  **⚡ Auto Sync** is now the single entry point. The manual Fine Tune button
+  ran the fast per-clip pass *only*, with no coarse whole-track phase, so
+  reaching for it on footage with minute-scale clock offsets produced a
+  confidently-reported result that was still minutes out. Removing the
+  half-pipeline removes that trap — `fineTuneAudio()` no longer takes a
+  `coarse` option and always runs both phases.
 - **The CEP extension is discontinued.** Syncitol is now a UXP-only plugin
   requiring Premiere Pro 26.0+. The `cep/` tree, its CI and release
   workflows, and the CEP ↔ UXP version-sync gate have been removed from the
@@ -23,6 +32,10 @@ history (up to 1.4.0) is preserved in [CHANGELOG-legacy.md](CHANGELOG-legacy.md)
   it now covers the UXP plugin alone.
 - `uxp/README.md` was folded into the root `README.md`. With one plugin left
   there is no reason to send users a directory deeper for install steps.
+
+### Added
+- The post-sync tips card now reports what the run actually did — total
+  footage synced, clip count, and elapsed time — instead of a bare "Synced!".
 
 ### Documentation
 - **Documented the macOS security prompt.** On first run after installing,

@@ -68,9 +68,6 @@ let lastFineTuneRevert = null; // inverse shift list that undoes the last applie
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
 const btnAuto = $("btn-auto");
-const btnRefresh = $("btn-refresh");
-const btnSync = $("btn-sync");
-const btnFineTune = $("btn-fine-tune");
 const btnInstructions = $("btn-instructions");
 const btnInstClose = $("btn-instructions-close");
 const instructionsPanel = $("instructions-panel");
@@ -113,6 +110,7 @@ if (footerTips) {
 // ─── Tips card (shown once per install after a successful Auto Sync) ─────────
 const TIPS_DISMISSED_KEY = "syncitol-tips-dismissed";
 const tipsCard = $("tips-card");
+const tipsCardStats = $("tips-card-stats");
 const tipsCardClose = $("tips-card-close");
 const tipsCardLink = $("tips-card-link");
 
@@ -124,8 +122,10 @@ function dismissTipsCard() {
     try { localStorage.setItem(TIPS_DISMISSED_KEY, "1"); } catch (_) {}
     if (tipsCard) tipsCard.style.display = "none";
 }
-function maybeShowTipsCard() {
-    if (tipsCard && !tipsDismissed()) tipsCard.style.display = "flex";
+function maybeShowTipsCard(statsText) {
+    if (!tipsCard || tipsDismissed()) return;
+    if (tipsCardStats) tipsCardStats.textContent = statsText || "Synced!";
+    tipsCard.style.display = "flex";
 }
 if (tipsCardClose) tipsCardClose.addEventListener("click", dismissTipsCard);
 if (tipsCardLink) {
@@ -233,11 +233,11 @@ async function pollActiveSequence() {
     lastLiveSeqName = liveName;
 
     if (!liveName) {
-        seqInfo.textContent = "Open a sequence, then click \"Auto Sync\" or follow the manual steps.";
+        seqInfo.textContent = "Open a sequence, then click \"Auto Sync\".";
     } else if (liveName !== scannedSeqName) {
         seqInfo.innerHTML =
             `<span class="seq-name">${escapeHtml(liveName)}</span>` +
-            `<span class="seq-meta seq-stale">active — click "Auto Sync", or follow the manual steps</span>`;
+            `<span class="seq-meta seq-stale">active — click "Auto Sync"</span>`;
     }
     // When liveName === scannedSeqName, leave the rich scanned info in place.
 }
@@ -322,8 +322,8 @@ function byDurationDesc(a, b) {
 // factory reset or dead clock battery puts one recorder years off). Build can
 // only place such a clip arbitrarily, so a weak match at its Build position is
 // coincidence, not confirmation — the coarse pass must demand a strong score.
-// Returns an empty set when the payload is unavailable (manual Fine Tune) or
-// when every clock agrees, leaving the normal thresholds in force.
+// Returns an empty set when the payload is unavailable or when every clock
+// agrees, leaving the normal thresholds in force.
 function untrustedTimingPaths() {
     const out = new Set();
     if (!clipPayload || !clipPayload.length) return out;
@@ -1224,9 +1224,6 @@ btnRevert.addEventListener("click", revertFineTune);
 
 function setButtonsDisabled(d) {
     setDisabled(btnAuto, d);
-    setDisabled(btnRefresh, d);
-    setDisabled(btnSync, d || !clipPayload);
-    setDisabled(btnFineTune, d || !scannedSeqName);
 }
 
 // ─── Scan: read active sequence ───────────────────────────────────────────────
@@ -1235,8 +1232,6 @@ async function refreshSequence() {
     clearLog();
     clearSyncSummary();
     clipPayload = null;
-    setDisabled(btnSync, true);
-    setDisabled(btnFineTune, true);
     clipTable.style.display = "none";
     seqInfo.textContent = "Reading sequence…";
     setProgress(10);
@@ -1378,15 +1373,13 @@ async function refreshSequence() {
         }
 
         clipPayload = enriched;
-        setDisabled(btnFineTune, false);
         setProgress(100);
         setTimeout(() => setProgress(0, false), 600);
 
         if (hasSpanViolation) {
-            log("Build Sync Sequence is disabled \u2014 the sequence must fit within 24 hours. Process one recording day at a time.", "error");
+            log("Cannot build the sync sequence \u2014 it must fit within Premiere\u2019s 24-hour maximum. Process one recording day at a time.", "error");
         } else {
-            setDisabled(btnSync, false);
-            log(`Ready. Click "Build Sync Sequence" to create ${scan.name}-SYNC.`, "success");
+            log(`Ready to build "${scan.name}-SYNC".`, "success");
         }
 
         return !hasSpanViolation;
@@ -1451,9 +1444,8 @@ async function buildSync() {
 }
 
 // ─── Fine tune by waveform comparison ─────────────────────────────────────────
-async function fineTuneAudio(opts = {}) {
-    const runCoarse = opts.coarse === true; // Auto Sync passes true; the manual button is fine-only
-    beginOp(runCoarse ? "Fine tuning…" : "Fine tuning (fast)…");
+async function fineTuneAudio() {
+    beginOp("Fine tuning…");
     clearSyncSummary();
     setButtonsDisabled(true);
     setProgress(5);
@@ -1481,28 +1473,22 @@ async function fineTuneAudio(opts = {}) {
         log(`Fine tune: evaluating ${anchors.length} clips.`);
         setProgress(10);
 
-        // Phase 1 — coarse auto-align (Auto Sync only).
+        // Phase 1 — coarse auto-align (whole-track).
         const syncRows = [];
         const coarseDeltaByKey = new Map();
-        if (runCoarse) {
-            setBusy("Fine tuning — coarse align…");
-            log("Coarse align: scanning audio to find each track's offset — this can take a minute on long clips…");
-            const coarse = await analyzeCoarseAlign(anchors, (done, total) => {
-                setProgress(10 + Math.round((done / total) * 25));
-            });
-            coarse.notes.forEach(msg => log(msg));
-            for (const [key, d] of coarse.deltaByKey) coarseDeltaByKey.set(key, d);
-            syncRows.push(...coarse.results);
-        } else {
-            log(`Fine tune: per-clip pass only (±${dsp.FINE_TUNE_MAX_SHIFT_SEC}s). Assumes tracks are already within ${dsp.FINE_TUNE_MAX_SHIFT_SEC}s — use Auto Sync for larger offsets.`);
-        }
+        setBusy("Fine tuning — coarse align…");
+        log("Coarse align: scanning audio to find each track's offset — this can take a minute on long clips…");
+        const coarse = await analyzeCoarseAlign(anchors, (done, total) => {
+            setProgress(10 + Math.round((done / total) * 25));
+        });
+        coarse.notes.forEach(msg => log(msg));
+        for (const [key, d] of coarse.deltaByKey) coarseDeltaByKey.set(key, d);
+        syncRows.push(...coarse.results);
 
         // Phase 2 — fine residual via per-clip waveform correlation.
         setBusy("Fine tuning — per-clip pass…");
-        const fineBase = runCoarse ? 35 : 10;
-        const fineSpan = runCoarse ? 50 : 75;
         const fine = await analyzeFineTune(anchors, (done, total) => {
-            setProgress(fineBase + Math.round((done / total) * fineSpan));
+            setProgress(35 + Math.round((done / total) * 50));
         });
         fine.notes.forEach(msg => log(msg));
         syncRows.push(...fine.results);
@@ -1595,6 +1581,7 @@ async function autoSync() {
     beginOp("Auto Sync…");
     setDisabled(btnAuto, true);
     log("Auto Sync: starting (scan → build → fine tune)…");
+    const startedAt = Date.now();
 
     try {
         // Refuse to run on an already-built -SYNC sequence: the pipeline would
@@ -1623,9 +1610,16 @@ async function autoSync() {
             return;
         }
 
-        await fineTuneAudio({ coarse: true });
+        await fineTuneAudio();
         log(cancelRequested ? "Auto Sync cancelled." : "Auto Sync complete.", cancelRequested ? "warn" : "success");
-        if (!cancelRequested) maybeShowTipsCard();
+        if (!cancelRequested) {
+            const clipCount = (clipPayload || []).length;
+            const footageMs = (clipPayload || []).reduce((sum, f) => sum + (f.durationSec || 0) * 1000, 0);
+            const elapsedMs = Date.now() - startedAt;
+            maybeShowTipsCard(footageMs > 0
+                ? `Synced ${formatDuration(footageMs)} of footage across ${clipCount} clip${clipCount !== 1 ? "s" : ""} in ${formatDuration(elapsedMs)}!`
+                : "Synced!");
+        }
     } catch (e) {
         if (e && e.cancelled) log("Auto Sync cancelled.", "warn");
         else log(`✗ Auto Sync: ${e.message}`, "error");
@@ -1637,8 +1631,5 @@ async function autoSync() {
 
 // ─── Button click handlers ────────────────────────────────────────────────────
 btnAuto.addEventListener("click", autoSync);
-btnRefresh.addEventListener("click", refreshSequence);
-btnSync.addEventListener("click", buildSync);
-btnFineTune.addEventListener("click", () => fineTuneAudio({ coarse: false }));
 
 log("Syncitol UXP ready.");
