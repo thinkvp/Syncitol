@@ -18,11 +18,15 @@ jobs:
       matrix:
         node-version: [20, 22, 24]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
+          # setup-node caches npm automatically from v5 on. There are no
+          # dependencies and no lockfile here, so that would only fail
+          # looking for one.
+          package-manager-cache: false
       - name: Syntax check
         run: npm run lint
       - name: Unit tests

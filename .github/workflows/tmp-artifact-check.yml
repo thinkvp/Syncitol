@@ -1,0 +1,58 @@
+name: TEMP artifact round-trip check
+
+# Temporary. The release workflow only runs on a v* tag, so bumping
+# upload-artifact/download-artifact cannot be verified by a PR. This mirrors the
+# exact upload/download path handling that uxp-release.yml depends on — the
+# common-ancestor stripping on upload, and restoring the uxp/mac prefix on
+# download — with the new action versions. Delete once green.
+
+on:
+  push:
+    branches: ['ci/bump-actions']
+
+defaults:
+  run:
+    working-directory: uxp
+
+jobs:
+  produce:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stand in for the built macOS addon
+        run: |
+          mkdir -p mac/x64 mac/arm64
+          echo "fake-addon-x64" > mac/x64/syncitol.uxpaddon
+          echo "fake-addon-arm64" > mac/arm64/syncitol.uxpaddon
+
+      - name: Upload macOS addon artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mac-addon
+          path: |
+            uxp/mac/x64/syncitol.uxpaddon
+            uxp/mac/arm64/syncitol.uxpaddon
+
+  consume:
+    needs: produce
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download macOS addon
+        uses: actions/download-artifact@v8
+        with:
+          name: mac-addon
+          path: uxp/mac
+
+      - name: Verify the layout build-ccx.js expects
+        shell: bash
+        run: |
+          echo "--- tree under uxp/mac ---"
+          find mac -type f | sort
+          test -f mac/x64/syncitol.uxpaddon || { echo "mac/x64 addon missing"; exit 1; }
+          test -f mac/arm64/syncitol.uxpaddon || { echo "mac/arm64 addon missing"; exit 1; }
+          grep -q fake-addon-x64 mac/x64/syncitol.uxpaddon || { echo "x64 content wrong"; exit 1; }
+          grep -q fake-addon-arm64 mac/arm64/syncitol.uxpaddon || { echo "arm64 content wrong"; exit 1; }
+          echo "round-trip ✓"

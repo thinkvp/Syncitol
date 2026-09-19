@@ -23,14 +23,14 @@ jobs:
   build-addon-mac:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build tools
         run: brew install nasm pkg-config
 
       - name: Cache FFmpeg build
         id: cache-ffmpeg
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ffmpeg-out
           key: ffmpeg-mac-static-${{ hashFiles('uxp/scripts/build-ffmpeg-mac.sh') }}
@@ -56,7 +56,7 @@ jobs:
           cp native/build/syncitol.uxpaddon mac/arm64/
 
       - name: Upload macOS addon artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mac-addon
           path: |
@@ -68,10 +68,11 @@ jobs:
     needs: build-addon-mac
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
+          package-manager-cache: false   # no dependencies, no lockfile to cache
 
       - name: Check tag matches manifest.json
         shell: bash
@@ -83,10 +84,10 @@ jobs:
           fi
 
       - name: Download macOS addon
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mac-addon
-          # upload-artifact@v4 strips the common ancestor (uxp/mac/) from
+          # upload-artifact strips the common ancestor (uxp/mac/) from
           # paths, so the artifact contains x64/... and arm64/.... Extract
           # into uxp/mac to restore the prefix build-ccx.js expects.
           path: uxp/mac
