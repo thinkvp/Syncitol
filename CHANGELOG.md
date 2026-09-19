@@ -9,6 +9,55 @@ The earlier internal history is a **separate 1.x line** that ran to its own
 1.4.0 before that reset — unrelated to the 1.4.0 below — and is preserved in
 [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
+## [1.5.0] - 2026-09-19
+
+### Fixed
+- **A clip's video and audio could be pulled apart without a word.** Syncitol
+  computes one delta per source FILE and hands it to every timeline instance of
+  that file, so the two halves are never *asked* to move apart — but the host
+  can still refuse or alter a single move (a locked track, a destination
+  blocked by a neighbouring clip on that track, an item whose action could not
+  be built), and `applyStarts` queued each item independently, counted every
+  `addAction` as a success without reading its documented boolean return, and
+  reported per-item failures only to the developer console. One refused move
+  therefore tore that clip's link group silently. Now:
+  - moves are built and queued **per file, all or nothing** — if any instance
+    of a file cannot be moved, none of them are, and the file is reported as
+    left unsynced rather than torn;
+  - `addAction`'s return value is honored;
+  - every apply (build, fine tune, revert) **reads the timeline back** and
+    compares each file's instances, so a move the host accepted and then did
+    not perform is caught. Torn files are named in the log and in Sync Results
+    with what each instance actually did and what to do about it. A file whose
+    instances all moved together but not exactly as asked (frame snapping) is
+    reported separately as harmless.
+  - timeline items the scan could not read at all — no media path, or a getter
+    that threw — are now surfaced as a warning instead of being dropped
+    silently, since an unread item is one that never moves while its partner
+    does.
+
+### Added
+- **Audio reference dropdown.** The Active Sequence card now carries an
+  **Audio reference** picker, default **Auto**, listing every track that has
+  clips. Choosing one forces the alignment to use the recordings on that
+  track as its reference instead of the automatic pick (the track with the
+  most recorded coverage). Selecting a track selects the *files* sitting on
+  it, so forcing a camera's linked-audio track picks that camera even though
+  its anchor is the video instance. A forced track that holds no usable clip
+  — or that holds *every* clip, leaving nothing to align to it — falls back
+  to Auto and says so in the log. The choice is session-only (never
+  persisted: a track index means nothing in the next project) but survives
+  Auto Sync's original → `-SYNC` switch, since the Build clone keeps the
+  track layout.
+  - New pure `dsp.planReferenceLayer()` owns the decision (unit-tested);
+    `buildFineTuneAnchors(clips, forcedRefTrackKey)` marks the layers from it.
+  - New `premiere.listTracks()` reads the track inventory without touching
+    `getMediaFilePath()`, so the dropdown can follow the active sequence
+    cheaply.
+- **Copy the log.** A **⧉ Copy** button on the Log header puts the whole log on
+  the clipboard, and the log text is selectable where the UXP build allows it.
+  Reporting a bad sync no longer means retyping or screenshotting the panel.
+
 ## [1.4.0] - 2026-08-23
 
 ### Removed

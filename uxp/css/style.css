@@ -154,6 +154,82 @@ body {
 .seq-meta { color: var(--text-lo); font-size: 10px; }
 .seq-stale { color: var(--yellow); }
 
+/* ── Reference-track picker ─────────────────────────────────────────────────── */
+/* A div-built dropdown, like the buttons: UXP renders native <select> widgets
+   that ignore author styling, so the menu is our own absolutely-positioned
+   layer (the same technique as the instructions overlay). */
+.ref-row {
+    display: flex;
+    align-items: center;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+}
+.ref-row-label {
+    font-family: var(--mono);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--text-lo);
+    flex-shrink: 0;
+    margin-right: 10px;
+}
+.picker { position: relative; flex: 1; min-width: 0; }
+.picker-trigger {
+    display: flex;
+    align-items: center;
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-hi);
+    cursor: pointer;
+    user-select: none;
+}
+.picker-trigger:hover { border-color: var(--border-lit); }
+.picker-trigger.is-open { border-color: var(--accent); }
+.picker-trigger.is-disabled { opacity: 0.35; cursor: default; pointer-events: none; }
+#ref-trigger-text { flex: 1; min-width: 0; overflow: hidden; }
+.picker-caret { color: var(--text-lo); font-size: 9px; margin-left: 6px; flex-shrink: 0; }
+.picker-menu {
+    position: absolute;
+    /* Trigger height is fixed by its 10px mono line + 4px padding + 1px border. */
+    top: 26px;
+    left: 0;
+    right: 0;
+    z-index: 50;
+    max-height: 168px;
+    overflow-y: auto;
+    background-color: var(--bg-panel);
+    border: 1px solid var(--border-lit);
+    border-radius: 4px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
+}
+.picker-item {
+    display: flex;
+    align-items: baseline;
+    padding: 5px 8px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-mid);
+    cursor: pointer;
+    user-select: none;
+}
+.picker-item:hover { background-color: var(--accent-glow); color: var(--text-hi); }
+.picker-item.is-selected { color: var(--accent); }
+.picker-item-key { font-weight: 600; flex-shrink: 0; margin-right: 8px; }
+.picker-item-meta {
+    flex: 1;
+    min-width: 0;
+    font-size: 9px;
+    color: var(--text-lo);
+    text-align: right;
+    overflow: hidden;
+}
+.picker-empty { padding: 5px 8px; font-family: var(--mono); font-size: 9px; color: var(--text-lo); }
+
 /* ── Progress / busy ────────────────────────────────────────────────────────── */
 #progress-wrap {
     height: 4px;
@@ -407,8 +483,11 @@ body {
     min-height: 100px;
     max-height: 180px;
     overflow-y: auto;
+    /* Let the mouse select log text where the UXP build supports it; the ⧉ Copy
+       button is the reliable path, this is the convenience one. */
+    user-select: text;
 }
-.log-entry { color: var(--text-lo); }
+.log-entry { color: var(--text-lo); user-select: text; }
 .log-info  { color: var(--text-mid); }
 .log-success { color: var(--green); }
 .log-warn  { color: var(--yellow); }

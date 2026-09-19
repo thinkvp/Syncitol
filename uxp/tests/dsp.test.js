@@ -649,6 +649,170 @@ test("buildFineTuneAnchors skips clips without filePath or startTicks", () => {
     assert.strictEqual(dsp.buildFineTuneAnchors(clips).length, 0);
 });
 
+// ─── planReferenceLayer / forced reference track ───────────────────────────────
+
+// A two-camera + field-recorder sequence: each camera's audio is linked onto an
+// audio track, so choosing an audio track must still select the right FILES.
+function multicamClips() {
+    return [
+        { filePath: "camA", startTicks: "1", clipName: "A.mov", trackType: "video", trackIndex: 0, startSec: 0, endSec: 600, inPointSec: 0 },
+        { filePath: "camA", startTicks: "1", clipName: "A.mov", trackType: "audio", trackIndex: 0, startSec: 0, endSec: 600, inPointSec: 0 },
+        { filePath: "camB", startTicks: "2", clipName: "B.mov", trackType: "video", trackIndex: 1, startSec: 10, endSec: 200, inPointSec: 0 },
+        { filePath: "camB", startTicks: "2", clipName: "B.mov", trackType: "audio", trackIndex: 1, startSec: 10, endSec: 200, inPointSec: 0 },
+        { filePath: "wav", startTicks: "3", clipName: "REC.wav", trackType: "audio", trackIndex: 2, startSec: 5, endSec: 400, inPointSec: 0 },
+    ];
+}
+
+test("planReferenceLayer picks the most-covered track when nothing is forced", () => {
+    const clips = multicamClips();
+    const anchors = dsp.buildFineTuneAnchors(clips);
+    const plan = dsp.planReferenceLayer(anchors, clips, null);
+    assert.strictEqual(plan.forced, false);
+    assert.strictEqual(plan.refTrackKey, "video_0"); // camA, 600s — the longest
+    assert.strictEqual(plan.fallbackReason, null);
+});
+
+test("a forced track makes ITS recordings the reference layer", () => {
+    const clips = multicamClips();
+    const anchors = dsp.buildFineTuneAnchors(clips, "audio_2"); // the field recorder
+    const wav = anchors.find(a => a.filePath === "wav");
+    const camA = anchors.find(a => a.filePath === "camA");
+    assert.strictEqual(wav.isReference, true);
+    assert.strictEqual(wav.layerOrder, 0);
+    assert.strictEqual(camA.isReference, false);
+    assert.strictEqual(camA.layerOrder, 1);
+    // The reference sorts first, so the coarse pass treats it as the base layer.
+    assert.strictEqual(anchors[0].filePath, "wav");
+});
+
+test("forcing a camera's AUDIO track selects that camera, not its anchor track", () => {
+    // camB anchors to its video instance (video-preferred), yet picking the audio
+    // track its linked audio sits on must still make camB the reference.
+    const clips = multicamClips();
+    const anchors = dsp.buildFineTuneAnchors(clips, "audio_1");
+    const camB = anchors.find(a => a.filePath === "camB");
+    assert.strictEqual(camB.trackType, "video"); // anchor is still the video instance
+    assert.strictEqual(camB.isReference, true);
+    assert.strictEqual(anchors.filter(a => a.isReference).length, 1);
+    const plan = dsp.planReferenceLayer(anchors, clips, "audio_1");
+    assert.strictEqual(plan.forced, true);
+    assert.strictEqual(plan.refTrackKey, "audio_1");
+});
+
+test("a forced track holding every file falls back to Auto with a reason", () => {
+    // The realistic mistake: one audio track carries every camera's linked audio,
+    // so forcing it would leave nothing to align to it.
+    const clips = [
+        { filePath: "camA", startTicks: "1", clipName: "A.mov", trackType: "video", trackIndex: 0, startSec: 0, endSec: 600, inPointSec: 0 },
+        { filePath: "camA", startTicks: "1", clipName: "A.mov", trackType: "audio", trackIndex: 0, startSec: 0, endSec: 600, inPointSec: 0 },
+        { filePath: "camB", startTicks: "2", clipName: "B.mov", trackType: "video", trackIndex: 1, startSec: 10, endSec: 200, inPointSec: 0 },
+        { filePath: "camB", startTicks: "2", clipName: "B.mov", trackType: "audio", trackIndex: 0, startSec: 10, endSec: 200, inPointSec: 0 },
+    ];
+    const anchors = dsp.buildFineTuneAnchors(clips, "audio_0");
+    const plan = dsp.planReferenceLayer(anchors, clips, "audio_0");
+    assert.strictEqual(plan.forced, false);
+    assert.strictEqual(plan.rejectedTrackKey, "audio_0");
+    assert.ok(/every clip/.test(plan.fallbackReason), plan.fallbackReason);
+    // Auto took over: the most-covered track (camA on V1) is the reference.
+    assert.strictEqual(plan.refTrackKey, "video_0");
+    assert.strictEqual(anchors.filter(a => a.isReference).length, 1);
+    assert.strictEqual(anchors[0].filePath, "camA");
+});
+
+test("a forced track with no usable clip falls back to Auto with a reason", () => {
+    const clips = multicamClips();
+    const anchors = dsp.buildFineTuneAnchors(clips, "audio_7"); // empty / gone
+    const plan = dsp.planReferenceLayer(anchors, clips, "audio_7");
+    assert.strictEqual(plan.forced, false);
+    assert.strictEqual(plan.rejectedTrackKey, "audio_7");
+    assert.ok(/no clip/.test(plan.fallbackReason), plan.fallbackReason);
+    assert.strictEqual(plan.refTrackKey, "video_0");
+});
+
+test("trackKeyLabel renders a 1-based track label", () => {
+    assert.strictEqual(dsp.trackKeyLabel("audio_2"), "AUDIO 3");
+    assert.strictEqual(dsp.trackKeyLabel("video_0"), "VIDEO 1");
+    assert.strictEqual(dsp.trackKeyLabel(null), "");
+});
+
+// ─── diffInstanceMovement (A/V integrity) ─────────────────────────────────────
+
+// One camera file, video on V1 and its linked audio on A1, both at t=0.
+function linkedPair(startSec) {
+    return [
+        { filePath: "camA", clipName: "A.mov", trackType: "video", trackIndex: 0, startSec, endSec: startSec + 60 },
+        { filePath: "camA", clipName: "A.mov", trackType: "audio", trackIndex: 0, startSec, endSec: startSec + 60 }
+    ];
+}
+
+test("diffInstanceMovement is silent when a file's instances move together", () => {
+    const r = dsp.diffInstanceMovement(linkedPair(10), linkedPair(15), { camA: 5 }, 0.001);
+    assert.deepStrictEqual(r.torn, []);
+    assert.deepStrictEqual(r.missing, []);
+    assert.deepStrictEqual(r.quantized, []);
+});
+
+test("diffInstanceMovement reports a file whose video moved and audio did not", () => {
+    // The reported failure: the host accepted one move and refused the other.
+    const before = linkedPair(10);
+    const after = [
+        { filePath: "camA", clipName: "A.mov", trackType: "video", trackIndex: 0, startSec: 15, endSec: 75 },
+        { filePath: "camA", clipName: "A.mov", trackType: "audio", trackIndex: 0, startSec: 10, endSec: 70 }
+    ];
+    const r = dsp.diffInstanceMovement(before, after, { camA: 5 }, 0.001);
+    assert.strictEqual(r.torn.length, 1);
+    assert.strictEqual(r.torn[0].filePath, "camA");
+    assert.ok(Math.abs(r.torn[0].spreadSec - 5) < 1e-9, String(r.torn[0].spreadSec));
+    assert.strictEqual(r.torn[0].instances.length, 2);
+    const audio = r.torn[0].instances.find(i => i.trackType === "audio");
+    assert.strictEqual(audio.movedSec, 0);
+});
+
+test("diffInstanceMovement calls a consistent but inexact landing quantized, not torn", () => {
+    // Both instances snapped to the same frame: A/V is intact, so this must not
+    // be reported as a tear.
+    const r = dsp.diffInstanceMovement(linkedPair(10), linkedPair(14.96), { camA: 5 }, 0.001);
+    assert.deepStrictEqual(r.torn, []);
+    assert.strictEqual(r.quantized.length, 1);
+    assert.ok(Math.abs(r.quantized[0].actualSec - 4.96) < 1e-9);
+});
+
+test("diffInstanceMovement ignores files that were never asked to move", () => {
+    const before = linkedPair(10).concat([
+        { filePath: "camB", clipName: "B.mov", trackType: "video", trackIndex: 1, startSec: 0, endSec: 30 }
+    ]);
+    const after = linkedPair(15).concat([
+        { filePath: "camB", clipName: "B.mov", trackType: "video", trackIndex: 1, startSec: 0, endSec: 30 }
+    ]);
+    const r = dsp.diffInstanceMovement(before, after, { camA: 5 }, 0.001);
+    assert.deepStrictEqual(r.torn, []);
+    assert.deepStrictEqual(r.quantized, []);
+});
+
+test("diffInstanceMovement reports an instance that vanished from a track", () => {
+    const after = [
+        { filePath: "camA", clipName: "A.mov", trackType: "video", trackIndex: 0, startSec: 15, endSec: 75 }
+    ];
+    const r = dsp.diffInstanceMovement(linkedPair(10), after, { camA: 5 }, 0.001);
+    assert.strictEqual(r.missing.length, 1);
+    assert.strictEqual(r.missing[0].filePath, "camA");
+    assert.strictEqual(r.missing[0].tracks[0].trackType, "audio");
+    assert.strictEqual(r.missing[0].tracks[0].afterCount, 0);
+});
+
+test("diffInstanceMovement pairs multiple instances of one file on a track in time order", () => {
+    const before = [
+        { filePath: "camA", clipName: "A.mov", trackType: "video", trackIndex: 0, startSec: 0, endSec: 10 },
+        { filePath: "camA", clipName: "A.mov", trackType: "video", trackIndex: 0, startSec: 30, endSec: 40 },
+        { filePath: "camA", clipName: "A.mov", trackType: "audio", trackIndex: 0, startSec: 0, endSec: 10 },
+        { filePath: "camA", clipName: "A.mov", trackType: "audio", trackIndex: 0, startSec: 30, endSec: 40 }
+    ];
+    const after = before.map(c => ({ ...c, startSec: c.startSec + 2, endSec: c.endSec + 2 }));
+    const r = dsp.diffInstanceMovement(before, after, { camA: 2 }, 0.001);
+    assert.deepStrictEqual(r.torn, []);
+    assert.deepStrictEqual(r.quantized, []);
+});
+
 // ─── buildCompareWindow ───────────────────────────────────────────────────────
 
 test("buildCompareWindow plans offset windows within the overlap", () => {

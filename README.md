@@ -19,6 +19,11 @@ If Syncitol saves you a re-sync session, consider tipping on
   (audio demuxers/decoders only). No PATH setup, no external downloads.
 - **Tiny install.** A ~2–5 MB `.ccx` that Creative Cloud installs on
   double-click.
+- **Your call on the reference.** The audio alignment normally picks its own
+  reference track — the one with the most recorded coverage. The panel's
+  **Audio reference** dropdown overrides that: pick any track with clips (your
+  field recorder, the main camera) and everything else is aligned to the
+  recordings on it. Default is **Auto**.
 
 ## Requirements
 
@@ -78,12 +83,12 @@ resolves from Premiere's `.pek` peak cache with no audio decoding.
 
 | Area | State |
 | --- | --- |
-| DSP / sync brain (`uxp/js/dsp.js`) | Envelope cross-correlation, coarse search policy, pek parsing, drift probes, learned-offset search — `npm test` 66/66 |
+| DSP / sync brain (`uxp/js/dsp.js`) | Envelope cross-correlation, coarse search policy, pek parsing, drift probes, learned-offset search, reference-layer selection, A/V integrity diff — `npm test` 78/78 |
 | Native FFmpeg addon | Compiled for Windows (x64) and macOS (universal: arm64 + x86_64), self-contained, verified in-panel |
-| Host ops (`uxp/js/premiere.js`) | Verified live: scan, clone-based Build (**createMoveAction**, not createSetStartAction — see note), transactional shifts, undo = one step |
+| Host ops (`uxp/js/premiere.js`) | Verified live: scan, clone-based Build (**createMoveAction**, not createSetStartAction — see note), transactional shifts, undo = one step, per-file all-or-nothing moves + post-apply A/V integrity read-back |
 | Engine (`uxp/js/main.js`) | Staged coarse (pek → timecode → timestamp → learned → head → full), fine pass with rail guard, clock-drift report, cancel, boundary compensation |
 | Caches | Envelope disk cache in the plugin data folder (30-day prune); `.pek`/`.mcdb` index via UXP fs |
-| UI | Auto Sync, Detected Clips + Sync Results tables, score badges, Revert, Cancel, active-sequence polling, instructions overlay |
+| UI | Auto Sync, Audio reference picker, Detected Clips + Sync Results tables, score badges, Revert, Cancel, copy-log button, active-sequence polling, instructions overlay |
 | Packaging | `npm run build` → `uxp/dist/Syncitol-UXP-<version>.ccx` (minimal staging; never bundles native sources or shared FFmpeg DLLs) |
 
 ---

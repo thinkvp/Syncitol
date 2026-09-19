@@ -44,6 +44,19 @@
                 <div id="btn-cancel" class="btn btn-mini btn-cancel" title="Stop the current operation">✕ Cancel</div>
             </div>
             <div id="progress-wrap" style="display:none;"><div id="progress-bar"></div></div>
+
+            <!-- Audio reference track: "Auto" picks the track with the most
+                 coverage; any populated track can be forced instead. -->
+            <div class="ref-row">
+                <span class="ref-row-label">Audio reference</span>
+                <div class="picker">
+                    <div id="ref-trigger" class="picker-trigger" title="Which track everything else is aligned to">
+                        <span id="ref-trigger-text">Auto</span>
+                        <span class="picker-caret">▾</span>
+                    </div>
+                    <div id="ref-menu" class="picker-menu" style="display:none;"></div>
+                </div>
+            </div>
         </div>
 
         <!-- Action buttons -->
@@ -98,7 +111,10 @@
 
         <!-- Log -->
         <div>
-            <div class="card-label">Log</div>
+            <div class="results-head">
+                <div class="card-label">Log</div>
+                <div id="btn-copy-log" class="btn btn-mini" title="Copy the whole log to the clipboard">⧉ Copy</div>
+            </div>
             <div id="log"></div>
         </div>
 
@@ -126,7 +142,8 @@
 
             <div class="ins-section">
                 <div class="ins-heading">Align: coarse + fine</div>
-                <p class="ins-text">Auto Sync aligns audio in two automatic phases. The <strong>coarse</strong> pass shifts each whole track to correct minute-scale clock offsets between devices. The <strong>fine</strong> pass then polishes every clip's position within <code>±5s</code> via audio waveform cross-correlation, using an auto-picked <strong>reference track</strong> (the one with the most recorded coverage, on any track). Only corrections larger than <code>20&nbsp;ms</code> are applied.</p>
+                <p class="ins-text">Auto Sync aligns audio in two automatic phases. The <strong>coarse</strong> pass shifts each whole track to correct minute-scale clock offsets between devices. The <strong>fine</strong> pass then polishes every clip's position within <code>±5s</code> via audio waveform cross-correlation, using a <strong>reference track</strong> — by default the one with the most recorded coverage, on any track. Only corrections larger than <code>20&nbsp;ms</code> are applied.</p>
+                <p class="ins-text">The <strong>Audio reference</strong> dropdown in the Active Sequence card overrides that pick: choose any populated track (your field recorder, the main camera) and every other clip is aligned to the recordings on it. <strong>Auto</strong> is the default. A forced track that holds <em>every</em> clip in the sequence would leave nothing to align, so the panel falls back to Auto and says so in the log.</p>
                 <p class="ins-text ins-note">After Auto Sync, <strong>↩ Revert</strong> (in Sync Results) undoes exactly the shifts the fine pass applied. On overlaps longer than 10 minutes the panel also checks for <strong>clock drift</strong> — devices whose clocks run at different rates — and warns with the measured drift (a single offset can't fix both ends; split long clips before syncing if flagged).</p>
                 <div class="ins-subheading">Fine pass</div>
                 <div class="ins-range-table">
@@ -150,7 +167,7 @@
 
     <!-- Footer -->
     <div class="footer">
-        <span>Syncitol UXP v1.4.0</span>
+        <span>Syncitol UXP v1.5.0</span>
         <span id="tool-status" class="tool-status"></span>
         <span>Premiere Pro 26+</span>
         <a id="footer-tips" href="https://ko-fi.com/thinkvp" title="Support development">Tips</a>

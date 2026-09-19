@@ -236,17 +236,15 @@
 
     // ─── Fine-tune anchor planning ────────────────────────────────────────────
     // Collapse timeline clip instances to one anchor per source FILE, then mark
-    // which track is the reference. One anchor per file guarantees the coarse and
+    // which files are the reference. One anchor per file guarantees the coarse and
     // fine passes compute ONE shift per file, which the apply step gives to every
     // timeline instance of that file — a clip's video and its linked audio can
-    // never be shifted apart. The reference is the track with the most total
-    // recorded coverage (typically the continuous main-camera/program recording
-    // or a field-recorder WAV) — everything else is aligned to it. This is chosen
-    // by content, NOT by track position, so it works no matter which track the
-    // main recording sits on. Anchors get layerOrder 0 (reference) or 1
+    // never be shifted apart. Anchors get layerOrder 0 (reference) or 1
     // (everything else); the coarse and fine passes align layer-1 clips to the
-    // layer-0 reference.
-    function buildFineTuneAnchors(clips) {
+    // layer-0 reference. `forcedRefTrackKey` ("video_0", "audio_2") is the
+    // panel's reference dropdown; without it the reference is picked
+    // automatically — see planReferenceLayer.
+    function buildFineTuneAnchors(clips, forcedRefTrackKey) {
         var byKey = {};
         var order = [];
 
@@ -296,24 +294,9 @@
         var anchors = [];
         for (var k = 0; k < order.length; k += 1) anchors.push(byKey[order[k]]);
 
-        // Reference track = the track (type + index) with the most total coverage.
-        var coverage = {};
-        for (var a = 0; a < anchors.length; a += 1) {
-            var an = anchors[a];
-            var tk = an.trackType + "_" + an.trackIndex;
-            coverage[tk] = (coverage[tk] || 0) + (an.endSec - an.startSec);
-        }
-        var refTrackKey = null;
-        var refCoverage = -1;
-        for (var tkey in coverage) {
-            if (Object.prototype.hasOwnProperty.call(coverage, tkey) && coverage[tkey] > refCoverage) {
-                refCoverage = coverage[tkey];
-                refTrackKey = tkey;
-            }
-        }
-
+        var plan = planReferenceLayer(anchors, clips, forcedRefTrackKey);
         for (var b = 0; b < anchors.length; b += 1) {
-            var isRef = (anchors[b].trackType + "_" + anchors[b].trackIndex) === refTrackKey;
+            var isRef = Object.prototype.hasOwnProperty.call(plan.refPaths, anchors[b].filePath);
             anchors[b].layerOrder = isRef ? 0 : 1;
             anchors[b].isReference = isRef;
         }
@@ -323,6 +306,220 @@
             if (a.startSec !== b.startSec) return a.startSec - b.startSec;
             return a.clipName.localeCompare(b.clipName);
         });
+    }
+
+    // ─── Reference layer selection ────────────────────────────────────────────
+    // Decide which recordings form the reference layer — the layer every other
+    // clip is aligned TO. Returns { refTrackKey, refPaths, forced,
+    // rejectedTrackKey, fallbackReason }, where refPaths is the set of source
+    // file paths in that layer.
+    //
+    // `forcedRefTrackKey` is the panel's reference dropdown ("video_0",
+    // "audio_2"): every FILE with an instance on that timeline track joins the
+    // reference layer. Picking a track therefore picks the recordings sitting on
+    // it, not the anchors whose (video-preferred) position happens to be there —
+    // a camera whose audio sits on A1 anchors to its V1 instance, yet choosing
+    // A1 must still select that camera.
+    //
+    // Falls back to the automatic pick when no track is forced, when the forced
+    // track holds no usable clip, or when it holds EVERY file and so leaves
+    // nothing to align to it (the A1 that carries every camera's linked audio is
+    // the realistic case). The automatic pick is the track with the most total
+    // recorded coverage — typically the continuous main-camera/program recording
+    // or a field-recorder WAV. That is chosen by content, NOT by track position,
+    // so it works no matter which track the main recording sits on.
+    function planReferenceLayer(anchors, clips, forcedRefTrackKey) {
+        var i;
+
+        if (forcedRefTrackKey) {
+            var onTrack = {};
+            for (i = 0; i < clips.length; i += 1) {
+                var clip = clips[i];
+                if (!clip.filePath) continue;
+                if ((clip.trackType + "_" + clip.trackIndex) !== forcedRefTrackKey) continue;
+                onTrack[clip.filePath] = true;
+            }
+            // Only files that survived as anchors count: a clip with no start
+            // ticks or no readable media path never becomes one.
+            var kept = {};
+            var keptCount = 0;
+            for (i = 0; i < anchors.length; i += 1) {
+                if (!Object.prototype.hasOwnProperty.call(onTrack, anchors[i].filePath)) continue;
+                if (Object.prototype.hasOwnProperty.call(kept, anchors[i].filePath)) continue;
+                kept[anchors[i].filePath] = true;
+                keptCount += 1;
+            }
+            if (!keptCount) {
+                return autoReferenceLayer(anchors, forcedRefTrackKey, "it holds no clip the panel can read");
+            }
+            if (keptCount >= anchors.length) {
+                return autoReferenceLayer(anchors, forcedRefTrackKey,
+                    "it holds every clip in the sequence, so nothing would be left to align to it");
+            }
+            return {
+                refTrackKey: forcedRefTrackKey, refPaths: kept, forced: true,
+                rejectedTrackKey: null, fallbackReason: null
+            };
+        }
+
+        return autoReferenceLayer(anchors, null, null);
+    }
+
+    function autoReferenceLayer(anchors, rejectedTrackKey, fallbackReason) {
+        var coverage = {};
+        var a, tk;
+        for (a = 0; a < anchors.length; a += 1) {
+            tk = anchors[a].trackType + "_" + anchors[a].trackIndex;
+            coverage[tk] = (coverage[tk] || 0) + (anchors[a].endSec - anchors[a].startSec);
+        }
+        var refTrackKey = null;
+        var refCoverage = -1;
+        for (var tkey in coverage) {
+            if (Object.prototype.hasOwnProperty.call(coverage, tkey) && coverage[tkey] > refCoverage) {
+                refCoverage = coverage[tkey];
+                refTrackKey = tkey;
+            }
+        }
+        var refPaths = {};
+        for (a = 0; a < anchors.length; a += 1) {
+            tk = anchors[a].trackType + "_" + anchors[a].trackIndex;
+            if (tk === refTrackKey) refPaths[anchors[a].filePath] = true;
+        }
+        return {
+            refTrackKey: refTrackKey, refPaths: refPaths, forced: false,
+            rejectedTrackKey: rejectedTrackKey, fallbackReason: fallbackReason
+        };
+    }
+
+    // "audio_2" → "AUDIO 3" (1-based, matching Premiere's track headers).
+    function trackKeyLabel(key) {
+        if (!key) return "";
+        var cut = String(key).lastIndexOf("_");
+        if (cut < 1) return String(key);
+        var type = key.slice(0, cut);
+        var index = parseInt(key.slice(cut + 1), 10);
+        if (isNaN(index)) return String(key);
+        return type.toUpperCase() + " " + (index + 1);
+    }
+
+    // ─── Post-apply integrity check ───────────────────────────────────────────
+    // Syncitol moves clips ONE DELTA PER SOURCE FILE, so a file's video and its
+    // linked audio can never be asked to move apart. The host can still refuse
+    // or alter an INDIVIDUAL move — a locked track, a destination that would
+    // overlap a neighbour on that track, an item whose action could not be
+    // built, or frame quantization applied to a video item but not its audio —
+    // and Premiere reports that per action, not per file. A refusal therefore
+    // tears the link group it belongs to, silently. UXP exposes no link API
+    // (selection does not expand to linked items), so the only way to know is to
+    // read the timeline back and compare.
+    //
+    // `before` and `after` are scan clip lists of the SAME sequence, taken
+    // around one apply. Instances are paired per file+track in timeline order,
+    // which is stable because every instance of a file is moved by the same
+    // delta. What matters is that a file's instances all moved TOGETHER; moving
+    // by something other than the request, but consistently (the host snapping
+    // to the frame grid), keeps A/V intact and is reported separately.
+    //
+    // Returns { torn, missing, quantized } — see the three shapes below.
+    function diffInstanceMovement(before, after, deltaByPath, toleranceSec) {
+        var tol = (toleranceSec === undefined || toleranceSec === null) ? 0.001 : toleranceSec;
+
+        function index(clips) {
+            var out = {};
+            for (var i = 0; i < clips.length; i += 1) {
+                var c = clips[i];
+                if (!c.filePath) continue;
+                var key = c.filePath + "|" + c.trackType + "_" + c.trackIndex;
+                if (!out[key]) out[key] = [];
+                out[key].push(c);
+            }
+            for (var k in out) {
+                if (Object.prototype.hasOwnProperty.call(out, k)) {
+                    out[k].sort(function (a, b) { return a.startSec - b.startSec; });
+                }
+            }
+            return out;
+        }
+
+        var beforeBy = index(before);
+        var afterBy = index(after);
+
+        // File → its requested delta, keeping only files we actually asked to move.
+        var wanted = {};
+        for (var path in deltaByPath) {
+            if (!Object.prototype.hasOwnProperty.call(deltaByPath, path)) continue;
+            if (Math.abs(deltaByPath[path]) < tol) continue;
+            wanted[path] = deltaByPath[path];
+        }
+
+        var byFile = {};   // filePath → { moves: [...], missing: [...] }
+        for (var bkey in beforeBy) {
+            if (!Object.prototype.hasOwnProperty.call(beforeBy, bkey)) continue;
+            var cut = bkey.lastIndexOf("|");
+            var filePath = bkey.slice(0, cut);
+            if (!Object.prototype.hasOwnProperty.call(wanted, filePath)) continue;
+
+            if (!byFile[filePath]) byFile[filePath] = { moves: [], missing: [], clipName: null };
+            var entry = byFile[filePath];
+            var beforeList = beforeBy[bkey];
+            var afterList = afterBy[bkey] || [];
+            if (!entry.clipName) entry.clipName = beforeList[0].clipName;
+
+            if (afterList.length !== beforeList.length) {
+                entry.missing.push({
+                    trackType: beforeList[0].trackType,
+                    trackIndex: beforeList[0].trackIndex,
+                    beforeCount: beforeList.length,
+                    afterCount: afterList.length
+                });
+                continue;
+            }
+            for (var i = 0; i < beforeList.length; i += 1) {
+                entry.moves.push({
+                    trackType: beforeList[i].trackType,
+                    trackIndex: beforeList[i].trackIndex,
+                    clipName: beforeList[i].clipName,
+                    fromSec: beforeList[i].startSec,
+                    toSec: afterList[i].startSec,
+                    movedSec: afterList[i].startSec - beforeList[i].startSec
+                });
+            }
+        }
+
+        var torn = [];
+        var missing = [];
+        var quantized = [];
+        for (var fp in byFile) {
+            if (!Object.prototype.hasOwnProperty.call(byFile, fp)) continue;
+            var f = byFile[fp];
+            if (f.missing.length) {
+                missing.push({ filePath: fp, clipName: f.clipName, tracks: f.missing });
+            }
+            if (!f.moves.length) continue;
+
+            var lo = f.moves[0].movedSec;
+            var hi = f.moves[0].movedSec;
+            for (var m = 1; m < f.moves.length; m += 1) {
+                if (f.moves[m].movedSec < lo) lo = f.moves[m].movedSec;
+                if (f.moves[m].movedSec > hi) hi = f.moves[m].movedSec;
+            }
+            var requested = wanted[fp];
+            if (hi - lo > tol) {
+                torn.push({
+                    filePath: fp, clipName: f.clipName, requestedSec: requested,
+                    spreadSec: hi - lo, instances: f.moves
+                });
+            } else if (Math.abs(lo - requested) > tol) {
+                // Consistent across the file, so A/V is intact — the host just
+                // did not land exactly where it was asked (frame grid, t=0 edge).
+                quantized.push({
+                    filePath: fp, clipName: f.clipName, requestedSec: requested,
+                    actualSec: lo, instances: f.moves.length
+                });
+            }
+        }
+
+        return { torn: torn, missing: missing, quantized: quantized };
     }
 
     // Plan the overlapping comparison windows for a reference/target anchor pair.
@@ -862,6 +1059,9 @@
         findBestLag: findBestLag,
         slideMatch: slideMatch,
         buildFineTuneAnchors: buildFineTuneAnchors,
+        diffInstanceMovement: diffInstanceMovement,
+        planReferenceLayer: planReferenceLayer,
+        trackKeyLabel: trackKeyLabel,
         buildCompareWindow: buildCompareWindow,
         buildDriftProbe: buildDriftProbe,
         escapeHtml: escapeHtml,

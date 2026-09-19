@@ -81,9 +81,13 @@ const progressWrap = $("progress-wrap");
 const progressBar = $("progress-bar");
 const btnCancel = $("btn-cancel");
 const btnRevert = $("btn-revert");
+const btnCopyLog = $("btn-copy-log");
 const resultsSection = $("results-section");
 const resultsBody = $("results-body");
 const toolStatusEl = $("tool-status");
+const refTrigger = $("ref-trigger");
+const refTriggerText = $("ref-trigger-text");
+const refMenu = $("ref-menu");
 
 // Actions are styled <div class="btn"> elements (UXP's native <button> widget
 // ignores author backgrounds), so disabled state is a class, not a property.
@@ -136,14 +140,52 @@ if (tipsCardLink) {
 }
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
+// Every line is kept as plain text as well, so "⧉ Copy" hands over exactly what
+// is on screen: UXP's text selection inside a scrolling div is unreliable, and a
+// pasteable log is what makes a sync problem reportable.
+const logLines = [];
+
 function log(msg, type = "info") {
+    const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logLines.push(line);
     const entry = document.createElement("div");
     entry.className = "log-entry log-" + type;
-    entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    entry.textContent = line;
     logContainer.appendChild(entry);
     logContainer.scrollTop = logContainer.scrollHeight;
 }
-function clearLog() { logContainer.innerHTML = ""; }
+function clearLog() {
+    logLines.length = 0;
+    logContainer.innerHTML = "";
+}
+
+async function copyLog() {
+    const text = logLines.join("\n");
+    if (!text) return;
+    let ok = false;
+    try {
+        // UXP's own clipboard is the documented one; newer builds also carry the
+        // web API, so fall through to that rather than failing silently.
+        const uxp = require("uxp");
+        if (uxp && uxp.clipboard && typeof uxp.clipboard.setContent === "function") {
+            await uxp.clipboard.setContent({ "text/plain": text });
+            ok = true;
+        }
+    } catch (e) { ok = false; }
+    if (!ok) {
+        try {
+            if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(text);
+                ok = true;
+            }
+        } catch (e) { ok = false; }
+    }
+    // Feedback on the button itself — a log line about copying the log would be
+    // both noise and instantly stale.
+    btnCopyLog.textContent = ok ? "✓ Copied" : "✗ Failed";
+    setTimeout(() => { btnCopyLog.textContent = "⧉ Copy"; }, 1400);
+    if (!ok) log("Could not reach the clipboard — select the log text and copy manually.", "warn");
+}
 
 // Host-layer diagnostics go to the developer console; flip this on to mirror
 // them into the panel log when debugging in the field.
@@ -172,11 +214,16 @@ function beginOp(text) {
         setDisabled(btnCancel, false);
     }
     opDepth += 1;
+    closeRefMenu();
+    setDisabled(refTrigger, true);
     setBusy(text);
 }
 function endOp() {
     opDepth = Math.max(0, opDepth - 1);
-    if (opDepth === 0) setBusy(null);
+    if (opDepth === 0) {
+        setDisabled(refTrigger, false);
+        setBusy(null);
+    }
 }
 
 // ─── Cancellation ─────────────────────────────────────────────────────────────
@@ -231,6 +278,7 @@ async function pollActiveSequence() {
     const liveName = await premiere.getActiveSequenceName();
     if (liveName === lastLiveSeqName) return; // nothing changed since the last tick
     lastLiveSeqName = liveName;
+    refreshTrackOptions();                    // the reference dropdown follows the sequence
 
     if (!liveName) {
         seqInfo.textContent = "Open a sequence, then click \"Auto Sync\".";
@@ -242,6 +290,153 @@ async function pollActiveSequence() {
     // When liveName === scannedSeqName, leave the rich scanned info in place.
 }
 setInterval(pollActiveSequence, 3000);
+
+// ─── Audio reference picker ───────────────────────────────────────────────────
+// "Auto" leaves the reference to the analysis (the track with the most recorded
+// coverage); any populated track can be forced instead, which selects the
+// RECORDINGS on that track — every other clip is then aligned to them.
+//
+// The choice is session-only and deliberately NOT persisted: a track index means
+// nothing in the next project, and a stale forced reference would silently
+// mis-sync it. It does survive Auto Sync's original → -SYNC switch, because the
+// Build clone keeps the track layout.
+//
+// UXP renders native <select> widgets that ignore author styling (the same
+// reason the actions are <div class="btn">), so this is a div-built dropdown with
+// its own absolutely-positioned menu.
+let forcedRefTrackKey = null;  // null = Auto
+let refTrackOptions = [];      // [{ key, short, meta, trigger }]
+let refMenuOpen = false;
+let refOptionsGen = 0;         // discards the result of a superseded refresh
+
+function shortTrackLabel(track) {
+    return (track.trackType === "video" ? "V" : "A") + (track.trackIndex + 1);
+}
+
+// The track's own name, but only when the user renamed it to something more
+// useful than Premiere's defaults ("V1" / "Video 1").
+function customTrackName(track) {
+    const name = (track.trackName || "").trim();
+    if (!name) return null;
+    const n = track.trackIndex + 1;
+    const defaults = [`${track.trackType === "video" ? "v" : "a"}${n}`, `${track.trackType} ${n}`];
+    return defaults.includes(name.toLowerCase()) ? null : name;
+}
+
+// Walk up the parent chain instead of using contains()/closest(), which UXP's
+// DOM subset doesn't reliably implement.
+function isInside(node, root) {
+    while (node) {
+        if (node === root) return true;
+        node = node.parentNode;
+    }
+    return false;
+}
+
+function updateRefTrigger() {
+    if (!forcedRefTrackKey) {
+        refTriggerText.textContent = "Auto";
+        return;
+    }
+    const opt = refTrackOptions.find(o => o.key === forcedRefTrackKey);
+    refTriggerText.textContent = opt ? opt.trigger : dsp.trackKeyLabel(forcedRefTrackKey);
+}
+
+function renderRefMenu() {
+    refMenu.innerHTML = "";
+    const rows = [{ key: null, short: "Auto", meta: "most recorded coverage" }, ...refTrackOptions];
+    for (const opt of rows) {
+        const item = document.createElement("div");
+        item.className = "picker-item" + (opt.key === forcedRefTrackKey ? " is-selected" : "");
+        item.innerHTML =
+            `<span class="picker-item-key">${escapeHtml(opt.short)}</span>` +
+            `<span class="picker-item-meta">${escapeHtml(opt.meta)}</span>`;
+        item.addEventListener("click", () => selectRefTrack(opt.key));
+        refMenu.appendChild(item);
+    }
+    if (!refTrackOptions.length) {
+        const note = document.createElement("div");
+        note.className = "picker-empty";
+        note.textContent = "No tracks with clips — open a sequence.";
+        refMenu.appendChild(note);
+    }
+}
+
+function openRefMenu() {
+    renderRefMenu();
+    refMenu.style.display = "block";
+    refTrigger.classList.add("is-open");
+    refMenuOpen = true;
+}
+function closeRefMenu() {
+    if (!refMenu) return;
+    refMenu.style.display = "none";
+    refTrigger.classList.remove("is-open");
+    refMenuOpen = false;
+}
+
+function selectRefTrack(key) {
+    closeRefMenu();
+    if (key === forcedRefTrackKey) return;
+    forcedRefTrackKey = key;
+    updateRefTrigger();
+    log(key
+        ? `Audio reference: ${dsp.trackKeyLabel(key)} — every other clip will be aligned to the recordings on that track.`
+        : "Audio reference: Auto — the track with the most recorded coverage will be used.");
+}
+
+// Read the active sequence's tracks. Cheap enough (no media-path lookups) to run
+// on every sequence change; never throws — no sequence open just means no
+// options.
+async function refreshTrackOptions() {
+    const gen = refOptionsGen + 1;
+    refOptionsGen = gen;
+    let tracks = [];
+    try {
+        const info = await premiere.listActiveSequenceTracks();
+        tracks = (info.tracks || []).filter(t => t.clipCount > 0);
+    } catch (e) {
+        tracks = [];
+    }
+    if (gen !== refOptionsGen) return; // a later refresh already landed
+
+    refTrackOptions = tracks.map(t => {
+        const short = shortTrackLabel(t);
+        const name = customTrackName(t) || t.firstClipName;
+        const count = `${t.clipCount} clip${t.clipCount !== 1 ? "s" : ""}`;
+        return {
+            key: t.key,
+            short,
+            meta: name ? `${count} · ${name}` : count,
+            trigger: name ? `${short} · ${name}` : short
+        };
+    });
+
+    // A forced track the current sequence doesn't have would silently fall back
+    // mid-run, so drop it here where the panel can say so.
+    if (forcedRefTrackKey && !refTrackOptions.some(o => o.key === forcedRefTrackKey)) {
+        log(`Audio reference ${dsp.trackKeyLabel(forcedRefTrackKey)} is not in this sequence — back to Auto.`, "warn");
+        forcedRefTrackKey = null;
+    }
+    updateRefTrigger();
+    if (refMenuOpen) renderRefMenu();
+}
+
+refTrigger.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (refMenuOpen) {
+        closeRefMenu();
+        return;
+    }
+    openRefMenu();
+    if (!refTrackOptions.length) refreshTrackOptions(); // first open: fetch, then re-render
+});
+// Click-away. Bound to body (not document, whose event support UXP does not
+// guarantee) and written so the menu still stays open if stopPropagation above
+// is a no-op on some build.
+(document.body || document).addEventListener("click", (e) => {
+    if (refMenuOpen && !isInside(e.target, refMenu) && !isInside(e.target, refTrigger)) closeRefMenu();
+});
 
 // ─── Decoder availability (footer chip) ───────────────────────────────────────
 function updateToolStatus(ok, detail) {
@@ -1209,6 +1404,7 @@ async function revertFineTune() {
     setButtonsDisabled(true);
     try {
         const r = await premiere.applyShifts(lastFineTuneRevert.adjustments, {});
+        reportApplyIntegrity(r, null);
         log(`↩ Reverted the last fine tune (${r.applied} clip${r.applied !== 1 ? "s" : ""} restored).`, "success");
         setRevertAvailable(null);
         clearSyncSummary();
@@ -1224,6 +1420,95 @@ btnRevert.addEventListener("click", revertFineTune);
 
 function setButtonsDisabled(d) {
     setDisabled(btnAuto, d);
+}
+
+// ─── A/V integrity reporting ──────────────────────────────────────────────────
+// Syncitol asks for ONE delta per source file and hands it to every timeline
+// instance of that file, so a clip's video and its linked audio are never asked
+// to move apart. The host can still refuse or alter a single move — a locked
+// track, a destination that would overlap a neighbour on that track, an item
+// whose action could not be built — and that is what pulls A/V apart on some
+// clips while their neighbours on the same track are fine. premiere.js now reads
+// the timeline back after every apply; this turns the report into log lines and
+// Sync Results rows.
+//
+// Nothing here is cosmetic: an unreported tear is a permanent, silent edit.
+function reportApplyIntegrity(result, rows) {
+    if (!result) return true;
+    let clean = true;
+
+    if (result.scanDropped && (result.scanDropped.noPath || result.scanDropped.itemErr)) {
+        const d = result.scanDropped;
+        const lost = d.noPath + d.itemErr;
+        clean = false;
+        log(`⚠ ${lost} of ${d.raw} timeline items could not be read (${d.noPath} with no media path, ` +
+            `${d.itemErr} that errored). They were left where they are — if one of them is the audio half ` +
+            `of a clip, that clip is now out of sync with its video.`, "warn");
+        if (rows) rows.push({
+            scope: "track", label: "Unreadable timeline items", status: "unmatched",
+            detail: `${lost} item(s) skipped — check those clips`
+        });
+    }
+
+    for (const sk of (result.skipped || [])) {
+        clean = false;
+        const name = audio.baseName(sk.filePath);
+        log(`⚠ ${name} was left unsynced: ${sk.reason}. All ${sk.instances} of its timeline items were skipped ` +
+            `together, so its video and audio are still linked.`, "warn");
+        if (rows) rows.push({ scope: "clip", label: name, status: "unmatched", detail: `not moved — ${sk.reason}` });
+    }
+
+    for (const p of (result.partial || [])) {
+        clean = false;
+        const name = audio.baseName(p.filePath);
+        log(`✗ ${name}: the host accepted only ${p.added} of ${p.instances} moves for this file — its video and ` +
+            `audio may now be out of sync. Undo (Ctrl/Cmd+Z) restores the timeline.`, "error");
+        if (rows) rows.push({ scope: "clip", label: name, status: "unmatched", detail: "host refused part of the move — A/V may be torn" });
+    }
+
+    const integrity = result.integrity;
+    if (integrity) {
+        for (const t of integrity.torn) {
+            clean = false;
+            const name = audio.baseName(t.filePath);
+            const where = t.instances
+                .map(i => `${i.trackType.toUpperCase()} ${i.trackIndex + 1} moved ${formatSignedSeconds(i.movedSec)}`)
+                .join("; ");
+            log(`✗ A/V TORN — ${name}: every instance was asked to move ${formatSignedSeconds(t.requestedSec)}, but they ` +
+                `landed ${formatSignedSeconds(t.spreadSec)} apart (${where}). Undo (Ctrl/Cmd+Z) restores the timeline; ` +
+                `then check whether that clip's audio track is locked, or whether a neighbouring clip blocks where it ` +
+                `needed to land.`, "error");
+            if (rows) rows.push({
+                scope: "clip", label: name, status: "unmatched",
+                detail: `A/V torn by ${formatSignedSeconds(t.spreadSec)} — undo and check that track`
+            });
+        }
+        for (const m of integrity.missing) {
+            clean = false;
+            const name = audio.baseName(m.filePath);
+            const where = m.tracks
+                .map(t => `${t.trackType.toUpperCase()} ${t.trackIndex + 1}: ${t.beforeCount}→${t.afterCount}`)
+                .join(", ");
+            log(`✗ ${name}: the timeline holds a different number of its items after the move (${where}). ` +
+                `Undo (Ctrl/Cmd+Z) and re-run.`, "error");
+        }
+        if (integrity.quantized.length) {
+            // Every instance of these files agreed, so A/V is intact — the host
+            // simply did not land exactly where it was asked.
+            const worst = integrity.quantized.reduce((a, b) =>
+                Math.abs(b.actualSec - b.requestedSec) > Math.abs(a.actualSec - a.requestedSec) ? b : a);
+            log(`ℹ ${integrity.quantized.length} file(s) landed slightly off the requested shift (worst: ` +
+                `${audio.baseName(worst.filePath)}, asked ${formatSignedSeconds(worst.requestedSec)}, got ` +
+                `${formatSignedSeconds(worst.actualSec)}) — the host snapped them. Every instance of each file moved ` +
+                `by the same amount, so A/V stayed together.`, "info");
+        }
+        if (integrity.dropped && (integrity.dropped.noPath || integrity.dropped.itemErr)) {
+            const lost = integrity.dropped.noPath + integrity.dropped.itemErr;
+            log(`⚠ The verification pass could not read ${lost} timeline item(s); those were not checked for A/V drift.`, "warn");
+        }
+    }
+
+    return clean;
 }
 
 // ─── Scan: read active sequence ───────────────────────────────────────────────
@@ -1248,6 +1533,7 @@ async function refreshSequence() {
         scannedSeqName = scan.name;   // mark this sequence as the scanned one
         lastLiveSeqName = scan.name;  // keep the idle poll from re-flagging it
         log(`Sequence: "${scan.name}" — ${videoClips} video, ${audioClips} audio clips`);
+        await refreshTrackOptions(); // the reference dropdown follows the sequence
         setProgress(30);
 
         // Deduplicate to unique source FILES while preserving the FIRST instance's
@@ -1425,6 +1711,7 @@ async function buildSync() {
         } catch (e) { /* keep the clone's default name */ }
 
         log(`✓ Created sequence: "${finalName}" — placed ${built.placed}/${built.total} clips by record time.`, "success");
+        reportApplyIntegrity(built, null);
         setProgress(100);
         setTimeout(() => setProgress(0, false), 800);
         log(`Done! "${finalName}" is now open.`, "success");
@@ -1459,15 +1746,20 @@ async function fineTuneAudio() {
         await audio.ensureAddon();
 
         const scan = await premiere.scanActiveSequence();
-        const anchors = dsp.buildFineTuneAnchors(scan.clips);
+        const anchors = dsp.buildFineTuneAnchors(scan.clips, forcedRefTrackKey);
         if (anchors.length < 2) {
             throw new Error("Need at least two clips with accessible audio for fine tune.");
         }
 
-        const refAnchor = anchors.find(a => a.isReference);
-        if (refAnchor) {
+        // Same pure decision the anchors were marked with — read back for the log.
+        const refPlan = dsp.planReferenceLayer(anchors, scan.clips, forcedRefTrackKey);
+        if (refPlan.fallbackReason) {
+            log(`Audio reference ${dsp.trackKeyLabel(refPlan.rejectedTrackKey)} can't be the reference — ${refPlan.fallbackReason}. Falling back to Auto.`, "warn");
+        }
+        if (refPlan.refTrackKey) {
             const refCount = anchors.filter(a => a.isReference).length;
-            log(`Reference track: ${refAnchor.trackType.toUpperCase()} ${refAnchor.trackIndex + 1} — longest coverage (${refCount} clip${refCount !== 1 ? "s" : ""}). All other tracks align to it.`);
+            const how = refPlan.forced ? "chosen in the panel" : "longest coverage";
+            log(`Reference track: ${dsp.trackKeyLabel(refPlan.refTrackKey)} — ${how} (${refCount} clip${refCount !== 1 ? "s" : ""}). All other tracks align to it.`);
         }
 
         log(`Fine tune: evaluating ${anchors.length} clips.`);
@@ -1547,6 +1839,7 @@ async function fineTuneAudio() {
         }
 
         const r = await premiere.applyShifts(shifts, {});
+        reportApplyIntegrity(r, syncRows);
         if (compensateSec > 0) {
             log(`Fine tune: shifted entire sequence forward by ${formatSignedSeconds(compensateSec)} to keep boundary clip at position 0.`, "info");
         }
@@ -1632,4 +1925,7 @@ async function autoSync() {
 // ─── Button click handlers ────────────────────────────────────────────────────
 btnAuto.addEventListener("click", autoSync);
 
+if (btnCopyLog) btnCopyLog.addEventListener("click", copyLog);
+
+refreshTrackOptions();
 log("Syncitol UXP ready.");

@@ -24,6 +24,7 @@
  */
 
 const ppro = require("premierepro");
+const dsp = require("./dsp");
 
 async function val(x) { return (x && typeof x.then === "function") ? await x : x; }
 function tSec(t) { return t ? t.seconds : 0; }
@@ -123,7 +124,11 @@ const TRACK_ITEM_CLIP =
 
 // ─── Read a sequence's clips ──────────────────────────────────────────────────
 // Returns { name, sequence, clips:[{ filePath, clipName, trackType, trackIndex,
-//   startSec, endSec, inPointSec, startTicks, item, projectItem }] }.
+//   startSec, endSec, inPointSec, startTicks, item, projectItem }], dropped }.
+// `dropped` counts the timeline items this scan could NOT represent — an item
+// whose getters threw, or whose media path would not resolve. Those items are
+// invisible to every later step, so if one of them is the audio half of a link
+// group its video half moves without it. Callers surface a non-zero count.
 async function scanSequence(sequence) {
     if (!sequence) sequence = await getActiveSequence();
     if (!sequence) throw new Error("No active sequence.");
@@ -181,15 +186,62 @@ async function scanSequence(sequence) {
     if (typeof scanSequence.onDiag === "function") {
         scanSequence.onDiag(`tracks v${vCount}/a${aCount} · raw ${rawItems} · keptClips ${clips.length} · noPath ${noPath} · itemErr ${itemErr}`);
     }
-    return { name, sequence, clips };
+    return { name, sequence, clips, dropped: { noPath, itemErr, raw: rawItems } };
 }
 
 async function scanActiveSequence() { return scanSequence(await getActiveSequence()); }
 
+// ─── Track inventory (reference-track picker) ─────────────────────────────────
+// Light read for the panel's audio-reference dropdown: which tracks carry clips,
+// how many, the track's own name when the host exposes one, and the first clip's
+// name so a track is recognizable ("A3 · REC_0042.wav"). Deliberately cheaper
+// than scanSequence — it never calls getMediaFilePath(), the expensive getter
+// that yields to the host — so it is safe to run whenever the active sequence
+// changes. Returns { name, tracks:[{ key, trackType, trackIndex, trackName,
+// clipCount, firstClipName }] } with EVERY track, empty ones included (the
+// caller filters).
+async function listTracks(sequence) {
+    if (!sequence) sequence = await getActiveSequence();
+    const name = await val(sequence.name);
+    const vCount = await val(sequence.getVideoTrackCount());
+    const aCount = await val(sequence.getAudioTrackCount());
+    const tracks = [];
+
+    async function collect(track, trackType, trackIndex) {
+        let clipCount = 0;
+        let firstClipName = null;
+        let trackName = null;
+        let items = [];
+        try { items = track.getTrackItems(TRACK_ITEM_CLIP, false) || []; } catch (e) {} // sync
+        clipCount = items.length;
+        if (items.length) {
+            try { const n = await val(items[0].getName()); if (n) firstClipName = String(n); } catch (e) {}
+        }
+        // Track.name is a plain property on PPro 26.x; getName() exists on some
+        // builds. Either is optional — the caller falls back to "V1"/"A1".
+        try {
+            let n = await val(track.name);
+            if (!n && typeof track.getName === "function") n = await val(track.getName());
+            if (n) trackName = String(n);
+        } catch (e) {}
+        tracks.push({
+            key: `${trackType}_${trackIndex}`, trackType, trackIndex,
+            trackName, clipCount, firstClipName
+        });
+    }
+
+    for (let v = 0; v < vCount; v++) await collect(await val(sequence.getVideoTrack(v)), "video", v);
+    for (let a = 0; a < aCount; a++) await collect(await val(sequence.getAudioTrack(a)), "audio", a);
+    return { name, tracks };
+}
+
+async function listActiveSequenceTracks() { return listTracks(await getActiveSequence()); }
+
 // ─── Apply per-clip time shifts (one undoable transaction) ────────────────────
-// `targets`: [{ trackType, trackIndex, itemIndex, deltaSec }]. We match items by
+// `targets`: [{ filePath, trackType, trackIndex, itemIndex, deltaSec }]. We match
+// items by
 // track POSITION + index — never carrying a transient trackItem ref across an
-// await. Track objects are collected up front; the trackItems themselves are
+// await — and group them by filePath so a file moves as one piece or not at all. Track objects are collected up front; the trackItems themselves are
 // re-fetched fresh inside the (synchronous) transaction callback.
 //
 // Verified on PPro 26.3: createSetStartAction throws "Invalid parameter" whenever
@@ -200,49 +252,99 @@ async function scanActiveSequence() { return scanSequence(await getActiveSequenc
 // IMPORTANT: `project` and `sequence` must come from the SAME getActiveProject()
 // call — mixing wrappers from different calls makes host objects "no longer valid".
 async function applyStarts(project, sequence, targets, undoLabel) {
-    if (!targets.length) return 0;
+    if (!targets.length) return { applied: 0, requested: 0, skipped: [], partial: [] };
     const step = (m) => { try { console.log("[apply] " + m); } catch (e) {} if (typeof applyStarts.onStep === "function") applyStarts.onStep(m); };
-    const byTrack = new Map(); // "type:index" -> Map(itemIndex -> deltaSec)
+    const msgOf = (e) => (e && (e.message || String(e))) || "unknown error";
+
+    // Group by FILE first: a file's instances move together or not at all. Moving
+    // only some of them is what tears a clip's video from its linked audio, and
+    // it is never better than leaving that file unsynced.
+    const byFile = new Map();  // filePath -> [target]
     let skippedBad = 0;
     for (const t of targets) {
         if (!isFinite(t.deltaSec)) { skippedBad++; continue; }
-        const k = `${t.trackType}:${t.trackIndex}`;
-        if (!byTrack.has(k)) byTrack.set(k, new Map());
-        byTrack.get(k).set(t.itemIndex, t.deltaSec);
+        const key = t.filePath || `${t.trackType}:${t.trackIndex}:${t.itemIndex}`;
+        if (!byFile.has(key)) byFile.set(key, []);
+        byFile.get(key).push(t);
     }
     {
         const fv = targets.map(t => t.deltaSec).filter(isFinite);
-        step(`targets ${targets.length} · bad ${skippedBad} · Δmin ${fv.length ? Math.min.apply(null, fv).toFixed(2) : "-"} · Δmax ${fv.length ? Math.max.apply(null, fv).toFixed(2) : "-"}`);
+        step(`targets ${targets.length} · files ${byFile.size} · bad ${skippedBad} · Δmin ${fv.length ? Math.min.apply(null, fv).toFixed(2) : "-"} · Δmax ${fv.length ? Math.max.apply(null, fv).toFixed(2) : "-"}`);
     }
+
+    const needed = new Set(targets.map(t => `${t.trackType}:${t.trackIndex}`));
+    const tracks = [];
     const vCount = await val(sequence.getVideoTrackCount());
     const aCount = await val(sequence.getAudioTrackCount());
-    const tracks = [];
-    for (let v = 0; v < vCount; v++) tracks.push({ track: await val(sequence.getVideoTrack(v)), type: "video", index: v });
-    for (let a = 0; a < aCount; a++) tracks.push({ track: await val(sequence.getAudioTrack(a)), type: "audio", index: a });
+    for (let v = 0; v < vCount; v++) {
+        if (needed.has(`video:${v}`)) tracks.push({ track: await val(sequence.getVideoTrack(v)), key: `video:${v}` });
+    }
+    for (let a = 0; a < aCount; a++) {
+        if (needed.has(`audio:${a}`)) tracks.push({ track: await val(sequence.getAudioTrack(a)), key: `audio:${a}` });
+    }
 
-    let applied = 0, failVal = null, failMsg = null, failStage = null;
-    const perTrack = [];
+    let applied = 0;
+    const skipped = [];   // [{ filePath, instances, reason }] — nothing was moved
+    const partial = [];   // [{ filePath, instances, added }] — the host refused mid-file
     await lockedTransaction(project, undoLabel || "Syncitol", (compound) => {
-        for (const { track, type, index } of tracks) {
-            const map = byTrack.get(`${type}:${index}`);
-            if (!map || !map.size) continue;
-            const items = track.getTrackItems(TRACK_ITEM_CLIP, false) || []; // sync
-            let trackApplied = 0;
-            for (let i = 0; i < items.length; i++) {
-                if (!map.has(i)) continue;
-                const dSec = map.get(i);
+        const itemsByTrack = new Map();
+        for (const { track, key } of tracks) {
+            itemsByTrack.set(key, track.getTrackItems(TRACK_ITEM_CLIP, false) || []); // sync
+        }
+
+        for (const [filePath, list] of byFile) {
+            // Phase 1 — build every action for this file. Any failure and the
+            // whole file is left alone.
+            const actions = [];
+            let reason = null;
+            for (const t of list) {
+                const items = itemsByTrack.get(`${t.trackType}:${t.trackIndex}`) || [];
+                const item = items[t.itemIndex];
+                if (!item) {
+                    reason = `its ${t.trackType} ${t.trackIndex + 1} item is no longer at index ${t.itemIndex}`;
+                    break;
+                }
                 let delta;
-                try { delta = ppro.TickTime.createWithSeconds(dSec); }
-                catch (e) { if (failVal === null) { failVal = dSec; failStage = "createWithSeconds"; failMsg = e && (e.message || String(e)); } continue; }
-                try { compound.addAction(items[i].createMoveAction(delta)); applied++; trackApplied++; }
-                catch (e) { if (failVal === null) { failVal = dSec; failStage = "createMoveAction"; failMsg = e && (e.message || String(e)); } }
+                try { delta = ppro.TickTime.createWithSeconds(t.deltaSec); }
+                catch (e) { reason = `TickTime(${t.deltaSec}s) rejected: ${msgOf(e)}`; break; }
+                try { actions.push(item.createMoveAction(delta)); }
+                catch (e) { reason = `move action rejected on ${t.trackType} ${t.trackIndex + 1}: ${msgOf(e)}`; break; }
             }
-            perTrack.push(`${type}${index}: items=${items.length} wanted=${map.size} added=${trackApplied}`);
+            if (reason) {
+                skipped.push({ filePath, instances: list.length, reason });
+                continue;
+            }
+
+            // Phase 2 — queue them. addAction is documented to return a boolean;
+            // a false here means the host dropped that one move, which would
+            // leave the file half-shifted, so it is reported rather than counted.
+            let added = 0;
+            for (const action of actions) {
+                let ok = true;
+                try { ok = compound.addAction(action); }
+                catch (e) { ok = false; }
+                if (ok === false) continue;
+                added += 1;
+            }
+            applied += added;
+            if (added !== actions.length) partial.push({ filePath, instances: actions.length, added });
         }
     });
-    step("tracks: " + perTrack.join(" | "));
-    if (failVal !== null) step(`first error @ ${failStage} Δ=${failVal}: ${failMsg}`);
-    return applied;
+
+    step(`applied ${applied} · skipped files ${skipped.length} · partial files ${partial.length}`);
+    for (const sk of skipped.slice(0, 5)) step(`skipped ${sk.filePath}: ${sk.reason}`);
+    return { applied, requested: targets.length, skipped, partial };
+}
+
+// Read the timeline back after an apply and confirm every file moved as ONE
+// piece. This is the only way to catch a move the host accepted and then did not
+// perform (or performed differently) — the failure mode that silently pulls a
+// clip's video away from its linked audio. Pure comparison lives in dsp.js.
+async function verifyMovement(sequence, beforeClips, deltaByPath) {
+    const after = await scanSequence(sequence);
+    const report = dsp.diffInstanceMovement(beforeClips, after.clips, deltaByPath, 0.001);
+    report.dropped = after.dropped;
+    return report;
 }
 
 // Match shifts (filePath -> deltaSec) to scanned clips, then move them by track
@@ -265,14 +367,24 @@ async function applyShifts(shifts, opts) {
     }
 
     const targets = [];
+    const requestedByPath = {};
     for (const c of scan.clips) {
         if (blocked.has(c.filePath)) continue;
         const d = byPath.get(c.filePath);
         if (d === undefined || Math.abs(d) < 0.0005) continue;
-        targets.push({ trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: d });
+        targets.push({ filePath: c.filePath, trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: d });
+        requestedByPath[c.filePath] = d;
     }
-    const applied = await applyStarts(project, sequence, targets, "Syncitol: align clips");
-    return { applied, total: targets.length };
+    const result = await applyStarts(project, sequence, targets, "Syncitol: align clips");
+    // Files applyStarts refused were never moved, so they are not expected to
+    // have shifted — drop them from the verification set.
+    for (const sk of result.skipped) delete requestedByPath[sk.filePath];
+    const integrity = await verifyMovement(sequence, scan.clips, requestedByPath);
+    return {
+        applied: result.applied, total: targets.length,
+        skipped: result.skipped, partial: result.partial,
+        integrity, scanDropped: scan.dropped
+    };
 }
 
 // ─── Build a synced sequence ──────────────────────────────────────────────────
@@ -376,13 +488,21 @@ async function buildSyncSequence(clipPayload, baseName) {
 
     step("8 applyStarts (" + scan.clips.length + " clips)");
     const targets = [];
+    const requestedByPath = {};
     for (const c of scan.clips) {
         const d = deltaByPath[c.filePath];
         if (d === undefined || Math.abs(d) < MIN_PLACE_SEC) continue;
-        targets.push({ trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: d });
+        targets.push({ filePath: c.filePath, trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: d });
+        requestedByPath[c.filePath] = d;
     }
-    const moved = await applyStarts(project, clone, targets, "Syncitol: place by record time");
-    return { sequence: clone, name: await val(clone.name), placed: moved, total: scan.clips.length };
+    const result = await applyStarts(project, clone, targets, "Syncitol: place by record time");
+    for (const sk of result.skipped) delete requestedByPath[sk.filePath];
+    const integrity = await verifyMovement(clone, scan.clips, requestedByPath);
+    return {
+        sequence: clone, name: await val(clone.name), placed: result.applied, total: scan.clips.length,
+        skipped: result.skipped, partial: result.partial,
+        integrity, scanDropped: scan.dropped
+    };
 }
 
 // File modification time (ms) — fallback record-start source when a file carries
@@ -402,6 +522,6 @@ async function statMtimeMs(filePath) {
 
 module.exports = {
     getActiveProject, getActiveSequence, getActiveSequenceName, renameSequence,
-    scanSequence, scanActiveSequence,
-    applyStarts, applyShifts, buildSyncSequence, statMtimeMs
+    scanSequence, scanActiveSequence, listTracks, listActiveSequenceTracks,
+    applyStarts, applyShifts, buildSyncSequence, verifyMovement, statMtimeMs
 };
