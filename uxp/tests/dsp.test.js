@@ -383,8 +383,20 @@ test("pickProbeWindows rates room tone far below real content", () => {
         `content ${loud.activity} should dwarf room tone ${quiet.activity}`);
 });
 
-test("pickProbeWindows returns nothing when the clip is shorter than the probe", () => {
-    assert.deepStrictEqual(dsp.pickProbeWindows(new Float32Array(100), 10, 120, 2), []);
+test("pickProbeWindows falls back to the whole clip when it is shorter than the probe", () => {
+    // Callers ask for a probe as long as min(clipLength, targetMax), so on any
+    // clip under the cap the request equals the envelope and one sample of
+    // rounding used to mean "no window at all" — which silently disabled the
+    // relay retry and the confirmation pass for every short clip.
+    const env = new Float32Array(100);
+    for (let i = 0; i < env.length; i += 1) env[i] = Math.abs(Math.sin(i / 7)) * 100;
+    const [best] = dsp.pickProbeWindows(env, 10, 120, 2);
+    assert.ok(best, "the window is the clip");
+    assert.strictEqual(best.offsetSec, 0);
+});
+
+test("pickProbeWindows still gives up on an envelope too short to mean anything", () => {
+    assert.deepStrictEqual(dsp.pickProbeWindows(new Float32Array(1), 10, 120, 2), []);
 });
 
 test("pickProbeWindows is stable on a perfectly flat envelope", () => {
@@ -426,8 +438,18 @@ test("pickProbeWindowsSpread falls back to plain picking on short clips", () => 
     }
 });
 
-test("pickProbeWindowsSpread returns nothing when the clip is shorter than the probe", () => {
-    assert.deepStrictEqual(dsp.pickProbeWindowsSpread(new Float32Array(100), 10, 120, 4), []);
+test("pickProbeWindowsSpread falls back to the whole clip when it is shorter than the probe", () => {
+    const env = new Float32Array(100);
+    for (let i = 0; i < env.length; i += 1) env[i] = Math.abs(Math.sin(i / 7)) * 100;
+    const windows = dsp.pickProbeWindowsSpread(env, 10, 120, 4);
+    assert.strictEqual(windows.length, 1, "one window, covering the whole clip");
+});
+
+test("pickProbeWindowsSpread survives an envelope one sample short of the probe", () => {
+    // The exact shape that stopped a 27s clip from ever reaching the relay pass.
+    const env = new Float32Array(269);
+    for (let i = 0; i < env.length; i += 1) env[i] = Math.abs(Math.sin(i / 7)) * 100;
+    assert.strictEqual(dsp.pickProbeWindowsSpread(env, 10, 27, 4).length, 1);
 });
 
 test("planCoarseVerify aims at where the second probe should land", () => {
@@ -1103,4 +1125,776 @@ test("escapeHtml passes plain text through and tolerates null/undefined", () => 
     assert.strictEqual(dsp.escapeHtml(null), "");
     assert.strictEqual(dsp.escapeHtml(undefined), "");
     assert.strictEqual(dsp.escapeHtml(42), "42");
+});
+
+// ─── planTearRepair (A/V tear repair) ─────────────────────────────────────────
+
+// One file, video on V1 and audio on A1, asked to move +5 s. The video made it,
+// the audio did not: the exact shape of a clip coming unlinked.
+function tornFile(requestedSec, movedVideoSec, movedAudioSec) {
+    return [{
+        filePath: "camA", clipName: "camA.mp4", requestedSec: requestedSec,
+        spreadSec: Math.abs(movedVideoSec - movedAudioSec),
+        instances: [
+            { trackType: "video", trackIndex: 0, fromSec: 10, toSec: 10 + movedVideoSec, movedSec: movedVideoSec, afterIndex: 0 },
+            { trackType: "audio", trackIndex: 0, fromSec: 10, toSec: 10 + movedAudioSec, movedSec: movedAudioSec, afterIndex: 2 }
+        ]
+    }];
+}
+
+test("planTearRepair completes the instance that did not move", () => {
+    const moves = dsp.planTearRepair(tornFile(5, 5, 0), "complete");
+    assert.strictEqual(moves.length, 1, "only the straggler needs moving");
+    assert.strictEqual(moves[0].trackType, "audio");
+    assert.strictEqual(moves[0].itemIndex, 2, "addresses the item by its AFTER index");
+    assert.ok(Math.abs(moves[0].deltaSec - 5) < 1e-9);
+});
+
+test("planTearRepair restores every instance to where it started", () => {
+    const moves = dsp.planTearRepair(tornFile(5, 5, 0), "restore");
+    assert.strictEqual(moves.length, 1, "the instance that never moved needs no undo");
+    assert.strictEqual(moves[0].trackType, "video");
+    assert.ok(Math.abs(moves[0].deltaSec + 5) < 1e-9, "video goes back by -5 s");
+});
+
+test("planTearRepair restores BOTH instances when both moved, differently", () => {
+    const moves = dsp.planTearRepair(tornFile(5, 5, 2), "restore");
+    assert.strictEqual(moves.length, 2);
+    const byTrack = Object.fromEntries(moves.map(m => [m.trackType, m.deltaSec]));
+    assert.ok(Math.abs(byTrack.video + 5) < 1e-9);
+    assert.ok(Math.abs(byTrack.audio + 2) < 1e-9);
+});
+
+test("planTearRepair ignores a sub-frame spread — that is the host snapping, not a tear", () => {
+    assert.deepStrictEqual(dsp.planTearRepair(tornFile(5, 5, 4.998), "complete"), []);
+});
+
+test("planTearRepair skips instances with no handle in the after-scan", () => {
+    const torn = tornFile(5, 5, 0);
+    delete torn[0].instances[1].afterIndex;
+    assert.deepStrictEqual(dsp.planTearRepair(torn, "complete"), []);
+});
+
+// ─── planLinkGroups (links the per-file rule cannot see) ──────────────────────
+
+// A video item and an audio item from DIFFERENT files occupying the same span:
+// a merged clip, a Synchronize, or a manual Clip > Link.
+function crossFilePair(startSec, endSec) {
+    return [
+        { filePath: "camA.mp4", clipName: "camA.mp4", trackType: "video", trackIndex: 0, itemIndex: 0, startSec, endSec },
+        { filePath: "rec.wav", clipName: "rec.wav", trackType: "audio", trackIndex: 0, itemIndex: 0, startSec, endSec }
+    ];
+}
+
+test("planLinkGroups leaves a sequence with no cross-file links untouched", () => {
+    const clips = [
+        { filePath: "camA.mp4", clipName: "camA.mp4", trackType: "video", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 10 },
+        { filePath: "camA.mp4", clipName: "camA.mp4", trackType: "audio", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 10 }
+    ];
+    const plan = dsp.planLinkGroups(clips, [], { "camA.mp4": 3 }, 0.002);
+    assert.deepStrictEqual(plan.deltas, { "camA.mp4": 3 });
+    assert.strictEqual(plan.unified.length, 0);
+    assert.strictEqual(plan.blocked.length, 0);
+});
+
+test("planLinkGroups moves a linked video+audio pair by the video's shift", () => {
+    const plan = dsp.planLinkGroups(crossFilePair(0, 10), [], { "camA.mp4": 3, "rec.wav": 3.4 }, 0.002);
+    assert.strictEqual(plan.deltas["rec.wav"], 3, "the sound follows the picture");
+    assert.strictEqual(plan.deltas["camA.mp4"], 3);
+    assert.strictEqual(plan.unified.length, 1);
+    assert.deepStrictEqual(plan.unified[0].names.sort(), ["camA.mp4", "rec.wav"]);
+});
+
+test("planLinkGroups pulls a linked file that was not moving at all along too", () => {
+    const plan = dsp.planLinkGroups(crossFilePair(0, 10), [], { "camA.mp4": 3 }, 0.002);
+    assert.strictEqual(plan.deltas["rec.wav"], 3);
+});
+
+test("planLinkGroups needs BOTH edges to match before it calls it a link", () => {
+    const clips = crossFilePair(0, 10);
+    clips[1].endSec = 12;   // same start, different end — not a linked pair
+    const plan = dsp.planLinkGroups(clips, [], { "camA.mp4": 3, "rec.wav": 3.4 }, 0.002);
+    assert.strictEqual(plan.deltas["rec.wav"], 3.4, "left to sync on its own");
+    assert.strictEqual(plan.unified.length, 0);
+});
+
+test("planLinkGroups ignores same-media-type coincidences (two cameras, a stereo pair)", () => {
+    const clips = [
+        { filePath: "camA.mp4", clipName: "camA.mp4", trackType: "video", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 10 },
+        { filePath: "camB.mp4", clipName: "camB.mp4", trackType: "video", trackIndex: 1, itemIndex: 0, startSec: 0, endSec: 10 }
+    ];
+    const plan = dsp.planLinkGroups(clips, [], { "camA.mp4": 3, "camB.mp4": -2 }, 0.002);
+    assert.strictEqual(plan.deltas["camB.mp4"], -2);
+    assert.strictEqual(plan.unified.length, 0);
+});
+
+test("planLinkGroups carries an unreadable item along with the clip it is linked to", () => {
+    const clips = [
+        { filePath: "camA.mp4", clipName: "camA.mp4", trackType: "video", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 10 }
+    ];
+    const opaque = [
+        { clipName: "?", trackType: "audio", trackIndex: 2, itemIndex: 1, startSec: 0, endSec: 10 }
+    ];
+    const plan = dsp.planLinkGroups(clips, opaque, { "camA.mp4": 3 }, 0.002);
+    assert.strictEqual(plan.opaqueTargets.length, 1);
+    assert.strictEqual(plan.opaqueTargets[0].trackIndex, 2);
+    assert.strictEqual(plan.opaqueTargets[0].itemIndex, 1);
+    assert.strictEqual(plan.opaqueTargets[0].deltaSec, 3);
+    assert.deepStrictEqual(plan.opaqueTargets[0].groupPaths, ["camA.mp4"]);
+});
+
+test("planLinkGroups blocks a group with no readable picture to anchor on", () => {
+    const clips = [
+        { filePath: "rec.wav", clipName: "rec.wav", trackType: "audio", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 10 }
+    ];
+    const opaque = [
+        { clipName: "?", trackType: "video", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 10 }
+    ];
+    const plan = dsp.planLinkGroups(clips, opaque, { "rec.wav": 4 }, 0.002);
+    assert.strictEqual(plan.deltas["rec.wav"], undefined, "not moved, so it cannot leave the video behind");
+    assert.strictEqual(plan.blocked.length, 1);
+});
+
+test("planLinkGroups blocks a file two groups want in two different places", () => {
+    const clips = [
+        { filePath: "camA.mp4", clipName: "camA.mp4", trackType: "video", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 10 },
+        { filePath: "rec.wav", clipName: "rec.wav", trackType: "audio", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 10 },
+        { filePath: "camB.mp4", clipName: "camB.mp4", trackType: "video", trackIndex: 1, itemIndex: 0, startSec: 40, endSec: 50 },
+        { filePath: "rec.wav", clipName: "rec.wav", trackType: "audio", trackIndex: 0, itemIndex: 1, startSec: 40, endSec: 50 }
+    ];
+    const plan = dsp.planLinkGroups(clips, [], { "camA.mp4": 3, "camB.mp4": -6, "rec.wav": 1 }, 0.002);
+    assert.strictEqual(plan.deltas["rec.wav"], undefined);
+    assert.strictEqual(plan.deltas["camA.mp4"], undefined, "its partner is stuck, so it stays put too");
+    assert.strictEqual(plan.deltas["camB.mp4"], undefined);
+    assert.strictEqual(plan.blocked.length, 2);
+    assert.strictEqual(plan.unified.length, 0);
+});
+
+test("planLinkGroups does not mutate the deltas it was handed", () => {
+    const deltas = { "camA.mp4": 3, "rec.wav": 3.4 };
+    dsp.planLinkGroups(crossFilePair(0, 10), [], deltas, 0.002);
+    assert.deepStrictEqual(deltas, { "camA.mp4": 3, "rec.wav": 3.4 });
+});
+
+test("diffInstanceMovement hands the repair pass an index for each instance", () => {
+    const before = [
+        { filePath: "camA", clipName: "camA", trackType: "video", trackIndex: 0, itemIndex: 0, startSec: 10, endSec: 20 },
+        { filePath: "camA", clipName: "camA", trackType: "audio", trackIndex: 0, itemIndex: 3, startSec: 10, endSec: 20 }
+    ];
+    const after = [
+        { filePath: "camA", clipName: "camA", trackType: "video", trackIndex: 0, itemIndex: 1, startSec: 15, endSec: 25 },
+        { filePath: "camA", clipName: "camA", trackType: "audio", trackIndex: 0, itemIndex: 3, startSec: 10, endSec: 20 }
+    ];
+    const r = dsp.diffInstanceMovement(before, after, { camA: 5 }, 0.001);
+    assert.strictEqual(r.torn.length, 1);
+    const indices = r.torn[0].instances.map(i => i.afterIndex);
+    assert.deepStrictEqual(indices, [1, 3], "indices come from the AFTER scan, where the repair has to act");
+});
+
+// ─── largestCluster ───────────────────────────────────────────────────────────
+
+test("largestCluster finds the group that agrees and returns its median", () => {
+    const c = dsp.largestCluster([12.1, 0.4, 12.6, 40, 12.3], 2);
+    assert.deepStrictEqual(c.members, [12.1, 12.3, 12.6]);
+    assert.strictEqual(c.centre, 12.3);
+});
+
+test("largestCluster on scattered values keeps the tightest pair", () => {
+    const c = dsp.largestCluster([0, 30, 60], 2);
+    assert.strictEqual(c.members.length, 1, "nothing is within tolerance of anything else");
+});
+
+test("largestCluster tolerates an empty list", () => {
+    assert.strictEqual(dsp.largestCluster([], 2), null);
+});
+
+// ─── judgeTwoPointAgreement ───────────────────────────────────────────────────
+
+const lagAt = (lagSec, score) => ({ lagSec, score, atRail: false });
+
+test("judgeTwoPointAgreement accepts two windows telling the same story", () => {
+    const r = dsp.judgeTwoPointAgreement(lagAt(0.30, 0.8), lagAt(0.34, 0.7), 300);
+    assert.strictEqual(r.verdict, "agree");
+});
+
+test("judgeTwoPointAgreement rejects windows describing different alignments", () => {
+    // 4 s apart over a 300 s span is 13000 ppm — no device drifts like that.
+    const r = dsp.judgeTwoPointAgreement(lagAt(0.3, 0.8), lagAt(4.3, 0.8), 300);
+    assert.strictEqual(r.verdict, "disagree");
+    assert.ok(Math.abs(r.disagreeSec - 4) < 1e-9);
+});
+
+test("judgeTwoPointAgreement allows real clock drift over a long span", () => {
+    // 200 ppm over an hour is 0.72 s — plausible for two consumer devices.
+    const r = dsp.judgeTwoPointAgreement(lagAt(0, 0.8), lagAt(0.72, 0.8), 3600);
+    assert.strictEqual(r.verdict, "agree");
+    assert.ok(r.tolSec > 0.72, "tolerance grows with the span between the windows");
+});
+
+test("judgeTwoPointAgreement stays out of the way when a window has no signal", () => {
+    assert.strictEqual(dsp.judgeTwoPointAgreement(lagAt(0.3, 0.8), null, 300).verdict, "inconclusive");
+    assert.strictEqual(dsp.judgeTwoPointAgreement(lagAt(0.3, 0.8), lagAt(9, 0.05), 300).verdict, "inconclusive");
+    assert.strictEqual(
+        dsp.judgeTwoPointAgreement(lagAt(0.3, 0.8), { lagSec: 9, score: 0.8, atRail: true }, 300).verdict,
+        "inconclusive");
+});
+
+// ─── judgeCorroboration ───────────────────────────────────────────────────────
+
+const sib = (clipName, agreed, impliedDeltaSec) => ({ clipName, agreed, impliedDeltaSec, score: 0.5 });
+
+test("judgeCorroboration confirms when the track's other clips back the offset", () => {
+    const r = dsp.judgeCorroboration([sib("B.mp4", true, -12), sib("C.mp4", true, -12)], 2);
+    assert.strictEqual(r.verdict, "confirmed");
+    assert.strictEqual(r.agreed.length, 2);
+});
+
+test("judgeCorroboration says nothing when no sibling could be compared", () => {
+    const r = dsp.judgeCorroboration([
+        { clipName: "B.mp4", agreed: null, reason: "no overlap" },
+        { clipName: "C.mp4", agreed: null, reason: "no usable audio" }
+    ], 2);
+    assert.strictEqual(r.verdict, "inconclusive");
+});
+
+test("judgeCorroboration adopts the offset the dissenting clips agree on", () => {
+    // The matched clip claimed one thing; two other clips on the track both say
+    // the track really belongs 41 s earlier. They outvote it.
+    const r = dsp.judgeCorroboration([sib("B.mp4", false, -41.2), sib("C.mp4", false, -40.9)], 2);
+    assert.strictEqual(r.verdict, "adopt");
+    assert.ok(Math.abs(r.adoptedDeltaSec + 41.05) < 0.01, `got ${r.adoptedDeltaSec}`);
+});
+
+test("judgeCorroboration rejects dissent that agrees on nothing", () => {
+    const r = dsp.judgeCorroboration([sib("B.mp4", false, -41), sib("C.mp4", false, 130)], 2);
+    assert.strictEqual(r.verdict, "rejected");
+    assert.strictEqual(r.adoptedDeltaSec, null);
+});
+
+test("judgeCorroboration keeps the offset when assent outnumbers dissent", () => {
+    const r = dsp.judgeCorroboration([sib("B.mp4", true, -12), sib("C.mp4", true, -12), sib("D.mp4", false, 80)], 2);
+    assert.strictEqual(r.verdict, "confirmed");
+    assert.ok(r.note.includes("outnumbered"));
+});
+
+test("judgeCorroboration will not adopt on a single dissenting clip", () => {
+    const r = dsp.judgeCorroboration([sib("B.mp4", false, -41)], 2);
+    assert.strictEqual(r.verdict, "rejected", "one clip is not a consensus");
+});
+
+// ─── summarizeTrackResiduals ──────────────────────────────────────────────────
+
+const fineRow = (label, status, deltaSec) => ({ label, filePath: label, status, deltaSec });
+
+test("summarizeTrackResiduals finds the residual a track's clips agree on", () => {
+    const r = dsp.summarizeTrackResiduals([
+        fineRow("A.mp4", "shifted", 1.42),
+        fineRow("B.mp4", "shifted", 1.39),
+        fineRow("C.mp4", "unmatched")
+    ], 2);
+    assert.strictEqual(r.total, 3);
+    assert.strictEqual(r.matched, 2);
+    assert.strictEqual(r.failed, 1);
+    assert.deepStrictEqual(r.failedPaths, ["C.mp4"]);
+    assert.strictEqual(r.consensusCount, 2);
+    assert.ok(Math.abs(r.consensusDeltaSec - 1.405) < 0.01);
+    assert.strictEqual(r.suspect, false, "one clip failing out of three is ordinary");
+});
+
+test("summarizeTrackResiduals flags a track where most clips failed", () => {
+    const r = dsp.summarizeTrackResiduals([
+        fineRow("A.mp4", "shifted", 0.3),
+        fineRow("B.mp4", "unmatched"),
+        fineRow("C.mp4", "weak"),
+        fineRow("D.mp4", "unmatched")
+    ], 2);
+    assert.strictEqual(r.suspect, true);
+    assert.strictEqual(r.failed, 3);
+});
+
+test("summarizeTrackResiduals counts an already-aligned clip as a zero residual", () => {
+    const r = dsp.summarizeTrackResiduals([
+        fineRow("A.mp4", "aligned"),
+        fineRow("B.mp4", "aligned"),
+        fineRow("C.mp4", "unmatched")
+    ], 2);
+    assert.strictEqual(r.consensusDeltaSec, 0, "nothing to rescue anyone with");
+    assert.strictEqual(r.consensusCount, 2);
+});
+
+test("summarizeTrackResiduals reports no consensus from a single matched clip", () => {
+    const r = dsp.summarizeTrackResiduals([
+        fineRow("A.mp4", "shifted", 1.4),
+        fineRow("B.mp4", "unmatched")
+    ], 2);
+    assert.strictEqual(r.consensusDeltaSec, null, "one clip cannot corroborate itself");
+});
+
+test("summarizeTrackResiduals ignores scattered residuals", () => {
+    const r = dsp.summarizeTrackResiduals([
+        fineRow("A.mp4", "shifted", 0.2),
+        fineRow("B.mp4", "shifted", 4.4)
+    ], 2);
+    assert.strictEqual(r.consensusDeltaSec, null);
+});
+
+// ─── buildDriftProbe with a caller-set minimum ────────────────────────────────
+
+test("buildDriftProbe honours a lower overlap minimum than the drift default", () => {
+    const reference = { resolvedStartSec: 0, resolvedEndSec: 300, inPointSec: 0 };
+    const target = { resolvedStartSec: 0, resolvedEndSec: 300, inPointSec: 0 };
+    assert.strictEqual(dsp.buildDriftProbe(reference, target), null, "300s is under the 600s drift default");
+    const probe = dsp.buildDriftProbe(reference, target, dsp.FINE_TUNE_AGREE_MIN_OVERLAP_SEC);
+    assert.ok(probe, "but over the two-point-agreement minimum");
+    assert.ok(probe.spanSec > 0);
+});
+
+// ─── compareVersions (update check) ───────────────────────────────────────────
+
+test("compareVersions orders releases and tolerates a leading v", () => {
+    assert.strictEqual(dsp.compareVersions("1.6.0", "1.5.0"), 1);
+    assert.strictEqual(dsp.compareVersions("v1.6.0", "1.5.0"), 1);
+    assert.strictEqual(dsp.compareVersions("1.5.0", "v1.6.0"), -1);
+    assert.strictEqual(dsp.compareVersions("1.5.0", "1.5.0"), 0);
+});
+
+test("compareVersions compares numerically, not as text", () => {
+    assert.strictEqual(dsp.compareVersions("1.10.0", "1.9.3"), 1, "1.10 is newer than 1.9");
+    assert.strictEqual(dsp.compareVersions("1.5.10", "1.5.9"), 1);
+});
+
+test("compareVersions ignores a pre-release or build suffix", () => {
+    assert.strictEqual(dsp.compareVersions("v1.6.0-beta.1", "1.6.0"), 0);
+});
+
+test("compareVersions returns null rather than guessing at a bad version", () => {
+    // A malformed tag must never read as "an update is available".
+    assert.strictEqual(dsp.compareVersions("latest", "1.5.0"), null);
+    assert.strictEqual(dsp.compareVersions("1.5.0", null), null);
+    assert.strictEqual(dsp.compareVersions(undefined, undefined), null);
+});
+
+// ─── planBuildAnchors (build layout) ──────────────────────────────────────────
+
+const HOUR_MS = 3600000;
+const MIN_MS = 60000;
+
+// One file on a track, timed from embedded metadata unless told otherwise.
+function payload(trackType, trackIndex, startMs, durationSec, timingSource) {
+    return {
+        filePath: `${trackType}${trackIndex}@${startMs}`,
+        trackType, trackIndex, recordStartMs: startMs, durationSec,
+        timingSource: timingSource || "creation_time"
+    };
+}
+
+test("planBuildAnchors shares one anchor when the tracks were recording together", () => {
+    // Two cameras and a recorder, all rolling around 10:00: the clocks agree.
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("video", 1, 10 * HOUR_MS + 3 * MIN_MS, 600),
+        payload("audio", 0, 10 * HOUR_MS - MIN_MS, 1800)
+    ]);
+    assert.strictEqual(plan.groups.length, 1);
+    assert.strictEqual(plan.ungrouped.length, 0);
+    const anchor = 10 * HOUR_MS - MIN_MS;   // the earliest of the three
+    assert.strictEqual(plan.anchorMsByTrack["video_0"], anchor);
+    assert.strictEqual(plan.anchorMsByTrack["video_1"], anchor);
+    assert.strictEqual(plan.anchorMsByTrack["audio_0"], anchor);
+});
+
+test("planBuildAnchors lays a shared group out at its real clock offsets", () => {
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("video", 1, 10 * HOUR_MS + 3 * MIN_MS, 600)
+    ]);
+    const offset = (key, startMs) => (startMs - plan.anchorMsByTrack[key]) / 1000;
+    assert.strictEqual(offset("video_0", 10 * HOUR_MS), 0, "the earliest track still starts at 0:00");
+    assert.strictEqual(offset("video_1", 10 * HOUR_MS + 3 * MIN_MS), 180, "the later one starts 3 min in");
+});
+
+test("planBuildAnchors leaves a device with a wrong clock on its own anchor", () => {
+    // Two cameras agree; the third reset itself to the epoch.
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("video", 1, 10 * HOUR_MS + 3 * MIN_MS, 600),
+        payload("audio", 0, 0, 600)
+    ]);
+    assert.strictEqual(plan.groups.length, 1);
+    assert.deepStrictEqual(plan.groups[0].trackKeys.sort(), ["video_0", "video_1"]);
+    assert.deepStrictEqual(plan.ungrouped.map(u => u.trackKey), ["audio_0"]);
+    // …and that one still starts at 0:00, i.e. anchored to itself.
+    assert.strictEqual(plan.anchorMsByTrack["audio_0"], 0);
+});
+
+test("planBuildAnchors falls back entirely when no two tracks overlap", () => {
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 10 * HOUR_MS, 60),
+        payload("audio", 0, 14 * HOUR_MS, 60)
+    ]);
+    assert.strictEqual(plan.groups.length, 0, "nothing corroborates anything");
+    assert.strictEqual(plan.anchorMsByTrack["video_0"], 10 * HOUR_MS);
+    assert.strictEqual(plan.anchorMsByTrack["audio_0"], 14 * HOUR_MS);
+});
+
+test("planBuildAnchors groups transitively through a track that bridges two others", () => {
+    // A ran 09:00-10:00, C ran 11:00-12:00 — they never overlap each other, but
+    // the recorder B ran across both, so all three clocks corroborate.
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 9 * HOUR_MS, 3600),
+        payload("audio", 0, 9 * HOUR_MS, 3600 * 3),
+        payload("video", 1, 11 * HOUR_MS, 3600)
+    ]);
+    assert.strictEqual(plan.groups.length, 1);
+    assert.strictEqual(plan.groups[0].trackKeys.length, 3);
+});
+
+test("planBuildAnchors never groups a track timed from the file date", () => {
+    // mtime is "file date minus duration" — wrong by however much a copy touched
+    // the file, so it is not something to lay a timeline out on.
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("audio", 0, 10 * HOUR_MS, 600, "mtime")
+    ]);
+    assert.strictEqual(plan.groups.length, 0);
+    const why = Object.fromEntries(plan.ungrouped.map(u => [u.trackKey, u.reason]));
+    assert.ok(why["audio_0"].includes("file date"), "the mtime track is excluded outright");
+    // …which leaves the video track with nobody to corroborate it, so it falls
+    // back too rather than "grouping" with itself.
+    assert.ok(why["video_0"].includes("no other track"));
+    assert.strictEqual(plan.anchorMsByTrack["video_0"], 10 * HOUR_MS);
+});
+
+test("planBuildAnchors accepts timecode-derived starts alongside creation_time", () => {
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 10 * HOUR_MS, 600, "creation_time"),
+        payload("audio", 0, 10 * HOUR_MS, 600, "modification_date")
+    ]);
+    assert.strictEqual(plan.groups.length, 1);
+});
+
+test("planBuildAnchors refuses a group that would not fit a timeline", () => {
+    // Overlapping, but spanning more than Premiere's 24-hour maximum.
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 0, 3600),
+        payload("audio", 0, 1000, dsp.MAX_SPAN_SEC + 3600)
+    ]);
+    assert.strictEqual(plan.groups.length, 0);
+    assert.strictEqual(plan.ungrouped.length, 2);
+    assert.ok(plan.ungrouped[0].reason.includes("24-hour"));
+});
+
+test("planBuildAnchors takes each track's span from all of its clips", () => {
+    // V1 has two recordings; only the later one overlaps the audio track.
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 8 * HOUR_MS, 600),
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("audio", 0, 10 * HOUR_MS, 600)
+    ]);
+    assert.strictEqual(plan.groups.length, 1);
+    assert.strictEqual(plan.anchorMsByTrack["video_0"], 8 * HOUR_MS, "anchored to the track's earliest clip");
+    assert.strictEqual(plan.anchorMsByTrack["audio_0"], 8 * HOUR_MS, "and the audio shares it");
+});
+
+test("planBuildAnchors is a no-op shape for a single track", () => {
+    const plan = dsp.planBuildAnchors([payload("video", 0, 10 * HOUR_MS, 600)]);
+    assert.strictEqual(plan.groups.length, 0);
+    assert.strictEqual(plan.anchorMsByTrack["video_0"], 10 * HOUR_MS, "starts at 0:00 as always");
+});
+
+test("planBuildAnchors tolerates an empty payload", () => {
+    const plan = dsp.planBuildAnchors([]);
+    assert.deepStrictEqual(plan.anchorMsByTrack, {});
+    assert.deepStrictEqual(plan.groups, []);
+});
+
+// ─── assessTimingPlausibility (are these recording times at all?) ─────────────
+
+const SEC_MS = 1000;
+
+test("assessTimingPlausibility accepts sequential takes from one device", () => {
+    const r = dsp.assessTimingPlausibility([
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("video", 0, 10 * HOUR_MS + 11 * MIN_MS, 600),
+        payload("video", 0, 10 * HOUR_MS + 25 * MIN_MS, 600)
+    ]);
+    assert.deepStrictEqual(r.implausible, []);
+});
+
+test("assessTimingPlausibility rejects a batch transcode's timestamps", () => {
+    // Three 10-minute files all stamped within 60s of each other: consistent,
+    // and impossible — one camera cannot record them simultaneously.
+    const r = dsp.assessTimingPlausibility([
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("video", 0, 10 * HOUR_MS + 30 * SEC_MS, 600),
+        payload("video", 0, 10 * HOUR_MS + 60 * SEC_MS, 600)
+    ]);
+    assert.deepStrictEqual(r.implausible, ["video_0"]);
+    assert.ok(r.tracks[0].overlapSec > 1000, "nearly all the footage overlaps itself");
+});
+
+test("assessTimingPlausibility rejects a camera whose clock was never set", () => {
+    const r = dsp.assessTimingPlausibility([
+        payload("video", 0, 0, 600),
+        payload("video", 0, 0, 600)
+    ]);
+    assert.deepStrictEqual(r.implausible, ["video_0"]);
+});
+
+test("assessTimingPlausibility does NOT flag genuine multicam", () => {
+    // The whole point of the per-device test: three cameras really do all start
+    // within seconds of each other, and any "these are too close together" check
+    // would throw that away. Each is its own track, so none overlaps itself.
+    const r = dsp.assessTimingPlausibility([
+        payload("video", 0, 10 * HOUR_MS, 1800),
+        payload("video", 1, 10 * HOUR_MS + 3 * SEC_MS, 1800),
+        payload("audio", 0, 10 * HOUR_MS + 5 * SEC_MS, 1800)
+    ]);
+    assert.deepStrictEqual(r.implausible, []);
+});
+
+test("assessTimingPlausibility tolerates a second-resolution rounding overlap", () => {
+    // Back-to-back takes whose container stamps round into a 1s overlap.
+    const r = dsp.assessTimingPlausibility([
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("video", 0, 10 * HOUR_MS + 600 * SEC_MS - SEC_MS, 600)
+    ]);
+    assert.deepStrictEqual(r.implausible, []);
+});
+
+test("assessTimingPlausibility never flags a track holding one clip", () => {
+    const r = dsp.assessTimingPlausibility([payload("video", 0, 0, 600)]);
+    assert.deepStrictEqual(r.implausible, []);
+});
+
+test("assessTimingPlausibility spots file dates written by one bulk download", () => {
+    // mtime files: recordStart = mtime − duration, so their ENDS are the file
+    // dates. Three files covering an hour, all dated within 40s of each other.
+    const now = 1700000000000;
+    const r = dsp.assessTimingPlausibility([
+        payload("video", 0, now - 600 * SEC_MS, 600, "mtime"),
+        payload("video", 1, now - 900 * SEC_MS + 20 * SEC_MS, 900, "mtime"),
+        payload("audio", 0, now - 2400 * SEC_MS + 40 * SEC_MS, 2400, "mtime")
+    ]);
+    assert.ok(r.bulkCopy, "the file dates cluster far too tightly for the footage");
+    assert.strictEqual(r.bulkCopy.count, 3);
+    assert.strictEqual(r.bulkCopy.windowSec, 40);
+});
+
+test("assessTimingPlausibility leaves genuinely spread file dates alone", () => {
+    const base = 1700000000000;
+    const r = dsp.assessTimingPlausibility([
+        payload("video", 0, base, 600, "mtime"),
+        payload("video", 1, base + 2 * HOUR_MS, 600, "mtime"),
+        payload("audio", 0, base + 4 * HOUR_MS, 600, "mtime")
+    ]);
+    assert.strictEqual(r.bulkCopy, null);
+});
+
+test("assessTimingPlausibility ignores embedded-timed files when looking for a bulk copy", () => {
+    // These share a creation_time window, but that is the transcode check's
+    // business — bulkCopy is specifically about the filesystem date fallback.
+    const r = dsp.assessTimingPlausibility([
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("video", 1, 10 * HOUR_MS, 600),
+        payload("audio", 0, 10 * HOUR_MS, 600)
+    ]);
+    assert.strictEqual(r.bulkCopy, null);
+});
+
+test("planBuildAnchors refuses to group a track with batch-stamped timestamps", () => {
+    // V1 is a batch transcode; A1 is genuine. Neither should group: the bad one
+    // because it is not a recording time, the good one because it is then alone.
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 10 * HOUR_MS, 600),
+        payload("video", 0, 10 * HOUR_MS + 30 * SEC_MS, 600),
+        payload("audio", 0, 10 * HOUR_MS, 2400)
+    ]);
+    assert.strictEqual(plan.groups.length, 0);
+    const why = Object.fromEntries(plan.ungrouped.map(u => [u.trackKey, u.reason]));
+    assert.ok(why["video_0"].includes("batch-processing"));
+    assert.strictEqual(plan.anchorMsByTrack["video_0"], 10 * HOUR_MS, "still anchors to itself");
+});
+
+test("planBuildAnchors still groups the honest tracks around a batch-stamped one", () => {
+    const plan = dsp.planBuildAnchors([
+        payload("video", 0, 10 * HOUR_MS, 600),           // batch-stamped:
+        payload("video", 0, 10 * HOUR_MS + 30 * SEC_MS, 600),
+        payload("video", 1, 10 * HOUR_MS, 1800),          // genuine, one clip each
+        payload("audio", 0, 10 * HOUR_MS + 5 * SEC_MS, 1800)
+    ]);
+    assert.strictEqual(plan.groups.length, 1);
+    assert.deepStrictEqual(plan.groups[0].trackKeys.sort(), ["audio_0", "video_1"]);
+    assert.ok(plan.ungrouped.some(u => u.trackKey === "video_0"));
+});
+
+// ─── envelopeActivity (is there anything to correlate?) ───────────────────────
+
+test("envelopeActivity calls digital silence unusable", () => {
+    const r = dsp.envelopeActivity(new Float32Array(600));
+    assert.strictEqual(r.usable, false);
+    assert.strictEqual(r.stdDev, 0);
+});
+
+test("envelopeActivity calls a constant envelope unusable", () => {
+    // Loud but unvarying: slideMatch divides by zero energy and returns null,
+    // which is why a silent clip reports "no match" rather than a weak one.
+    const flat = new Float32Array(600).fill(1200);
+    assert.strictEqual(dsp.envelopeActivity(flat).usable, false);
+    assert.strictEqual(dsp.slideMatch(makeSignal(3000, 9), flat, { envelopeRate: 10, minOverlapSec: 60 }), null);
+});
+
+test("envelopeActivity accepts quiet but varying audio", () => {
+    // Quiet is still audio; only a constant signal is unusable.
+    const quiet = new Float32Array(600);
+    for (let i = 0; i < quiet.length; i += 1) quiet[i] = (i % 7) * 0.01;
+    assert.strictEqual(dsp.envelopeActivity(quiet).usable, true);
+});
+
+test("envelopeActivity handles an empty envelope", () => {
+    assert.strictEqual(dsp.envelopeActivity(new Float32Array(0)).usable, false);
+    assert.strictEqual(dsp.envelopeActivity(null).usable, false);
+});
+
+// ─── summarizeTrackResiduals: out-of-range clips are not failures ─────────────
+
+const rangeRow = (label, status, deltaSec, outOfRange) =>
+    ({ label, filePath: label, status, deltaSec, outOfRange });
+
+test("summarizeTrackResiduals does not blame a track for clips the reference never covered", () => {
+    // The VIDEO 3 shape from the field log: a healthy track whose reference
+    // recording simply does not span the whole shoot. Counting those as
+    // failures made a perfectly good coarse offset look broken.
+    const rows = [
+        rangeRow("a", "shifted", -0.69), rangeRow("b", "shifted", -0.70),
+        rangeRow("c", "shifted", -0.68), rangeRow("d", "unmatched", undefined, true),
+        rangeRow("e", "unmatched", undefined, true), rangeRow("f", "unmatched", undefined, true),
+        rangeRow("g", "unmatched", undefined, true), rangeRow("h", "unmatched", undefined, true)
+    ];
+    const r = dsp.summarizeTrackResiduals(rows, 2);
+    assert.strictEqual(r.outOfRange, 5);
+    assert.strictEqual(r.suspect, false, "the reference just did not reach them");
+    assert.ok(Math.abs(r.consensusDeltaSec + 0.69) < 0.01);
+    assert.strictEqual(r.failedPaths.length, 5, "they are still worth rescuing");
+});
+
+test("summarizeTrackResiduals still flags a track that failed with a reference present", () => {
+    const rows = [
+        rangeRow("a", "shifted", -0.69),
+        rangeRow("b", "unmatched", undefined, false),
+        rangeRow("c", "weak", undefined, false),
+        rangeRow("d", "unmatched", undefined, false)
+    ];
+    const r = dsp.summarizeTrackResiduals(rows, 2);
+    assert.strictEqual(r.outOfRange, 0);
+    assert.strictEqual(r.suspect, true, "three clips had a reference and still failed");
+});
+
+test("summarizeTrackResiduals stays quiet when every clip was out of range", () => {
+    // Nothing was testable, so there is no evidence either way.
+    const rows = [
+        rangeRow("a", "unmatched", undefined, true),
+        rangeRow("b", "unmatched", undefined, true)
+    ];
+    const r = dsp.summarizeTrackResiduals(rows, 2);
+    assert.strictEqual(r.suspect, false);
+    assert.strictEqual(r.consensusDeltaSec, null);
+});
+
+// ─── auditLinkAlignment / planLinkRepair (absolute A/V alignment) ─────────────
+
+const avClip = (filePath, trackType, trackIndex, itemIndex, startSec, endSec) =>
+    ({ filePath, clipName: filePath, trackType, trackIndex, itemIndex, startSec, endSec });
+
+test("auditLinkAlignment is silent when audio sits under its video", () => {
+    const r = dsp.auditLinkAlignment([
+        avClip("camA.mp4", "video", 3, 0, 100, 130),
+        avClip("camA.mp4", "audio", 4, 0, 100, 130)
+    ]);
+    assert.strictEqual(r.checked, 1);
+    assert.deepStrictEqual(r.misaligned, []);
+});
+
+test("auditLinkAlignment catches a tear the movement check cannot see", () => {
+    // Both instances moved by the SAME +226.39s, so diffInstanceMovement reports
+    // a spread of zero and calls it clean — while the audio sits 2s off the
+    // picture the whole time. Only an absolute comparison finds this.
+    const before = [
+        avClip("camA.mp4", "video", 3, 0, 100, 130),
+        avClip("camA.mp4", "audio", 4, 0, 102, 132)
+    ];
+    const after = [
+        avClip("camA.mp4", "video", 3, 0, 326.39, 356.39),
+        avClip("camA.mp4", "audio", 4, 0, 328.39, 358.39)
+    ];
+    const moved = dsp.diffInstanceMovement(before, after, { "camA.mp4": 226.39 }, 0.001);
+    assert.deepStrictEqual(moved.torn, [], "the movement check sees nothing wrong");
+    const r = dsp.auditLinkAlignment(after);
+    assert.strictEqual(r.misaligned.length, 1, "the absolute check finds it");
+    assert.strictEqual(r.misaligned[0].offsetSec, 2);
+});
+
+test("auditLinkAlignment will not guess at a file cut into several pieces", () => {
+    const r = dsp.auditLinkAlignment([
+        avClip("camA.mp4", "video", 3, 0, 100, 130),
+        avClip("camA.mp4", "video", 3, 1, 200, 230),
+        avClip("camA.mp4", "audio", 4, 0, 100, 130)
+    ]);
+    assert.strictEqual(r.checked, 0);
+    assert.strictEqual(r.ambiguous.length, 1);
+});
+
+test("auditLinkAlignment ignores a file with no audio on the timeline", () => {
+    const r = dsp.auditLinkAlignment([avClip("camA.mp4", "video", 3, 0, 100, 130)]);
+    assert.strictEqual(r.checked, 0);
+    assert.deepStrictEqual(r.misaligned, []);
+});
+
+test("diffLinkAlignment separates what an apply broke from what it inherited", () => {
+    const before = { misaligned: [{ filePath: "old.mp4", offsetSec: 1.5 }] };
+    const after = { misaligned: [
+        { filePath: "old.mp4", offsetSec: 1.5, clipName: "old.mp4" },   // carried along
+        { filePath: "new.mp4", offsetSec: -0.8, clipName: "new.mp4" },  // created here
+        { filePath: "worse.mp4", offsetSec: 3.0, clipName: "worse.mp4" }
+    ] };
+    const beforeWithWorse = { misaligned: before.misaligned.concat([{ filePath: "worse.mp4", offsetSec: 0.2 }]) };
+    const d = dsp.diffLinkAlignment(beforeWithWorse, after);
+    assert.deepStrictEqual(d.created.map(x => x.filePath), ["new.mp4"]);
+    assert.deepStrictEqual(d.worsened.map(x => x.filePath), ["worse.mp4"]);
+    assert.deepStrictEqual(d.preexisting.map(x => x.filePath), ["old.mp4"]);
+});
+
+test("planLinkRepair moves the audio back under the picture, never the video", () => {
+    const moves = dsp.planLinkRepair([{
+        filePath: "camA.mp4", offsetSec: 2,
+        audio: { trackType: "audio", trackIndex: 4, itemIndex: 7 },
+        video: { trackType: "video", trackIndex: 3, itemIndex: 2 }
+    }]);
+    assert.strictEqual(moves.length, 1);
+    assert.strictEqual(moves[0].trackType, "audio", "the picture is what the edit is cut against");
+    assert.strictEqual(moves[0].itemIndex, 7);
+    assert.strictEqual(moves[0].deltaSec, -2);
+});
+
+test("planLinkRepair ignores offsets too small to be worth a move", () => {
+    assert.deepStrictEqual(dsp.planLinkRepair([{
+        filePath: "camA.mp4", offsetSec: 0.001,
+        audio: { trackType: "audio", trackIndex: 4, itemIndex: 7 }
+    }]), []);
+});
+
+test("planTearRepair refuses to act on an ambiguous pairing", () => {
+    // A file cut into pieces is paired in time order, which only holds while the
+    // pieces move together — exactly what is in doubt. Moving on that guess
+    // would relocate a clip rather than repair one.
+    const torn = [{
+        filePath: "camA", clipName: "camA", requestedSec: 5, spreadSec: 5, ambiguous: true,
+        instances: [
+            { trackType: "video", trackIndex: 0, movedSec: 5, afterIndex: 0 },
+            { trackType: "audio", trackIndex: 0, movedSec: 0, afterIndex: 1 }
+        ]
+    }];
+    assert.deepStrictEqual(dsp.planTearRepair(torn, "complete"), []);
+    torn[0].ambiguous = false;
+    assert.strictEqual(dsp.planTearRepair(torn, "complete").length, 1);
 });

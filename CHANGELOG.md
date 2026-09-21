@@ -9,6 +9,198 @@ The earlier internal history is a **separate 1.x line** that ran to its own
 1.4.0 before that reset — unrelated to the 1.4.0 below — and is preserved in
 [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
+## [1.6.0] - 2026-09-21
+
+### Fixed
+- **A clip’s audio could come off its video and the integrity check would
+  call it clean.** `diffInstanceMovement` compares how far a file’s instances
+  MOVED, not where they ended up. Two instances that move by the same amount
+  pass it — even when the audio is sitting two seconds off the picture the
+  whole way. Every existing guard was built on that one measurement, so a
+  whole class of tear was structurally invisible: reported in the field as
+  ~50% of a track’s clips unlinked, with a log showing no warnings at all.
+
+  There is now an absolute check alongside it. `dsp.auditLinkAlignment` reads
+  where each file’s video and audio actually sit and compares them to EACH
+  OTHER — which is what makes it safe to act on, since both instances are on
+  the same sequence’s frame grid and snapping cancels out, with no frame rate
+  to guess at. After every apply, any clip whose audio came off its picture
+  during that apply has the audio slid back underneath it, and the log says
+  which clips and by how much. A clip that arrived out of step is reported but
+  left alone — that offset may be deliberate.
+- **An unreadable item could be left behind by the partner it travels with.**
+  Items with no resolvable media path are carried along with the clip they are
+  linked to, but each was keyed as its own all-or-nothing group, so the host
+  could refuse it alone and split the pair. They now share their partner’s
+  group and move with it or not at all.
+- **The tear repair no longer acts on a pairing it cannot trust.** A file cut
+  into several pieces on one track is paired before/after in time order, which
+  only holds while the pieces move together — exactly what is in doubt when a
+  tear is being repaired. Those files are now reported rather than moved, so a
+  repair cannot relocate a clip while trying to mend one.
+- **A track could be abandoned because the one clip standing in for it had
+  nothing to offer.** The coarse pass picked a single clip per track — the
+  longest on the timeline — and gave the whole track up the moment it failed,
+  however many usable clips sat beside it. Found in the field: a 44-clip track
+  was represented by a 27-second clip with no usable audio, reported "best
+  score n/a", and was left 20 minutes out of sync. Three things were wrong:
+  - **The search now tries other clips from the same track.** Up to four, in
+    descending timeline length, whenever the track has no confident answer. An
+    offset that was confident and then failed confirmation is still handled by
+    the relay pass — that is a wrong answer, not a missing one.
+  - **A clip with a flat waveform is skipped before it is searched.** Pearson
+    correlation divides by the signal energy about the mean, so a silent clip
+    makes `slideMatch` return null at every lag — "no match at all" rather
+    than a low score, which is why it looked like a mystery rather than a
+    quiet clip. `dsp.envelopeActivity` catches it from an envelope the setup
+    already computes.
+  - **The probe-window picker no longer gives up on short clips.** Callers ask
+    for a probe as long as `min(clipLength, 120s)`, so on any clip under the
+    cap the request equalled the whole envelope and one sample of rounding
+    returned "no window at all" — silently disabling the relay retry and the
+    multi-point confirmation for every clip shorter than two minutes. A clip
+    shorter than the request now simply means the window is the clip.
+- **"The coarse offset for this track is probably wrong" fired on healthy
+  tracks.** The check counted every unmatched clip as a failure, including
+  clips sitting outside the reference recording’s span entirely — which have
+  no reference to fail against and say nothing about the track. With a
+  reference that covers only part of the shoot that is most of the track: one
+  field log warned about a track where 109 clips agreed on the same correction
+  to within 10 ms. Only clips that had a reference and still failed now count,
+  and the out-of-range ones are reported separately as a gap in the reference.
+  They are still given the track’s consensus shift, as before.
+- **The "How to use Syncitol" panel squeezed its text instead of scrolling.**
+  Its body was a flex column whose sections shrank to fit the panel height, so
+  on a short panel the whole guide compressed into an unreadable block. The
+  sections now keep their natural height and the body scrolls.
+- **The Audio reference dropdown listed video tracks.** Forcing a track selects
+  the *files* on it, and a camera clip's picture and sound are the same file, so
+  "V1" and "A1" picked exactly the same recordings — confusing under a control
+  labelled Audio reference. The list is audio tracks only now. A sequence with
+  no populated audio track leaves the menu empty, which is right — there is no
+  audio to align anything to. Auto is unaffected and still considers every clip
+  whatever track it is on.
+- **The coarse pass could put a whole track in the wrong place, confidently.**
+  It matched ONE clip per track against the reference and then shifted every
+  clip on that track by what it found. If that one clip matched the wrong part
+  of the reference — a music bed, a repeated announcement, a stretch of room
+  tone — the entire track went minutes out, and the only check on it was a
+  second window of the *same* clip, which cannot catch that error. Three
+  safeguards now stand between a match and a track-wide move:
+  - **Long clips are probed across their whole length.** A clip over 90 s picks
+    its probe windows one per quarter of the recording instead of taking the two
+    liveliest stretches wherever they fall — on a long clip both of those
+    routinely landed in the same few minutes, which made the confirmation pass
+    nearly worthless. The offset must now hold at more than one of them.
+  - **The offset is re-tested against the track’s other clips.** This is the
+    question the coarse pass is actually answering, and only a different
+    recording can answer it. Clips that cannot be compared count as no evidence,
+    never as dissent. If the dissenting clips agree with each other on a
+    different offset, that is the better-supported answer and it is adopted; if
+    they merely contradict it, the track is left to the fine pass.
+  - **The fine pass is read back as an audit of the coarse one.** When most of a
+    track fails to match, the log says so — that is what a wrong coarse offset
+    looks like from the other side. When several clips on a track needed the
+    same correction, that correction is also applied to the clips on that track
+    the fine pass could not match; they are one device with one clock error, and
+    their track-mates are better evidence than leaving them where they are.
+- **A long fine-pass match is now checked at both ends of the overlap.** A
+  single window scoring well only proves the two files share *that* stretch of
+  audio. Any overlap over 120 s is matched near both ends and the two lags must
+  agree before the shift is applied, with a tolerance that grows with the span
+  so genuine clock drift still passes. This replaces the old drift check, which
+  did the same two measurements but only from 10 minutes of overlap and only
+  ever rejected the most extreme disagreements.
+- **Clips could still come unlinked during a sync.** 1.5.0 made the tear
+  *visible*; this release makes it not happen, and repairs it when it does.
+  Three holes are closed:
+  - **A refused move is rolled back.** `applyStarts` built a file's moves
+    all-or-nothing, but still *queued* them one at a time: if the host refused
+    the third of four, the first two were already in the compound and the file
+    came out half-shifted. A move is a delta, so the inverse of each accepted
+    move is now queued behind it — the file is left where it started, whole and
+    unsynced, and said so in the log.
+  - **A tear is now repaired, not just reported.** After every apply the
+    timeline is read back as before; if a file's instances landed unevenly,
+    Syncitol first nudges the stragglers onto the requested position, and if
+    that will not take, moves every instance of the file back where it started.
+    Unsynced with its A/V intact beats synced-and-torn. Only spreads above
+    10 ms are acted on — anything smaller is the host snapping a video item to
+    the frame grid, which is sub-frame and harmless.
+  - **Links the per-file rule cannot see are honoured.** One delta per source
+    file keeps a camera clip's own picture and sound together because they
+    share a path. It does nothing for audio linked from a *different* file
+    (merged clips, Synchronize, a manual Clip > Link) or for items whose media
+    path will not resolve — those were moved apart from their partners every
+    time. UXP exposes no link API, so link groups are now inferred from items
+    that occupy exactly the same span across both media types, and moved as one
+    on the picture's shift. Unreadable items are carried along with the clip
+    they are linked to instead of being left behind; a group that no single
+    shift can satisfy is left alone and named in the log.
+- **There was no way to get the log out of the panel.** The Copy button always
+  failed — it reached for `require("uxp").clipboard`, which does not exist, and
+  the plugin never held the `clipboard` manifest permission that gates the real
+  API — and the log could not be selected with the mouse either, because UXP
+  only implements text selection inside form controls, so `user-select: text`
+  on the log was never going to do anything. Both are gone, replaced by one
+  button that writes a file.
+
+### Changed
+- **The build lays tracks out by the clock when the clocks agree.** Every
+  track used to anchor to its own earliest recording, so every track started
+  at 0:00 and the audio coarse pass had to rediscover the minute-scale offsets
+  between devices from nothing. That is the right call when a device’s clock
+  is wrong — a camera reset to 2000-01-01 would otherwise be placed years from
+  everything else — but it threw away good information the rest of the time.
+  Tracks whose recordings overlap in clock time now corroborate each other and
+  share one anchor, landing at their true offsets from one another, so the
+  audio pass starts close in and only has to fine-tune. Grouping is
+  transitive, so a recorder that ran across two sessions vouches for both
+  cameras even though they never overlapped each other.
+
+  The fallback is per-track rather than all-or-nothing: a track nothing
+  corroborates keeps its own anchor and starts at 0:00 exactly as before, so
+  one camera with a dead clock battery no longer costs the other four their
+  layout. Clips timed from the `mtime` fallback never join a group — that
+  start is "file date minus duration", which is wrong by however much the OS
+  touched the file on copy. A group that would not fit a timeline’s 24-hour
+  maximum is refused too. The log says which tracks went which way, and the
+  Detected Clips table’s Offset column shows the layout that will be built.
+
+  **Consistent timestamps are checked for being real ones.** A bulk download
+  from Google Drive or Dropbox rewrites every file’s date to when it arrived;
+  a batch transcode or proxy render writes a fresh `creation_time` into every
+  output; a camera with an unset clock stamps them all identically. All three
+  look perfectly self-consistent and would otherwise have been laid out on.
+  So the plan tests the one thing none of them can fake: **one device cannot
+  record two files at the same time**. If a track’s own clips claim
+  overlapping recording times, those are batch-processing timestamps — the
+  track is excluded from the clock layout, flagged in the log, and its Build
+  position is no longer treated as evidence by the coarse pass. The test is
+  deliberately per-device rather than "these timestamps cluster too tightly":
+  genuine multicam footage really does have every camera starting within
+  seconds of the others, and a cluster test would have discarded it. There is
+  also a separate warning when the `mtime`-derived file dates bunch into a
+  window far too short for the footage they cover, which is what a bulk copy
+  looks like from the filesystem side.
+
+### Added
+- **Update check.** Syncitol asks GitHub once a day whether a newer release
+  exists and shows a banner when one does; dismissing it suppresses that
+  version, not the next. Clicking the version number in the footer checks
+  immediately and says so either way, falling back to just opening the
+  releases page if the request cannot get through. Every failure mode — no
+  network, a rate-limited API, an unparseable tag — is silent on the automatic
+  check, and a version it cannot parse is never reported as an update. This
+  adds one manifest permission: network access to `https://api.github.com`.
+- **⬇ Export .txt** writes the whole log to a file through a save dialog (or
+  the plugin's data folder on a build with no picker, with the path logged).
+  Send that with a bug report and the whole sync can be replayed from it.
+
+### Removed
+- The Copy button, and with it the `clipboard` permission the plugin no longer
+  needs.
+
 ## [1.5.0] - 2026-09-19
 
 ### Fixed

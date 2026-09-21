@@ -43,6 +43,11 @@ const COARSE_VERIFY_TOL_SEC = 10;      // second probe must agree with the first
 const COARSE_VERIFY_MIN_SCORE = 0.25;  // the confirmation only has to corroborate, not be pristine
 const COARSE_MAX_RELAY_CANDIDATES = 24; // reference channels scanned per probe window in the relay pass (pek-only, ~0.2s each)
 const COARSE_RELAY_PROBE_SEGMENTS = 4;  // relay probe windows spread across the target (best per quarter)
+const COARSE_PROBE_SEGMENTS = 4;        // probe windows spread across a long target (best per quarter)
+const COARSE_VERIFY_POINTS = 2;         // confirmation windows required on a long clip
+const COARSE_CORROBORATE_MAX_CLIPS = 2; // sibling clips the track offset is re-tested against
+const COARSE_CORROBORATE_MARGIN_SEC = 300; // ± reference searched around a sibling's predicted spot
+const COARSE_MAX_TARGET_CLIPS = 4;      // clips from a track tried as its coarse probe before giving up
 
 const COARSE_CFG = {
     minOverlapSec: COARSE_MIN_OVERLAP_SEC,
@@ -81,7 +86,7 @@ const progressWrap = $("progress-wrap");
 const progressBar = $("progress-bar");
 const btnCancel = $("btn-cancel");
 const btnRevert = $("btn-revert");
-const btnCopyLog = $("btn-copy-log");
+const btnExportLog = $("btn-export-log");
 const resultsSection = $("results-section");
 const resultsBody = $("results-body");
 const toolStatusEl = $("tool-status");
@@ -103,11 +108,12 @@ const formatSignedSeconds = dsp.formatSignedSeconds;
 btnInstructions.addEventListener("click", () => instructionsPanel.classList.add("visible"));
 btnInstClose.addEventListener("click", () => instructionsPanel.classList.remove("visible"));
 
+const footerVersion = $("footer-version");
 const footerTips = $("footer-tips");
 if (footerTips) {
     footerTips.addEventListener("click", (e) => {
         e.preventDefault();
-        require("uxp").shell.openExternal(footerTips.href);
+        openExternal(footerTips.href);
     });
 }
 
@@ -135,14 +141,15 @@ if (tipsCardClose) tipsCardClose.addEventListener("click", dismissTipsCard);
 if (tipsCardLink) {
     tipsCardLink.addEventListener("click", (e) => {
         e.preventDefault();
-        require("uxp").shell.openExternal(tipsCardLink.href);
+        openExternal(tipsCardLink.href);
     });
 }
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
-// Every line is kept as plain text as well, so "⧉ Copy" hands over exactly what
-// is on screen: UXP's text selection inside a scrolling div is unreliable, and a
-// pasteable log is what makes a sync problem reportable.
+// Every line is kept as plain text as well, so "⬇ Export .txt" writes out
+// exactly what is on screen. UXP cannot select text inside a scrolling div, so
+// the file is the only way to get a log off the panel — and a log that can
+// leave the panel is what makes a sync problem reportable.
 const logLines = [];
 
 function log(msg, type = "info") {
@@ -159,32 +166,46 @@ function clearLog() {
     logContainer.innerHTML = "";
 }
 
-async function copyLog() {
-    const text = logLines.join("\n");
+function logAsText() { return logLines.join("\n"); }
+
+// Flash a result on the button that was pressed, then put its label back.
+function flashButton(btn, label, restore) {
+    if (!btn) return;
+    btn.textContent = label;
+    setTimeout(() => { btn.textContent = restore; }, 1600);
+}
+
+// ── Export ──────────────────────────────────────────────────────────────────
+// The log is the whole record of a run, and the only way to get it out of the
+// panel is a file: UXP's clipboard is gated behind a manifest permission and
+// missing from some builds, and the log itself cannot be selected with the
+// mouse because UXP only implements text selection inside form controls. The
+// save dialog is the good path; if this build has no picker, fall back to the
+// plugin's own data folder and log the full path so the file can still be
+// found.
+async function exportLog() {
+    const text = logAsText();
     if (!text) return;
-    let ok = false;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const fileName = `syncitol-log-${stamp}.txt`;
     try {
-        // UXP's own clipboard is the documented one; newer builds also carry the
-        // web API, so fall through to that rather than failing silently.
-        const uxp = require("uxp");
-        if (uxp && uxp.clipboard && typeof uxp.clipboard.setContent === "function") {
-            await uxp.clipboard.setContent({ "text/plain": text });
-            ok = true;
+        const fsProvider = require("uxp").storage.localFileSystem;
+        let file = null;
+        if (typeof fsProvider.getFileForSaving === "function") {
+            // Resolves to null when the user cancels the dialog — not an error.
+            file = await fsProvider.getFileForSaving(fileName, { types: ["txt"] });
+            if (!file) { flashButton(btnExportLog, "Cancelled", "⬇ Export .txt"); return; }
+        } else {
+            const folder = await fsProvider.getDataFolder();
+            file = await folder.createFile(fileName, { overwrite: true });
         }
-    } catch (e) { ok = false; }
-    if (!ok) {
-        try {
-            if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
-                await navigator.clipboard.writeText(text);
-                ok = true;
-            }
-        } catch (e) { ok = false; }
+        await file.write(text);
+        flashButton(btnExportLog, "✓ Saved", "⬇ Export .txt");
+        log(`Log written to ${file.nativePath || fileName}`, "success");
+    } catch (e) {
+        flashButton(btnExportLog, "✗ Failed", "⬇ Export .txt");
+        log(`Could not write the log file: ${(e && (e.message || String(e))) || "unknown error"}`, "error");
     }
-    // Feedback on the button itself — a log line about copying the log would be
-    // both noise and instantly stale.
-    btnCopyLog.textContent = ok ? "✓ Copied" : "✗ Failed";
-    setTimeout(() => { btnCopyLog.textContent = "⧉ Copy"; }, 1400);
-    if (!ok) log("Could not reach the clipboard — select the log text and copy manually.", "warn");
 }
 
 // Host-layer diagnostics go to the developer console; flip this on to mirror
@@ -194,6 +215,124 @@ premiere.scanSequence.onDiag = (m) => { if (HOST_DEBUG) log("scan: " + m); };
 premiere.buildSyncSequence.onStep = (m) => { if (HOST_DEBUG) log("build: " + m); };
 premiere.applyStarts.onStep = (m) => { if (HOST_DEBUG) log("apply: " + m); };
 pek.onDiag = (m) => log(m);
+
+// ─── Update check ───────────────────────────────────────────────────────────
+// Asks GitHub once a day whether there is a newer release than the one running,
+// and shows a banner if so. Everything about it fails quietly: no network, a
+// rate-limited API, a malformed tag — the panel simply says nothing and tries
+// again tomorrow, because an update check is never worth interrupting a sync
+// over. Clicking the version in the footer forces a check and reports either way.
+const UPDATE_REPO = "thinkvp/Syncitol";
+const UPDATE_API_URL = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`;
+const UPDATE_PAGE_URL = `https://github.com/${UPDATE_REPO}/releases/latest`;
+const UPDATE_LAST_CHECK_KEY = "syncitol-update-last-check";
+const UPDATE_DISMISSED_KEY = "syncitol-update-dismissed";
+const UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_TIMEOUT_MS = 10000;
+
+const updateCard = $("update-card");
+const updateCardVersion = $("update-card-version");
+const updateCardNote = $("update-card-note");
+const updateCardLink = $("update-card-link");
+const updateCardClose = $("update-card-close");
+
+let updateReleaseUrl = UPDATE_PAGE_URL;
+let updateLatestVersion = null;
+
+function openExternal(url) {
+    try { require("uxp").shell.openExternal(url); }
+    catch (e) { log(`Could not open ${url}: ${(e && e.message) || "unknown error"}`, "warn"); }
+}
+
+function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+function lsSet(key, value) { try { localStorage.setItem(key, value); } catch (e) {} }
+
+// The running version, read from the plugin's own manifest so it can never drift
+// from what was actually installed. The footer is the fallback — set-version.js
+// keeps it in step with the manifest, so it is right even when the plugin folder
+// is unreadable.
+async function getPluginVersion() {
+    try {
+        const fsProvider = require("uxp").storage.localFileSystem;
+        if (typeof fsProvider.getPluginFolder === "function") {
+            const folder = await fsProvider.getPluginFolder();
+            const entry = await folder.getEntry("manifest.json");
+            const parsed = JSON.parse(await entry.read());
+            if (parsed && parsed.version) return String(parsed.version);
+        }
+    } catch (e) { /* fall through to the footer */ }
+    const m = /v(\d+\.\d+\.\d+)/.exec((footerVersion && footerVersion.textContent) || "");
+    return m ? m[1] : null;
+}
+
+function showUpdateCard(latest, current) {
+    if (!updateCard) return;
+    if (updateCardVersion) updateCardVersion.textContent = `Syncitol ${latest} is available`;
+    if (updateCardNote) updateCardNote.textContent = current ? ` — you are on ${current}.` : ".";
+    updateCard.style.display = "flex";
+}
+
+// `manual` = the user asked, so say something either way and ignore both the
+// once-a-day throttle and a previous dismissal.
+async function checkForUpdates(manual) {
+    const last = Number(lsGet(UPDATE_LAST_CHECK_KEY) || 0);
+    if (!manual && last && (Date.now() - last) < UPDATE_INTERVAL_MS) return;
+    // Stamp before the request, not after: a network that is down should not
+    // mean a retry on every single panel open.
+    lsSet(UPDATE_LAST_CHECK_KEY, String(Date.now()));
+
+    const current = await getPluginVersion();
+    let latest = null;
+    try {
+        const response = await Promise.race([
+            fetch(UPDATE_API_URL, { headers: { Accept: "application/vnd.github+json" } }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), UPDATE_TIMEOUT_MS))
+        ]);
+        if (!response.ok) throw new Error(`GitHub replied ${response.status}`);
+        const data = await response.json();
+        latest = data && data.tag_name;
+        if (data && data.html_url) updateReleaseUrl = data.html_url;
+    } catch (e) {
+        if (manual) {
+            log(`Could not check for updates: ${(e && e.message) || "unknown error"}. ` +
+                `Opening the releases page instead.`, "warn");
+            openExternal(UPDATE_PAGE_URL);
+        }
+        return;
+    }
+
+    const diff = dsp.compareVersions(latest, current);
+    if (diff === null) {
+        if (manual) log(`Could not read the latest release number from GitHub.`, "warn");
+        return;
+    }
+    if (diff <= 0) {
+        if (manual) log(`Syncitol ${current} is up to date.`, "success");
+        return;
+    }
+
+    updateLatestVersion = String(latest).replace(/^v/, "");
+    if (!manual && lsGet(UPDATE_DISMISSED_KEY) === updateLatestVersion) return;
+    showUpdateCard(`v${updateLatestVersion}`, current ? `v${current}` : null);
+    log(`Syncitol v${updateLatestVersion} is available (you are on v${current}).`, "info");
+}
+
+if (updateCardLink) updateCardLink.addEventListener("click", () => openExternal(updateReleaseUrl));
+if (updateCardClose) {
+    updateCardClose.addEventListener("click", () => {
+        if (updateLatestVersion) lsSet(UPDATE_DISMISSED_KEY, updateLatestVersion);
+        updateCard.style.display = "none";
+    });
+}
+if (footerVersion) {
+    footerVersion.addEventListener("click", (e) => {
+        e.preventDefault();
+        log("Checking GitHub for a newer release\u2026");
+        checkForUpdates(true);
+    });
+}
+// Opportunistic, throttled to once a day, and never allowed to fail loudly.
+checkForUpdates(false).catch(() => {});
 
 // ─── Progress / busy ──────────────────────────────────────────────────────────
 function setProgress(pct, visible = true) {
@@ -357,7 +496,7 @@ function renderRefMenu() {
     if (!refTrackOptions.length) {
         const note = document.createElement("div");
         note.className = "picker-empty";
-        note.textContent = "No tracks with clips — open a sequence.";
+        note.textContent = "No audio tracks with clips — nothing to align to.";
         refMenu.appendChild(note);
     }
 }
@@ -399,6 +538,15 @@ async function refreshTrackOptions() {
         tracks = [];
     }
     if (gen !== refOptionsGen) return; // a later refresh already landed
+
+    // Audio tracks only, always. Forcing a track picks the FILES on it, and a
+    // camera clip's picture and sound are the same file — so "V1" and "A1"
+    // almost always select exactly the same recordings, which makes offering
+    // both confusing under a control labelled "Audio reference". A sequence with
+    // no populated audio track leaves the menu empty, which is correct: there is
+    // no audio to align anything to, so there is nothing to choose between.
+    // Auto remains available and is unfiltered.
+    tracks = tracks.filter(t => t.trackType === "audio");
 
     refTrackOptions = tracks.map(t => {
         const short = shortTrackLabel(t);
@@ -458,9 +606,7 @@ audio.ensureAddon().then(
 );
 
 // ─── Timing sources ───────────────────────────────────────────────────────────
-function isEmbeddedSource(timingSource) {
-    return timingSource === "creation_time" || timingSource === "modification_date";
-}
+const isEmbeddedSource = dsp.isEmbeddedTimingSource;
 
 // Resolve a file's record-start once: embedded metadata via the bundled probe,
 // else file mtime minus duration (record END → START).
@@ -498,16 +644,6 @@ function trackKeyOf(anchor) {
     return `${anchor.trackType}_${anchor.trackIndex}`;
 }
 
-function longestAnchor(list) {
-    let best = null;
-    let bestDur = -1;
-    for (const a of list) {
-        const dur = a.resolvedEndSec - a.resolvedStartSec;
-        if (dur > bestDur) { bestDur = dur; best = a; }
-    }
-    return best;
-}
-
 function byDurationDesc(a, b) {
     return (b.resolvedEndSec - b.resolvedStartSec) - (a.resolvedEndSec - a.resolvedStartSec);
 }
@@ -522,6 +658,18 @@ function byDurationDesc(a, b) {
 function untrustedTimingPaths() {
     const out = new Set();
     if (!clipPayload || !clipPayload.length) return out;
+
+    // A track whose clips claim overlapping recording times was stamped by a
+    // batch process, not a camera, so wherever Build put those clips is
+    // arbitrary — a weak coarse match at that position is coincidence.
+    const timing = dsp.assessTimingPlausibility(clipPayload);
+    if (timing.implausible.length) {
+        const bad = new Set(timing.implausible);
+        for (const f of clipPayload) {
+            if (bad.has(`${f.trackType}_${f.trackIndex}`)) out.add(f.filePath);
+        }
+    }
+
     let earliestMs = Infinity;
     let latestEndMs = -Infinity;
     for (const f of clipPayload) {
@@ -529,7 +677,7 @@ function untrustedTimingPaths() {
         const endMs = f.recordStartMs + (f.durationSec || 0) * 1000;
         if (endMs > latestEndMs) latestEndMs = endMs;
     }
-    if ((latestEndMs - earliestMs) / 1000 <= dsp.MAX_SPAN_SEC) return out; // clocks agree
+    if ((latestEndMs - earliestMs) / 1000 <= dsp.MAX_SPAN_SEC) return out; // clocks agree on the date
     for (const f of clipPayload) {
         if (!isEmbeddedSource(f.timingSource)) out.add(f.filePath);
     }
@@ -574,20 +722,27 @@ async function analyzeCoarseAlign(anchors, onProgress) {
     for (const group of trackGroups.values()) {
         const trackLabel = `${group[0].trackType} track ${group[0].trackIndex + 1}`;
         const targetLayer = group[0].layerOrder;
-        const target = longestAnchor(group);
         const pool = anchors.filter(a => a.layerOrder < targetLayer).sort(byDurationDesc);
 
-        if (!pool.length || !target) {
+        if (!pool.length || !group.length) {
             log(`Coarse align: ${trackLabel} — no reference recording, leaving to fine pass.`);
             results.push({ scope: "track", label: trackLabel, status: "skipped", detail: "no reference recording — left to fine pass" });
             continue;
         }
 
-        const tgtAvail = target.resolvedEndSec - target.resolvedStartSec;
-        const probeShort = Math.min(tgtAvail, COARSE_TARGET_MAX_SEC);
+        // The track's own clips, longest first, as an ORDERED LIST rather than a
+        // single pick. One clip used to decide a whole track's fate: if it
+        // happened to be silent, or to hold nothing the reference also recorded,
+        // the track was abandoned while dozens of usable clips sat beside it.
+        // Timeline length is still the first guess — more audio is more to match
+        // on — but it is now only the first.
+        const targets = group
+            .filter(a => Math.min(a.resolvedEndSec - a.resolvedStartSec, COARSE_TARGET_MAX_SEC) >= COARSE_MIN_OVERLAP_SEC)
+            .sort(byDurationDesc)
+            .slice(0, COARSE_MAX_TARGET_CLIPS);
         const usable = pool.filter(r =>
             Math.min(r.resolvedEndSec - r.resolvedStartSec, COARSE_REF_MAX_SEC) >= COARSE_MIN_OVERLAP_SEC);
-        if (probeShort < COARSE_MIN_OVERLAP_SEC || !usable.length) {
+        if (!targets.length || !usable.length) {
             log(`Coarse align: ${trackLabel} — clips too short to match, leaving to fine pass.`);
             results.push({ scope: "track", label: trackLabel, status: "skipped", detail: "clips too short to match — left to fine pass" });
             continue;
@@ -599,24 +754,12 @@ async function analyzeCoarseAlign(anchors, onProgress) {
             log(`Coarse align: ${trackLabel} — searching the ${candidates.length} longest of ${usable.length} reference clips; ${dropped} shorter one${dropped !== 1 ? "s" : ""} not searched.`, "info");
         }
 
-        // No trustworthy Build position → a weak "timestamp" prediction is not
-        // evidence. Raising minScore to strongScore makes the prediction branch of
-        // coarseResolve demand the same confidence as a blind match.
-        const distrusted = untrustedPaths.has(target.filePath);
-        if (distrusted) {
-            log(`Coarse align: ${trackLabel} — ${target.clipName} has an unreliable clock; its Build position won't be trusted on a weak score.`, "info");
-        }
-
         jobs.push({
-            group, trackLabel, target, tgtAvail,
-            cfg: distrusted ? Object.assign({}, cfg, { minScore: cfg.strongScore }) : cfg,
-            cands: candidates.map(reference => ({
-                reference,
-                refDurationFull: Math.min(reference.resolvedEndSec - reference.resolvedStartSec, COARSE_REF_MAX_SEC),
-                geom: null, plans: null,
-                state: dsp.createCoarseState(),
-                triedLearned: new Set()  // learned offsets this candidate has checked
-            })),
+            group, trackLabel, targets, targetIndex: -1,
+            target: null, tgtAvail: 0,
+            refCandidates: candidates,
+            cfg,                      // replaced per target by useNextTarget
+            cands: [],
             lines: [],                // buffered log lines, flushed as one block
             done: false,              // matched strongly — stop searching
             failed: false,            // decode error — leave to the fine pass
@@ -630,6 +773,7 @@ async function analyzeCoarseAlign(anchors, onProgress) {
     async function targetScanEnvelope(job, scanSec) {
         try {
             const p = await pek.resolvePek(job.target.filePath);
+            job.hasPek = !!p;
             if (p) {
                 const env = await pek.getPekEnvelope(p, job.target.inPointSec, scanSec, COARSE_ENVELOPE_RATE);
                 if (env && env.length) return env;
@@ -640,26 +784,99 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         return audio.getEnvelope(job.target.filePath, job.target.inPointSec, scanSec, envOpts);
     }
 
+    // Point a job at its next candidate clip: fresh reference candidates (and so
+    // fresh match states), fresh geometry, fresh probe windows. Returns false
+    // when the track has no clip left worth trying. Clips whose audio is flat
+    // are skipped without searching — see dsp.envelopeActivity for why silence
+    // produces "no match at all" rather than a low score.
+    async function useNextTarget(job) {
+        while (job.targetIndex + 1 < job.targets.length) {
+            job.targetIndex += 1;
+            const next = job.targets[job.targetIndex];
+            job.target = next;
+            job.tgtAvail = next.resolvedEndSec - next.resolvedStartSec;
+
+            // No trustworthy Build position → a weak "timestamp" prediction is
+            // not evidence. Raising minScore to strongScore makes the prediction
+            // branch of coarseResolve demand the same confidence as a blind match.
+            const distrusted = untrustedPaths.has(next.filePath);
+            job.cfg = distrusted ? Object.assign({}, cfg, { minScore: cfg.strongScore }) : cfg;
+            if (distrusted) {
+                job.lines.push([`Coarse align: ${job.trackLabel} — ${next.clipName} has an unreliable clock; its Build position won't be trusted on a weak score.`, "info"]);
+            }
+
+            job.cands = job.refCandidates.map(reference => ({
+                reference,
+                refDurationFull: Math.min(reference.resolvedEndSec - reference.resolvedStartSec, COARSE_REF_MAX_SEC),
+                geom: null, plans: null,
+                state: dsp.createCoarseState(),
+                triedLearned: new Set()  // learned offsets this candidate has checked
+            }));
+            job.done = false;
+            job.verified = false; job.verifyOk = null; job.verifyRejected = null;
+            job.verifyNote = null; job.verifyPoints = null;
+            job.corroborated = false; job.corroboration = null;
+
+            const prepared = await prepareTarget(job);
+            if (prepared.silent) {
+                job.lines.push([`Coarse align: ${job.trackLabel} — ${next.clipName} carries no audio to match on (a flat waveform correlates with nothing); trying another clip from the track.`, "info"]);
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
     // Metadata-only geometry + plan list per candidate (cheap, cached probe reads),
     // plus the content-picked probe position for this track.
-    await Promise.all(jobs.map(async (job) => {
+    async function prepareTarget(job) {
         // Probe the most distinctive audio in the clip rather than its head — a
         // silent lead-in has no structure to match and yields confident nonsense.
+        //
+        // Past COARSE_MULTI_PROBE_MIN_SEC the windows are spread across the
+        // WHOLE recording, one per quarter, instead of taking the two liveliest
+        // stretches wherever they fall. On a long clip both of those routinely
+        // land in the same few minutes, which makes the confirmation pass nearly
+        // worthless: two windows from one passage corroborate each other even
+        // when the offset is minutes wrong. Windows from different quarters
+        // cannot. The search still starts from the liveliest window (they are
+        // sorted by activity) — it is the CONFIRMATION that gains independence.
         const probeShort = Math.min(job.tgtAvail, COARSE_TARGET_MAX_SEC);
+        job.longClip = job.tgtAvail >= dsp.COARSE_MULTI_PROBE_MIN_SEC;
         job.probeWindows = [];
+        try { job.hasPek = !!(await pek.resolvePek(job.target.filePath)); }
+        catch (e) { if (e && e.cancelled) throw e; job.hasPek = false; }
+        let silent = false;
         try {
-            const env = await targetScanEnvelope(job, Math.min(job.tgtAvail, COARSE_PROBE_SCAN_SEC));
+            // A peak file makes a full-length envelope nearly free; a decode does
+            // not, so the decode path keeps its existing scan cap.
+            const scanSec = Math.min(job.tgtAvail, job.hasPek ? job.tgtAvail : COARSE_PROBE_SCAN_SEC);
+            const env = await targetScanEnvelope(job, scanSec);
             if (env && env.length) {
-                job.probeWindows = dsp.pickProbeWindows(env, COARSE_ENVELOPE_RATE, probeShort, 2);
+                // A flat envelope has no energy about its mean, so every lag in
+                // slideMatch divides by zero and the whole search returns null
+                // — "no match at all" rather than a low score. Spotting it here
+                // costs one pass over an envelope we already have, and saves a
+                // full staged search proving that silence matches nothing.
+                silent = !dsp.envelopeActivity(env).usable;
+                job.probeWindows = job.longClip
+                    ? dsp.pickProbeWindowsSpread(env, COARSE_ENVELOPE_RATE, probeShort, COARSE_PROBE_SEGMENTS)
+                    : dsp.pickProbeWindows(env, COARSE_ENVELOPE_RATE, probeShort, 2);
             }
         } catch (e) {
             if (e && e.cancelled) throw e;
-            // Fall back to probing the head — no worse than the old behaviour.
+            // Could not read it — fall back to probing the head, and do not
+            // condemn the clip as silent on the strength of a failed read.
         }
+        if (silent) return { silent: true };
         const probeOffset = job.probeWindows.length ? job.probeWindows[0].offsetSec : 0;
         job.probeOffsetSec = probeOffset;
         if (probeOffset >= 1) {
             log(`Coarse align: ${job.trackLabel} — probing ${job.target.clipName} from +${formatDuration(probeOffset * 1000)} in (its most distinctive audio; the clip opens quietly).`, "info");
+        }
+        if (job.longClip && job.probeWindows.length > 1) {
+            log(`Coarse align: ${job.trackLabel} — ${job.target.clipName} runs ${formatDuration(job.tgtAvail * 1000)}, so its offset must hold at ` +
+                `${job.probeWindows.slice(0, COARSE_VERIFY_POINTS + 1).map(w => `+${formatDuration(w.offsetSec * 1000)}`).join(", ")} before it is trusted.`, "info");
         }
 
         // Geometry is expressed as if the clip STARTED at the probe point, so the
@@ -680,6 +897,18 @@ async function analyzeCoarseAlign(anchors, onProgress) {
             };
             cand.plans = dsp.planCoarseSearch(cand.geom, job.cfg);
         }
+        return { silent: false };
+    }
+
+    // Point every job at its first usable clip.
+    await Promise.all(jobs.map(async (job) => {
+        if (await useNextTarget(job)) return;
+        job.failed = true;
+        job.lines.push([`Coarse align: ${job.trackLabel} — none of its clips carry audio that could be matched; leaving to fine pass.`, "warn"]);
+        results.push({
+            scope: "track", label: job.trackLabel, status: "skipped",
+            detail: "no clip on the track has audio to match on"
+        });
     }));
 
     // Whole-track offsets confirmed STRONGLY on some track — near-free search
@@ -887,7 +1116,9 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         job.verifyOk = null;
         job.verifyRejected = null;
         job.verifyNote = null;
-        await verifyJob(job);
+        job.corroborated = false;
+        job.corroboration = null;
+        await confirmJob(job);
     }
 
     // Confirm a job's winning offset against a SECOND, independent stretch of the
@@ -903,42 +1134,188 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         if (!pick.result || Math.abs(pick.result.coarseDelta) < COARSE_MIN_APPLY_SEC) return;
 
         const cand = job.cands[pick.index];
-        // The confirmation must come from a window OTHER than the one the winning
+        // The confirmation must come from windows OTHER than the one the winning
         // candidate matched with. Candidates can be probed from different windows
         // (the relay retries several spread across the clip), so derive each
         // candidate's own probe origin from its geometry instead of assuming the
         // first window.
         const originOffset = cand.geom.targetInPointSec - job.target.inPointSec;
-        const second = (job.probeWindows || []).find(w => Math.abs(w.offsetSec - originOffset) > 1);
-        if (!second) { job.verifyNote = "no second window with usable content"; return; }
+        const others = (job.probeWindows || []).filter(w => Math.abs(w.offsetSec - originOffset) > 1);
+        if (!others.length) { job.verifyNote = "no second window with usable content"; return; }
 
+        // A long recording has room for a genuinely independent second opinion,
+        // and needs one: a single confirming window can easily come from the same
+        // repeated content that produced the wrong peak. A short clip gets the
+        // one check there is room for.
+        const want = job.longClip ? COARSE_VERIFY_POINTS : 1;
         const probeDur = Math.min(cand.geom.targetAvailSec, COARSE_TARGET_MAX_SEC);
-        // probeWindows offsets are measured from the clip's in-point; geom's probe
-        // origin already includes the winning window's offset.
-        const probe2Rel = second.offsetSec - originOffset;
-        const plan = dsp.planCoarseVerify(cand.geom, job.cfg, pick.result.coarseDelta, probe2Rel, probeDur);
-        if (!plan) { job.verifyNote = "the second window falls outside the reference"; return; }
+        const confirmed = [];
+        job.verifyPoints = [];
 
-        try {
-            const [refEnv, tgtEnv] = await Promise.all([
-                refEnvFor(cand, plan.winStart, plan.winDur),
-                tgtEnvFor(job, cand, job.target.inPointSec + second.offsetSec, probeDur)
-            ]);
-            const m = dsp.slideMatch(refEnv, tgtEnv, {
-                envelopeRate: COARSE_ENVELOPE_RATE,
-                minOverlapSec: Math.min(probeDur, COARSE_MATCH_OVERLAP_SEC)
-            });
-            if (!m) { job.verifyNote = "the second window produced no usable match"; return; }
-            const disagreeSec = Math.abs(m.lagSec - plan.expectedLagSec);
-            if (m.score >= COARSE_VERIFY_MIN_SCORE && disagreeSec <= COARSE_VERIFY_TOL_SEC) {
-                job.verifyOk = { score: m.score, disagreeSec };
-            } else {
-                job.verifyRejected = { score: m.score, disagreeSec };
+        for (const other of others) {
+            if (confirmed.length >= want) break;
+            // probeWindows offsets are measured from the clip's in-point; geom's
+            // probe origin already includes the winning window's offset.
+            const probe2Rel = other.offsetSec - originOffset;
+            const plan = dsp.planCoarseVerify(cand.geom, job.cfg, pick.result.coarseDelta, probe2Rel, probeDur);
+            if (!plan) continue;   // the reference doesn't reach that far — try the next
+            try {
+                const [refEnv, tgtEnv] = await Promise.all([
+                    refEnvFor(cand, plan.winStart, plan.winDur),
+                    tgtEnvFor(job, cand, job.target.inPointSec + other.offsetSec, probeDur)
+                ]);
+                const m = dsp.slideMatch(refEnv, tgtEnv, {
+                    envelopeRate: COARSE_ENVELOPE_RATE,
+                    minOverlapSec: Math.min(probeDur, COARSE_MATCH_OVERLAP_SEC)
+                });
+                if (!m) continue;
+                const disagreeSec = Math.abs(m.lagSec - plan.expectedLagSec);
+                const point = { offsetSec: other.offsetSec, score: m.score, disagreeSec };
+                job.verifyPoints.push(point);
+                if (m.score >= COARSE_VERIFY_MIN_SCORE && disagreeSec <= COARSE_VERIFY_TOL_SEC) {
+                    confirmed.push(point);
+                } else {
+                    // One clear contradiction is enough: a correct offset holds
+                    // everywhere in the recording, so a window that says otherwise
+                    // means the match was not on shared audio.
+                    job.verifyRejected = { score: m.score, disagreeSec };
+                    return;
+                }
+            } catch (e) {
+                if (e && e.cancelled) throw e;
+                job.verifyNote = e.message; // confirmation is best-effort
             }
-        } catch (e) {
-            if (e && e.cancelled) throw e;
-            job.verifyNote = e.message; // confirmation is best-effort
         }
+
+        if (confirmed.length) {
+            job.verifyOk = {
+                score: confirmed[0].score,
+                disagreeSec: confirmed[0].disagreeSec,
+                points: confirmed.length,
+                wanted: want
+            };
+            if (confirmed.length < want) {
+                job.verifyNote = `only ${confirmed.length} of ${want} confirmation points had usable audio`;
+            }
+        } else if (!job.verifyNote) {
+            job.verifyNote = "no confirmation window produced a usable match";
+        }
+    }
+
+    // Envelope for an arbitrary file on the side of the fence this candidate
+    // lives on. Peak-derived and decode-derived envelopes measure different
+    // things and must never be correlated against each other, so a peak-file
+    // candidate can only be compared with peak-file audio.
+    async function envForFile(cand, filePath, startSec, durSec) {
+        if (cand.pek) {
+            const p = await pek.resolvePek(filePath);
+            if (!p) return null;
+            return pek.getPekEnvelope(p, startSec, durSec, COARSE_ENVELOPE_RATE, null);
+        }
+        return audio.getEnvelope(filePath, startSec, durSec, envOpts);
+    }
+
+    // ── Cross-clip corroboration ─────────────────────────────────────────────
+    // verifyJob asks "does this offset hold elsewhere in the clip we matched?".
+    // This asks the bigger question: "does it hold for the OTHER clips on this
+    // track?" — which is what the coarse pass is actually claiming, since it
+    // shifts the whole track by one number derived from one clip. A single clip
+    // matching the wrong part of a reference is the failure that puts an entire
+    // track minutes out, and no amount of re-checking that same clip can catch
+    // it: only a different recording can.
+    //
+    // Each sibling is re-tested against the SAME reference the winner matched.
+    // A sibling that cannot be compared at all (no overlap, no usable audio) is
+    // recorded as no-evidence, never as dissent. If the dissenters agree with
+    // each other on a different offset, that is the stronger match and it is
+    // adopted; if they merely disagree, the offset is dropped.
+    async function corroborateJob(job) {
+        if (job.failed || job.corroborated) return;
+        job.corroborated = true;
+        if (job.verifyRejected) return;   // already failed the within-clip check
+
+        const pick = dsp.coarseResolveBest(job.cands, job.cfg);
+        if (!pick.result || Math.abs(pick.result.coarseDelta) < COARSE_MIN_APPLY_SEC) return;
+
+        const siblings = job.group
+            .filter(a => a.filePath !== job.target.filePath)
+            .sort(byDurationDesc)
+            .slice(0, COARSE_CORROBORATE_MAX_CLIPS);
+        if (!siblings.length) return;     // a one-clip track has nothing to ask
+
+        const cand = job.cands[pick.index];
+        const delta = pick.result.coarseDelta;
+        // A wider reference window than the within-clip check uses: adopting a
+        // rival offset is only possible inside the searched span, and the errors
+        // worth catching here are tens of seconds, not tenths.
+        const cfg = Object.assign({}, job.cfg, { verifyMarginSec: COARSE_CORROBORATE_MARGIN_SEC });
+        const points = [];
+
+        for (const sib of siblings) {
+            const sibAvail = sib.resolvedEndSec - sib.resolvedStartSec;
+            const probeDur = Math.min(sibAvail, COARSE_TARGET_MAX_SEC);
+            if (probeDur < COARSE_MIN_OVERLAP_SEC) {
+                points.push({ clipName: sib.clipName, agreed: null, reason: "too short to compare" });
+                continue;
+            }
+            const geom = {
+                refInPointSec: cand.geom.refInPointSec,
+                refDurationFull: cand.geom.refDurationFull,
+                refResolvedStartSec: cand.geom.refResolvedStartSec,
+                targetInPointSec: sib.inPointSec,
+                targetResolvedStartSec: sib.resolvedStartSec,
+                targetAvailSec: sibAvail,
+                tcDelta: null
+            };
+            const plan = dsp.planCoarseVerify(geom, cfg, delta, 0, probeDur);
+            if (!plan) {
+                points.push({ clipName: sib.clipName, agreed: null, reason: "sits outside the reference recording" });
+                continue;
+            }
+            try {
+                const [refEnv, tgtEnv] = await Promise.all([
+                    refEnvFor(cand, plan.winStart, plan.winDur),
+                    envForFile(cand, sib.filePath, sib.inPointSec, probeDur)
+                ]);
+                if (!refEnv || !refEnv.length || !tgtEnv || !tgtEnv.length) {
+                    points.push({ clipName: sib.clipName, agreed: null, reason: "no usable audio" });
+                    continue;
+                }
+                const m = dsp.slideMatch(refEnv, tgtEnv, {
+                    envelopeRate: COARSE_ENVELOPE_RATE,
+                    minOverlapSec: Math.min(probeDur, COARSE_MATCH_OVERLAP_SEC)
+                });
+                if (!m || m.score < COARSE_VERIFY_MIN_SCORE) {
+                    points.push({ clipName: sib.clipName, agreed: null, score: m ? m.score : null, reason: "no confident match" });
+                    continue;
+                }
+                // Where this sibling's own match says the track should sit.
+                const matchedRefSrc = plan.winStart + m.lagSec;
+                const desiredStart = geom.refResolvedStartSec + (matchedRefSrc - geom.refInPointSec);
+                const impliedDeltaSec = Math.round((desiredStart - geom.targetResolvedStartSec) * 1000) / 1000;
+                points.push({
+                    clipName: sib.clipName,
+                    agreed: Math.abs(m.lagSec - plan.expectedLagSec) <= COARSE_VERIFY_TOL_SEC,
+                    impliedDeltaSec, score: m.score
+                });
+            } catch (e) {
+                if (e && e.cancelled) throw e;
+                points.push({ clipName: sib.clipName, agreed: null, reason: e.message });
+            }
+        }
+
+        if (!points.length) return;
+        const verdict = dsp.judgeCorroboration(points, dsp.COARSE_CORROBORATE_TOL_SEC);
+        verdict.points = points;
+        verdict.proposedDeltaSec = delta;
+        job.corroboration = verdict;
+    }
+
+    // verifyJob then corroborateJob: confirm the offset within the clip that
+    // produced it, then against the rest of the track it is about to move.
+    async function confirmJob(job) {
+        await verifyJob(job);
+        await corroborateJob(job);
     }
 
     // Resolve a finished job: apply the chosen shift, flush its buffered log
@@ -950,7 +1327,23 @@ async function analyzeCoarseAlign(anchors, onProgress) {
             // right session wins on audio content, not on being the longest clip.
             const pick = dsp.coarseResolveBest(job.cands, job.cfg);
 
-            if (pick.result && job.verifyRejected) {
+            const corr = job.corroboration;
+            const corrRejected = corr && corr.verdict === "rejected";
+            const corrAdopt = corr && corr.verdict === "adopt";
+
+            if (pick.result && corrRejected) {
+                // The offset held up inside the clip that produced it, but the
+                // track's other recordings say it is wrong — and they do not
+                // agree on a replacement either. Moving the track on this would
+                // be confidently wrong, so it stays put.
+                const names = corr.disagreed.map(d => `${d.clipName} wants ${formatSignedSeconds(d.impliedDeltaSec)}`).join("; ");
+                job.lines.push([`Coarse align: ${job.trackLabel} — ${job.target.clipName} matched at ${formatSignedSeconds(pick.result.coarseDelta)} (score ${pick.result.chosen.score.toFixed(2)}), but ${corr.disagreed.length} other clip${corr.disagreed.length !== 1 ? "s" : ""} on the track disagree${corr.disagreed.length === 1 ? "s" : ""} (${names}) with no consensus between them — rejecting it and leaving the track to the fine pass.`, "warn"]);
+                results.push({
+                    scope: "track", label: job.trackLabel, status: "unmatched",
+                    score: pick.result.chosen.score,
+                    detail: `offset contradicted by ${corr.disagreed.length} other clip(s) on the track`
+                });
+            } else if (pick.result && job.verifyRejected) {
                 // The offset looked confident but didn't hold up elsewhere in the
                 // recording — almost always a match on room tone. Leave the track
                 // where it is rather than move it somewhere confidently wrong.
@@ -968,7 +1361,7 @@ async function analyzeCoarseAlign(anchors, onProgress) {
                     score: pick.best ? pick.best.score : null,
                     detail: `no confident match for ${job.target.clipName}`
                 });
-            } else if (Math.abs(pick.result.coarseDelta) < COARSE_MIN_APPLY_SEC) {
+            } else if (Math.abs(corrAdopt ? corr.adoptedDeltaSec : pick.result.coarseDelta) < COARSE_MIN_APPLY_SEC) {
                 job.matched = true;
                 job.lines.push([`Coarse align: ${job.trackLabel} already aligned (match score ${pick.result.chosen.score.toFixed(2)}).`]);
                 results.push({
@@ -977,7 +1370,10 @@ async function analyzeCoarseAlign(anchors, onProgress) {
                 });
             } else {
                 job.matched = true;
-                const delta = pick.result.coarseDelta;
+                // The clip that produced the offset is one witness; the rest of
+                // the track are the others. When they agree with each other on a
+                // different answer, theirs is the better-supported one.
+                const delta = corrAdopt ? corr.adoptedDeltaSec : pick.result.coarseDelta;
                 const winner = job.cands[pick.index];
                 const refName = winner.channel === null || winner.channel === undefined
                     ? winner.reference.clipName
@@ -987,16 +1383,33 @@ async function analyzeCoarseAlign(anchors, onProgress) {
                     anchor.resolvedEndSec += delta;
                     deltaByKey.set(anchor.key, (deltaByKey.get(anchor.key) || 0) + delta);
                 }
+                const points = job.verifyOk && job.verifyOk.points > 1 ? `${job.verifyOk.points} further points` : "a second point";
                 const confirm = job.verifyOk
-                    ? `, confirmed at a second point (score ${job.verifyOk.score.toFixed(2)})`
+                    ? `, confirmed at ${points} in the clip (score ${job.verifyOk.score.toFixed(2)})`
                     : (job.verifyNote ? `, unconfirmed — ${job.verifyNote}` : "");
-                job.lines.push([`Coarse align: ${job.trackLabel} shifted ${formatSignedSeconds(delta)} to match ${job.target.clipName} against ${refName} via ${pick.result.chosen.label} (score ${pick.result.chosen.score.toFixed(2)}${confirm}).`, "success"]);
+                let corrNote = "";
+                if (corrAdopt) {
+                    corrNote = `; ${corr.disagreed.length} other clips on the track agreed instead on ${formatSignedSeconds(corr.adoptedDeltaSec)}, so that was used`;
+                } else if (corr && corr.verdict === "confirmed") {
+                    corrNote = `; corroborated by ${corr.agreed.length} other clip${corr.agreed.length !== 1 ? "s" : ""} on the track`;
+                } else if (corr && corr.verdict === "inconclusive") {
+                    corrNote = "; the track's other clips could not be compared, so it rests on this one";
+                } else if (job.group.length > 1 && !corr) {
+                    corrNote = "";
+                }
+                job.lines.push([`Coarse align: ${job.trackLabel} shifted ${formatSignedSeconds(delta)} to match ${job.target.clipName} against ${refName} via ${pick.result.chosen.label} (score ${pick.result.chosen.score.toFixed(2)}${confirm}${corrNote}).`, "success"]);
                 results.push({
                     scope: "track", label: job.trackLabel, status: "shifted",
                     deltaSec: delta, score: pick.result.chosen.score,
+                    trackKey: trackKeyOf(job.target),
+                    detail: corrAdopt ? "offset taken from the track's other clips" : undefined,
                     method: `${pick.result.chosen.label} · ${refName}`
                 });
-                if (pick.result.chosen.score >= COARSE_STRONG_SCORE) learnedDeltas.push(delta);
+                // A hint is only worth spreading to other tracks if the track it
+                // came from is actually settled. An offset its own clips could
+                // not corroborate is not that.
+                const trustworthy = corrAdopt || !corr || corr.verdict !== "inconclusive";
+                if (pick.result.chosen.score >= COARSE_STRONG_SCORE && trustworthy) learnedDeltas.push(delta);
             }
         }
         for (const [msg, type] of job.lines) log(msg, type);
@@ -1013,7 +1426,7 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         }
     });
     const pekDone = jobs.filter(j => j.done && !j.finalized);
-    await mapPool(pekDone, SYNC_CONCURRENCY, verifyJob);
+    await mapPool(pekDone, SYNC_CONCURRENCY, confirmJob);
     let pekMatched = 0;
     for (const job of pekDone) {
         finalizeJob(job);
@@ -1031,37 +1444,43 @@ async function analyzeCoarseAlign(anchors, onProgress) {
     let units = 0;
     const totalUnits = jobs.length * stages.length;
 
-    for (const stageLabels of stages) {
+    // One stage for one job. Shared with the retry pass below, so a second
+    // attempt on a different clip searches exactly as hard as the first did.
+    async function runStage(job, stageLabels) {
         const blind = stageLabels[0] !== "timecode";
+        try {
+            if (blind && learnedDeltas.length && await tryLearnedHints(job)) {
+                job.done = true;
+            }
+            if (!job.done) {
+                for (const cand of job.cands) {
+                    for (const plan of cand.plans) {
+                        if (stageLabels.indexOf(plan.label) === -1) continue;
+                        if (plan.label === "full" && cand.state.skipFull) continue; // prediction confirmed — skip the costly full scan
+                        if (dsp.coarseConsider(cand.state, plan, await matchPlan(job, cand, plan), cand.geom, job.cfg)) {
+                            job.done = true;
+                            break;
+                        }
+                    }
+                    if (job.done) break;
+                }
+            }
+        } catch (e) {
+            if (e && e.cancelled) throw e;
+            job.failed = true;
+            job.lines.push([`Coarse align: ${job.target.clipName} — ${e.message}; leaving to fine pass.`, "warn"]);
+            results.push({ scope: "track", label: job.trackLabel, status: "skipped", detail: e.message });
+        }
+    }
+
+    for (const stageLabels of stages) {
         const pending = jobs.filter(j => !j.done && !j.failed);
         units += jobs.length - pending.length;   // already-resolved tracks skip the stage
         if (onProgress) onProgress(units, totalUnits);
         if (!pending.length) continue;
 
         await mapPool(pending, SYNC_CONCURRENCY, async (job) => {
-            try {
-                if (blind && learnedDeltas.length && await tryLearnedHints(job)) {
-                    job.done = true;
-                }
-                if (!job.done) {
-                    for (const cand of job.cands) {
-                        for (const plan of cand.plans) {
-                            if (stageLabels.indexOf(plan.label) === -1) continue;
-                            if (plan.label === "full" && cand.state.skipFull) continue; // prediction confirmed — skip the costly full scan
-                            if (dsp.coarseConsider(cand.state, plan, await matchPlan(job, cand, plan), cand.geom, job.cfg)) {
-                                job.done = true;
-                                break;
-                            }
-                        }
-                        if (job.done) break;
-                    }
-                }
-            } catch (e) {
-                if (e && e.cancelled) throw e;
-                job.failed = true;
-                job.lines.push([`Coarse align: ${job.target.clipName} — ${e.message}; leaving to fine pass.`, "warn"]);
-                results.push({ scope: "track", label: job.trackLabel, status: "skipped", detail: e.message });
-            }
+            await runStage(job, stageLabels);
             units += 1;
             if (onProgress) onProgress(units, totalUnits);
         });
@@ -1069,13 +1488,56 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         // Confirm, then publish freshly-confident offsets before the next (blind)
         // stage — an unconfirmed offset must not become a hint for other tracks.
         const settled = jobs.filter(j => (j.done || j.failed) && !j.finalized);
-        await mapPool(settled, SYNC_CONCURRENCY, verifyJob);
+        await mapPool(settled, SYNC_CONCURRENCY, confirmJob);
         for (const job of settled) finalizeJob(job);
     }
 
     // Tracks that exhausted every stage: accept a near-prediction match or give up.
     const remaining = jobs.filter(j => !j.finalized);
-    await mapPool(remaining, SYNC_CONCURRENCY, verifyJob);
+    await mapPool(remaining, SYNC_CONCURRENCY, confirmJob);
+
+    // ── Another clip from the same track ─────────────────────────────────
+    // Everything above rests on ONE clip standing in for its whole track, and a
+    // track is abandoned the moment that clip comes up empty — however many
+    // other clips sit beside it. Sometimes the chosen clip simply has nothing to
+    // offer: it is silent, or it covers a stretch no other device recorded. A
+    // different clip from the same track answers the same question and may
+    // answer it well, so try one before giving the track up.
+    //
+    // Only tracks with no CONFIDENT answer are retried. An offset that was
+    // confident and then failed confirmation is a different problem — that one
+    // is a wrong answer rather than a missing one, and the relay pass below is
+    // what handles it.
+    const needAnotherClip = remaining.filter(job => {
+        if (job.failed || job.finalized) return false;
+        if (job.targetIndex + 1 >= job.targets.length) return false;
+        return !dsp.coarseResolveBest(job.cands, job.cfg).result;
+    });
+
+    for (const job of needAnotherClip) {
+        while (job.targetIndex + 1 < job.targets.length) {
+            const previous = job.target.clipName;
+            const before = dsp.coarseResolveBest(job.cands, job.cfg);
+            const why = before.best
+                ? `only reached a score of ${before.best.score.toFixed(2)}`
+                : "matched nothing at all";
+            if (!(await useNextTarget(job))) break;
+            log(`Coarse align: ${job.trackLabel} — ${previous} ${why}; retrying the track with ` +
+                `${job.target.clipName} (${formatDuration(job.tgtAvail * 1000)}).`, "info");
+            try {
+                if (await tryPekCoarse(job)) job.done = true;
+            } catch (e) {
+                if (e && e.cancelled) throw e;
+                // peaks are opportunistic — fall through to the audio stages
+            }
+            for (const stageLabels of stages) {
+                if (job.done || job.failed) break;
+                await runStage(job, stageLabels);
+            }
+            await confirmJob(job);
+            if (dsp.coarseResolveBest(job.cands, job.cfg).result) break;   // answered
+        }
+    }
 
     // ── Relay pass ────────────────────────────────────────────────────────────
     // Anything still unmatched (or whose match failed confirmation) is retried
@@ -1093,7 +1555,8 @@ async function analyzeCoarseAlign(anchors, onProgress) {
     const needsRelay = remaining.filter(job => {
         if (job.failed) return false;
         const pick = dsp.coarseResolveBest(job.cands, job.cfg);
-        return !pick.result || !!job.verifyRejected;
+        const corrRejected = job.corroboration && job.corroboration.verdict === "rejected";
+        return !pick.result || !!job.verifyRejected || corrRejected;
     });
 
     if (needsRelay.length && resolvedAnchors.length) {
@@ -1120,8 +1583,12 @@ async function analyzeCoarseAlign(anchors, onProgress) {
 async function comparePair(reference, target) {
     const comparePlan = dsp.buildCompareWindow(reference, target);
     if (!comparePlan) {
+        // Not a failed match — there was nothing to match against. The clip sits
+        // outside this reference recording’s span entirely, which says nothing
+        // about whether the track is aligned. Callers must not count it as a
+        // failure; see summarizeTrackResiduals.
         return {
-            reference, target, usable: false,
+            reference, target, usable: false, noOverlap: true,
             reason: `timeline overlap ${Math.max(0, Math.min(reference.resolvedEndSec, target.resolvedEndSec) - Math.max(reference.resolvedStartSec, target.resolvedStartSec)).toFixed(2)}s is below minimum ${dsp.FINE_TUNE_MIN_OVERLAP_SEC}s`,
             attempts: []
         };
@@ -1190,12 +1657,25 @@ async function comparePair(reference, target) {
     };
 }
 
-// ─── Clock-drift check ────────────────────────────────────────────────────────
-// A single offset can't fix devices whose clocks run at different RATES. Measure
-// the residual lag near both ends of a long overlap and report the divergence.
-async function measureDrift(reference, target) {
-    const probe = dsp.buildDriftProbe(reference, target);
-    if (!probe) return null; // overlap too short for drift to matter
+// ─── Two-point check: agreement, then drift ─────────────────────────────────
+// One window scoring well only proves the two files share THAT stretch of
+// audio. Over a long overlap that is weak evidence — a music bed, a repeated
+// announcement or a stretch of room tone can correlate beautifully at a
+// position that is badly wrong — so a second window near the other end of the
+// overlap has to tell the same story before the shift is applied. The same two
+// measurements also give clock drift for free: if the ends differ a little, the
+// devices' clocks run at slightly different RATES, which one offset cannot fix.
+//
+// Both now run from FINE_TUNE_AGREE_MIN_OVERLAP_SEC of overlap rather than the
+// old drift-only 10 minutes, because the point is no longer just to report
+// drift — it is to catch a confident match on the wrong audio.
+//
+// Returns null when there is not enough overlap to place two windows, else
+// { agreement, driftSec, ppm, spanSec } with driftSec/ppm null when one of the
+// windows had nothing measurable in it.
+async function measureTwoPoints(reference, target) {
+    const probe = dsp.buildDriftProbe(reference, target, dsp.FINE_TUNE_AGREE_MIN_OVERLAP_SEC);
+    if (!probe) return null; // overlap too short to place two independent windows
 
     const [refEarly, tgtEarly, refLate, tgtLate] = await Promise.all([
         audio.getEnvelope(reference.filePath, probe.early.refSourceOffsetSec, probe.early.compareDurationSec),
@@ -1206,16 +1686,14 @@ async function measureDrift(reference, target) {
 
     const early = dsp.findBestLag(refEarly, tgtEarly);
     const late = dsp.findBestLag(refLate, tgtLate);
-    if (!early || !late || early.atRail || late.atRail) return null;
-    if (early.score < dsp.FINE_TUNE_MIN_SCORE || late.score < dsp.FINE_TUNE_MIN_SCORE) return null;
+    const agreement = dsp.judgeTwoPointAgreement(early, late, probe.spanSec);
+    const out = { agreement, spanSec: probe.spanSec, driftSec: null, ppm: null };
+    if (agreement.verdict === "inconclusive") return out;
 
     const driftSec = late.lagSec - early.lagSec;
-    if (Math.abs(driftSec) < dsp.DRIFT_MIN_REPORT_SEC) return null;
-    return {
-        driftSec: Math.round(driftSec * 1000) / 1000,
-        ppm: Math.round((driftSec / probe.spanSec) * 1e6),
-        spanSec: probe.spanSec
-    };
+    out.driftSec = Math.round(driftSec * 1000) / 1000;
+    out.ppm = Math.round((driftSec / probe.spanSec) * 1e6);
+    return out;
 }
 
 async function analyzeFineTune(anchors, onProgress) {
@@ -1237,24 +1715,32 @@ async function analyzeFineTune(anchors, onProgress) {
     const outcomes = await mapPool(targets, SYNC_CONCURRENCY, async ({ target, targetIndex }) => {
         let bestPair = null;
         const pairDiagnostics = [];
-        let railKept = false; // a comparison matched only at the ±max-shift rail
+        let railKept = false;    // a comparison matched only at the ±max-shift rail
+        let hadOverlap = false;  // some reference actually covered this clip
         for (let refIndex = 0; refIndex < targetIndex; refIndex += 1) {
             const reference = anchors[refIndex];
             if (reference.layerOrder >= target.layerOrder) continue;
 
             const result = await comparePair(reference, target);
             if (!result || !result.usable) {
+                if (result && !result.noOverlap) hadOverlap = true;
                 if (result && result.reason) pairDiagnostics.push(`${dsp.describeAnchor(reference)}: ${result.reason}`);
                 if (result && result.railRejected) railKept = true;
                 continue;
             }
+            hadOverlap = true;
             if (!bestPair || result.score > bestPair.score) bestPair = result;
         }
 
         // Buffer this clip's lines so concurrent clips stay as intact blocks.
         const lines = [];
         let adjustment = null;
-        const row = { scope: "clip", label: target.clipName };
+        // filePath and trackKey let the rescue pass below reason about the
+        // track as a whole rather than about one clip at a time.
+        const row = {
+            scope: "clip", label: target.clipName,
+            filePath: target.filePath, trackKey: trackKeyOf(target)
+        };
 
         if (!bestPair && railKept) {
             lines.push([`↳ ${target.clipName}: kept coarse alignment — fine-tune match was unreliable (pinned to ±${dsp.FINE_TUNE_MAX_SHIFT_SEC}s limit)`, "info"]);
@@ -1264,7 +1750,12 @@ async function analyzeFineTune(anchors, onProgress) {
             const detail = pairDiagnostics.length ? ` (${pairDiagnostics[0]})` : "";
             lines.push([`⚠ Skip ${target.clipName}: no usable overlap/match${detail}`, "warn"]);
             row.status = "unmatched";
-            row.detail = pairDiagnostics.length ? pairDiagnostics[0] : "no usable overlap or match";
+            // No reference recording covers this clip, so it never had a chance.
+            // That is a gap in the reference, not evidence about this track.
+            row.outOfRange = !hadOverlap;
+            row.detail = hadOverlap
+                ? (pairDiagnostics.length ? pairDiagnostics[0] : "no usable match")
+                : "no reference recording covers this clip";
         } else if (bestPair.score < dsp.FINE_TUNE_MIN_SCORE) {
             lines.push([`⚠ Skip ${target.clipName}: weak match score ${bestPair.score.toFixed(2)} vs ${bestPair.reference.clipName}`, "warn"]);
             row.status = "weak";
@@ -1296,33 +1787,35 @@ async function analyzeFineTune(anchors, onProgress) {
                 row.deltaSec = roundedDelta;
             }
 
-            // Long overlap and a solid match: also check whether the two devices'
-            // clocks RUN at different rates (drift), which one offset can't fix.
-            // Beyond DRIFT_IMPLAUSIBLE_PPM the two ends disagree by more than any
-            // real device pair can, which means the windows matched noise rather
-            // than shared audio — discard the shift instead of locking it in.
+            // Long overlap: make the match prove itself at a second point near
+            // the other end before it is allowed to stand, and read the clock
+            // drift off the same two measurements.
             try {
-                const drift = await measureDrift(bestPair.reference, target);
-                if (drift) {
-                    row.driftSec = drift.driftSec;
-                    row.driftPpm = drift.ppm;
-                    if (Math.abs(drift.ppm) >= dsp.DRIFT_IMPLAUSIBLE_PPM) {
-                        if (appliedDelta) {
-                            target.resolvedStartSec -= appliedDelta;
-                            target.resolvedEndSec -= appliedDelta;
-                        }
-                        adjustment = null;
-                        lines.push([`⚠ Skip ${target.clipName}: the match vs ${bestPair.reference.clipName} implies ${drift.ppm} ppm drift across ${formatDuration(drift.spanSec * 1000)} — far beyond any real device, so it is not the same audio. Left in place.`, "warn"]);
-                        row.status = "unmatched";
-                        delete row.deltaSec;
-                        row.detail = `rejected: implausible ${drift.ppm} ppm drift vs ${bestPair.reference.clipName}`;
-                    } else {
-                        lines.push([`⚠ ${target.clipName}: clock drift ${formatSignedSeconds(drift.driftSec)} across ${formatDuration(drift.spanSec * 1000)} (~${drift.ppm} ppm) vs ${bestPair.reference.clipName} — the tail may be audibly off; consider splitting long clips before syncing.`, "warn"]);
+                const two = await measureTwoPoints(bestPair.reference, target);
+                if (two && two.agreement.verdict === "disagree") {
+                    // The two ends of the overlap describe different alignments,
+                    // so whatever correlated was not shared audio. Undo it.
+                    if (appliedDelta) {
+                        target.resolvedStartSec -= appliedDelta;
+                        target.resolvedEndSec -= appliedDelta;
                     }
+                    adjustment = null;
+                    lines.push([`⚠ Skip ${target.clipName}: the match vs ${bestPair.reference.clipName} scored ${bestPair.score.toFixed(2)} at one point but a second window ${formatDuration(two.spanSec * 1000)} later disagrees by ${formatDuration(two.agreement.disagreeSec * 1000)} (tolerance ${formatDuration(two.agreement.tolSec * 1000)}) — the two are not the same audio. Left in place.`, "warn"]);
+                    row.status = "unmatched";
+                    delete row.deltaSec;
+                    row.detail = `rejected: the two ends of the overlap disagree by ${two.agreement.disagreeSec.toFixed(2)}s`;
+                } else if (two && two.driftSec !== null) {
+                    row.driftSec = two.driftSec;
+                    row.driftPpm = two.ppm;
+                    if (Math.abs(two.driftSec) >= dsp.DRIFT_MIN_REPORT_SEC) {
+                        lines.push([`⚠ ${target.clipName}: clock drift ${formatSignedSeconds(two.driftSec)} across ${formatDuration(two.spanSec * 1000)} (~${two.ppm} ppm) vs ${bestPair.reference.clipName} — the tail may be audibly off; consider splitting long clips before syncing.`, "warn"]);
+                    }
+                } else if (two && two.agreement.verdict === "inconclusive" && bestPair.overlapWindowSec >= dsp.FINE_TUNE_AGREE_MIN_OVERLAP_SEC) {
+                    lines.push([`ℹ ${target.clipName}: could not second-guess the match — the other end of the overlap had no usable audio.`, "info"]);
                 }
             } catch (e) {
                 if (e && e.cancelled) throw e;
-                // Drift measurement is best-effort — never fail the clip over it.
+                // The second point is best-effort — never fail the clip over it.
             }
         }
 
@@ -1337,6 +1830,65 @@ async function analyzeFineTune(anchors, onProgress) {
     for (const outcome of outcomes) {
         if (outcome.adjustment) adjustments.push(outcome.adjustment);
         results.push(outcome.row);
+    }
+
+    // ── What the fine pass says about the coarse pass ────────────────────
+    // Coarse moves a whole track on evidence from ONE clip. The fine pass has
+    // just examined every clip on that track independently, which makes it the
+    // first real audit of that decision — so read its results back.
+    //
+    // A clip the fine pass could not match is sitting wherever coarse left it.
+    // When its track-mates agree with each other on a residual shift, that
+    // consensus is much better evidence for where the unmatched clip belongs
+    // than leaving it alone: they are all recordings from one device, carrying
+    // one clock error, moved by one coarse offset.
+    const byTrack = new Map();
+    for (const outcome of outcomes) {
+        const key = outcome.row.trackKey;
+        if (!key) continue;
+        if (!byTrack.has(key)) byTrack.set(key, []);
+        byTrack.get(key).push(outcome.row);
+    }
+
+    for (const [key, rows] of byTrack) {
+        const summary = dsp.summarizeTrackResiduals(rows, dsp.COARSE_CORROBORATE_TOL_SEC);
+        const label = dsp.trackKeyLabel(key);
+
+        if (summary.suspect) {
+            const tried = summary.total - summary.outOfRange;
+            notes.push(`⚠ ${label}: ${summary.failed - summary.outOfRange} of the ${tried} clips that had a reference to ` +
+                `compare against could not be matched. That usually means the coarse offset for this track is wrong — ` +
+                `check this track before trusting the sync.`);
+        }
+        if (summary.outOfRange) {
+            notes.push(`ℹ ${label}: ${summary.outOfRange} of ${summary.total} clips sit outside every reference recording’s ` +
+                `span, so the fine pass had nothing to compare them with. That is a gap in the reference, not a problem with ` +
+                `this track — pick a reference track that covers more of the shoot if you want them checked.`);
+        }
+
+        if (summary.consensusDeltaSec === null) continue;
+        if (Math.abs(summary.consensusDeltaSec) < dsp.FINE_TUNE_MIN_APPLY_SEC) continue;
+        const rescueable = rows.filter(r => r.filePath &&
+            r.status !== "shifted" && r.status !== "aligned");
+        if (!rescueable.length) continue;
+
+        const delta = summary.consensusDeltaSec;
+        const named = rescueable.length <= 8
+            ? ` (${rescueable.map(r => r.label).join(", ")})`
+            : ` (${rescueable.slice(0, 8).map(r => r.label).join(", ")} and ${rescueable.length - 8} more)`;
+        notes.push(`↻ ${label}: ${summary.consensusCount} clips on this track needed the same ${formatSignedSeconds(delta)} correction, ` +
+            `so the same shift was given to ${rescueable.length} clip${rescueable.length !== 1 ? "s" : ""} the fine pass could not check` +
+            `${named}. They come from one device with one clock error.`);
+        for (const r of rescueable) {
+            adjustments.push({
+                clipName: r.label, filePath: r.filePath, deltaSec: delta,
+                referenceName: `${label} consensus`, score: null
+            });
+            r.status = "shifted";
+            r.deltaSec = delta;
+            r.method = `${summary.consensusCount} clips on ${label}`;
+            r.detail = "unmatched — took the shift its track-mates agreed on";
+        }
     }
 
     return { adjustments, notes, results };
@@ -1437,6 +1989,32 @@ function reportApplyIntegrity(result, rows) {
     if (!result) return true;
     let clean = true;
 
+    // What the link-group pass did BEFORE the move. Syncitol moves one delta per
+    // source file, which keeps a camera clip's own picture and sound together
+    // because they share a path. Anything linked across two different files —
+    // merged clips, Synchronize, a manual Clip > Link — and anything whose media
+    // path would not resolve needs this pass instead.
+    const plan = result.linkPlan;
+    if (plan) {
+        for (const g of (plan.unified || [])) {
+            log(`⇄ Linked clips kept together: ${g.names.join(" + ")} — all moved ` +
+                `${formatSignedSeconds(g.deltaSec)} with the picture instead of drifting apart.`, "info");
+        }
+        for (const b of (plan.blocked || [])) {
+            clean = false;
+            log(`⚠ Left alone: ${b.names.join(" + ")} are linked but need different shifts, and no single ` +
+                `move suits them all. Unlink them in Premiere if you want these synced separately.`, "warn");
+            if (rows) rows.push({
+                scope: "clip", label: b.names[0], status: "unmatched",
+                detail: "linked to a clip needing a different shift — not moved"
+            });
+        }
+        if ((plan.opaqueTargets || []).length) {
+            log(`⇄ Carried ${plan.opaqueTargets.length} unreadable timeline item(s) along with the clip(s) ` +
+                `they are linked to, so they did not get left behind.`, "info");
+        }
+    }
+
     if (result.scanDropped && (result.scanDropped.noPath || result.scanDropped.itemErr)) {
         const d = result.scanDropped;
         const lost = d.noPath + d.itemErr;
@@ -1466,6 +2044,59 @@ function reportApplyIntegrity(result, rows) {
         if (rows) rows.push({ scope: "clip", label: name, status: "unmatched", detail: "host refused part of the move — A/V may be torn" });
     }
 
+    // A tear the host caused is no longer only reported — premiere.js tries to
+    // close it, then to put the file back where it started. Say which happened.
+    const repair = result.repair;
+    if (repair) {
+        for (const filePath of (repair.repaired || [])) {
+            log(`✓ ${audio.baseName(filePath)} landed unevenly and was pulled back into line — its video and ` +
+                `audio are together and synced.`, "success");
+        }
+        for (const filePath of (repair.restored || [])) {
+            clean = false;
+            log(`↩ ${audio.baseName(filePath)} could not be shifted in one piece, so it was put back exactly ` +
+                `where it started: unsynced, but its video and audio are still together. Check whether that ` +
+                `clip's track is locked or a neighbouring clip blocks where it needed to land.`, "warn");
+            if (rows) rows.push({
+                scope: "clip", label: audio.baseName(filePath), status: "unmatched",
+                detail: "host refused the move — restored, A/V intact"
+            });
+        }
+    }
+
+    // What the absolute A/V check found. This is the one that catches a clip
+    // whose sound has come off its picture regardless of HOW — a refused move, a
+    // clamped one, a destination blocked on one track but not the other.
+    const links = result.links;
+    if (links) {
+        const broke = (links.created || []).length + (links.worsened || []).length;
+        if (links.mended.length) {
+            const worst = links.mended.reduce((a, b) => Math.abs(b.offsetSec) > Math.abs(a.offsetSec) ? b : a);
+            log(`⇄ ${links.mended.length} clip${links.mended.length !== 1 ? "s" : ""} came out with the audio off the ` +
+                `picture (worst ${formatSignedSeconds(worst.offsetSec)}, ${audio.baseName(worst.filePath)}) — the audio was slid ` +
+                `back under the video. They are in sync and linked.`, "success");
+        }
+        for (const m of (links.remaining || [])) {
+            clean = false;
+            log(`✗ ${audio.baseName(m.filePath)}: its audio sits ${formatSignedSeconds(m.offsetSec)} from its video and ` +
+                `could not be moved back — check whether ${dsp.trackKeyLabel(m.audioTrack)} is locked or a neighbouring clip ` +
+                `is in the way. Undo (Ctrl/Cmd+Z, a few times) restores the timeline.`, "error");
+            if (rows) rows.push({
+                scope: "clip", label: audio.baseName(m.filePath), status: "unmatched",
+                detail: `audio ${formatSignedSeconds(m.offsetSec)} off its video — could not be re-aligned`
+            });
+        }
+        if (!broke && links.before && links.before.misaligned.length) {
+            log(`⚠ ${links.before.misaligned.length} clip${links.before.misaligned.length !== 1 ? "s" : ""} already had the ` +
+                `audio off the picture before this step, and still do — Syncitol moved them as they were rather than ` +
+                `"correcting" an offset that may be deliberate.`, "warn");
+        }
+        if (links.after && links.after.ambiguous.length) {
+            log(`ℹ ${links.after.ambiguous.length} file(s) appear more than once on a track, so their audio could not be ` +
+                `checked against their video automatically.`, "info");
+        }
+    }
+
     const integrity = result.integrity;
     if (integrity) {
         for (const t of integrity.torn) {
@@ -1475,9 +2106,10 @@ function reportApplyIntegrity(result, rows) {
                 .map(i => `${i.trackType.toUpperCase()} ${i.trackIndex + 1} moved ${formatSignedSeconds(i.movedSec)}`)
                 .join("; ");
             log(`✗ A/V TORN — ${name}: every instance was asked to move ${formatSignedSeconds(t.requestedSec)}, but they ` +
-                `landed ${formatSignedSeconds(t.spreadSec)} apart (${where}). Undo (Ctrl/Cmd+Z) restores the timeline; ` +
-                `then check whether that clip's audio track is locked, or whether a neighbouring clip blocks where it ` +
-                `needed to land.`, "error");
+                `landed ${formatSignedSeconds(t.spreadSec)} apart (${where}), and neither completing nor undoing the ` +
+                `move would take. Undo (Ctrl/Cmd+Z, a few times — each repair attempt is its own step) restores ` +
+                `the timeline; then check whether that clip's audio track is locked, or whether a neighbouring ` +
+                `clip blocks where it needed to land.`, "error");
             if (rows) rows.push({
                 scope: "clip", label: name, status: "unmatched",
                 detail: `A/V torn by ${formatSignedSeconds(t.spreadSec)} — undo and check that track`
@@ -1600,17 +2232,45 @@ async function refreshSequence() {
             log(`⚠ Mixed timing sources (${breakdown}). mtime-derived starts are less precise than embedded ones; use Fine Tune Audio to correct residual drift.`, "warn");
         }
 
-        // Per-track earliest recording — each track anchors to its own earliest
-        // clip, not a global anchor. This way a device whose clock is set to the
-        // wrong date (factory reset, dead battery) doesn't push correctly-dated
-        // clips beyond the 24-hour limit. Cross-track alignment is handled by
-        // the audio coarse + fine tune passes.
-        const trackEarliestMs = {};
-        for (const f of enriched) {
-            const tk = `${f.trackType}_${f.trackIndex}`;
-            if (!(tk in trackEarliestMs) || f.recordStartMs < trackEarliestMs[tk]) {
-                trackEarliestMs[tk] = f.recordStartMs;
+        // Where each track's 0:00 will sit. Tracks whose recordings overlap in
+        // clock time corroborate each other and share one anchor, so the build
+        // lays them out at their real offsets instead of stacking every track at
+        // 0:00 and making the audio pass rediscover them. A track nothing
+        // corroborates keeps its own earliest clip as its anchor. Same call and
+        // same inputs as buildSyncSequence makes — so the Offset column below
+        // shows what will actually be built.
+        const layout = dsp.planBuildAnchors(enriched);
+        const trackEarliestMs = layout.anchorMsByTrack;
+        for (const group of layout.groups) {
+            const names = group.trackKeys.map(dsp.trackKeyLabel).join(", ");
+            log(`Build layout: ${names} were recording at the same time, so their clocks agree — ` +
+                `they will be laid out at their real offsets from each other ` +
+                `(${formatDuration(group.spanSec * 1000)} of shoot). The audio pass only has to fine-tune.`, "success");
+        }
+        if (layout.tracks.length > 1) {
+            for (const odd of layout.ungrouped) {
+                log(`Build layout: ${dsp.trackKeyLabel(odd.trackKey)} starts at 0:00 — ${odd.reason}. ` +
+                    `The audio pass will find where it belongs.`, "info");
             }
+        }
+
+        // Timestamps can be perfectly consistent and still not be recording
+        // times. Say so plainly — the sync will lean entirely on audio, which is
+        // slower and less certain, and the user is the only one who can fix the
+        // cause (keep the originals, preserve file dates when copying).
+        for (const key of layout.timing.implausible) {
+            const t = layout.timing.tracks.find(x => x.trackKey === key);
+            log(`⚠ ${dsp.trackKeyLabel(key)}: its ${t.clipCount} clips claim to overlap each other by ` +
+                `${formatDuration(t.overlapSec * 1000)} of recording — one device cannot record two files at once, so ` +
+                `these timestamps are when something processed the files (a bulk download, a transcode, or a camera ` +
+                `with no clock set), not when they were shot. Alignment for this track rests on audio alone.`, "warn");
+        }
+        const bulk = layout.timing.bulkCopy;
+        if (bulk) {
+            log(`⚠ ${bulk.count} files have no embedded recording time, and their file dates all fall within ` +
+                `${formatDuration(bulk.windowSec * 1000)} of each other while covering ${formatDuration(bulk.footageSec * 1000)} ` +
+                `of footage — those dates were set by one copy or download (Google Drive, Dropbox, a card transfer), not by ` +
+                `recording. Re-copy the originals preserving file dates if you can; otherwise alignment rests on audio alone.`, "warn");
         }
 
         // Compute global earliest for the info log only.
@@ -1655,7 +2315,7 @@ async function refreshSequence() {
             log(`\u26a0 A track exceeds Premiere\u2019s 24-hour maximum — process one recording day at a time.`, "warn");
         }
         if (!hasSpanViolation && globalSpanSec > dsp.MAX_SPAN_SEC) {
-            log(`\u2139 Device clocks differ by ${(globalSpanSec / 3600).toFixed(0)}h (likely a wrong date on one device) — per-track anchoring keeps each track compact; audio alignment will sync them.`, "info");
+            log(`\u2139 Device clocks differ by ${(globalSpanSec / 3600).toFixed(0)}h (likely a wrong date on one device) — the tracks that disagree were anchored separately, so each stays compact; audio alignment will bring them together.`, "info");
         }
 
         clipPayload = enriched;
@@ -1925,7 +2585,7 @@ async function autoSync() {
 // ─── Button click handlers ────────────────────────────────────────────────────
 btnAuto.addEventListener("click", autoSync);
 
-if (btnCopyLog) btnCopyLog.addEventListener("click", copyLog);
+if (btnExportLog) btnExportLog.addEventListener("click", exportLog);
 
 refreshTrackOptions();
 log("Syncitol UXP ready.");

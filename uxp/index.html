@@ -34,6 +34,15 @@
 
     <div class="body">
 
+        <!-- Update banner: shown only when GitHub reports a newer release than
+             the one running. Dismissing it suppresses that version, not all of
+             them, so the next release still gets announced. -->
+        <div id="update-card" class="update-card" style="display:none;">
+            <span class="update-card-text">⬆ <strong id="update-card-version">Update available</strong><span id="update-card-note"></span></span>
+            <div id="update-card-link" class="btn btn-mini" title="Open the release on GitHub">Release notes</div>
+            <div id="update-card-close" class="btn btn-mini" title="Dismiss until the next release">✕</div>
+        </div>
+
         <!-- Active sequence info -->
         <div class="card">
             <div class="card-label">Active Sequence</div>
@@ -109,11 +118,14 @@
             </div>
         </div>
 
-        <!-- Log -->
+        <!-- Log. Export writes a .txt: the clipboard needs a manifest
+             permission and does not exist on every UXP build, and the log
+             itself cannot be selected with the mouse (UXP only supports text
+             selection inside form controls), so a file is the way out. -->
         <div>
             <div class="results-head">
                 <div class="card-label">Log</div>
-                <div id="btn-copy-log" class="btn btn-mini" title="Copy the whole log to the clipboard">⧉ Copy</div>
+                <div id="btn-export-log" class="btn btn-mini" title="Write the whole log to a .txt file">⬇ Export .txt</div>
             </div>
             <div id="log"></div>
         </div>
@@ -131,6 +143,10 @@
             <div class="ins-section">
                 <div class="ins-heading">How it works</div>
                 <p class="ins-text">Syncitol resolves each clip's <strong>record-start time</strong> from the best available source — the media's embedded <strong>creation time</strong> / <strong>timecode</strong>, read directly by the <strong>bundled FFmpeg decoder</strong>. If a file carries none, it falls back to the <strong>file modification date</strong> minus the clip's duration. Every clip is then placed on a new timeline so the gaps between recordings match real clock time, and the audio is fine-aligned by waveform.</p>
+
+                <p class="ins-text ins-note">Tracks that were <strong>recording at the same time</strong> corroborate each other’s clocks, so they are laid out at their real offsets from one another rather than every track starting at 0:00 — which leaves the audio pass with a fine-tune instead of a minute-scale hunt. A track nothing corroborates (its recordings sit apart from everyone else’s, or its times come from the <code>mtime</code> fallback) keeps its own anchor and starts at 0:00 as before; one camera with a dead clock battery no longer costs the others their layout. The log names which tracks went which way.</p>
+
+                <p class="ins-text ins-note"><strong>Consistent timestamps are not automatically real ones.</strong> A bulk download from Google Drive or Dropbox rewrites every file’s date to the moment it arrived; a batch transcode or proxy render writes a fresh <code>creation time</code> into every file it makes; a camera with no clock set stamps them all identically. Each looks perfectly self-consistent. So Syncitol checks something none of them can fake: <strong>one device cannot record two files at once</strong>. If a track’s own clips claim to overlap each other in time, those timestamps are when something processed the files, not when they were shot — that track is excluded from the clock layout and flagged in the log. The check is per-device on purpose: genuine multicam really does have every camera starting within seconds of the others, and any test based on “these all start too close together” would throw exactly that away.</p>
                 <p class="ins-text ins-note">No external install required — the FFmpeg audio decoder ships inside the plugin. The Detected Clips table tags each row <code>meta</code> (embedded metadata) or <code>mtime</code> (file date). On the <code>mtime</code> fallback, preserve file dates when copying media — if the OS updates <code>mtime</code> on copy the sync will be off.</p>
                 <p class="ins-text ins-note">Audio envelopes are cached on disk, so re-running a sync on unchanged media is much faster. When Premiere's own waveform cache (<code>.pek</code> peak files) covers the media, the coarse alignment reads it directly — milliseconds instead of minutes, no audio decoding.</p>
             </div>
@@ -143,7 +159,15 @@
             <div class="ins-section">
                 <div class="ins-heading">Align: coarse + fine</div>
                 <p class="ins-text">Auto Sync aligns audio in two automatic phases. The <strong>coarse</strong> pass shifts each whole track to correct minute-scale clock offsets between devices. The <strong>fine</strong> pass then polishes every clip's position within <code>±5s</code> via audio waveform cross-correlation, using a <strong>reference track</strong> — by default the one with the most recorded coverage, on any track. Only corrections larger than <code>20&nbsp;ms</code> are applied.</p>
-                <p class="ins-text">The <strong>Audio reference</strong> dropdown in the Active Sequence card overrides that pick: choose any populated track (your field recorder, the main camera) and every other clip is aligned to the recordings on it. <strong>Auto</strong> is the default. A forced track that holds <em>every</em> clip in the sequence would leave nothing to align, so the panel falls back to Auto and says so in the log.</p>
+
+                <p class="ins-text ins-note">A coarse offset is a claim about a whole track made from a single clip, so it has to earn it. Any clip over <code>90s</code> is probed at points spread across its <em>whole</em> length — not just its liveliest stretch — and the offset must hold at more than one of them. It is then re-tested against the <strong>other clips on the same track</strong>: if they agree with each other on a different offset, theirs is used instead; if they contradict it with no consensus between them, the track is left to the fine pass rather than moved somewhere confidently wrong. In the fine pass, any overlap longer than <code>120s</code> is matched at both ends and the two must tell the same story — a music bed or a stretch of room tone can score beautifully at a position that is minutes out.</p>
+
+                <p class="ins-text ins-note">Afterwards the fine pass’s own results are read back as an audit of the coarse one. If most of a track failed to match, the log says so plainly — that is what a wrong coarse offset looks like. If several clips on a track all needed the <em>same</em> correction, that correction is also given to the clips on that track the fine pass could not match: they are one device carrying one clock error, and their track-mates are better evidence than leaving them behind.</p>
+                <p class="ins-text">The <strong>Audio reference</strong> dropdown in the Active Sequence card overrides that pick: choose any populated <strong>audio</strong> track (your field recorder, the main camera’s sound) and every other clip is aligned to the recordings on it. <strong>Auto</strong> is the default. A forced track that holds <em>every</em> clip in the sequence would leave nothing to align, so the panel falls back to Auto and says so in the log.</p>
+
+                <p class="ins-text ins-note">The list shows audio tracks only. Forcing a track really selects the <em>files</em> on it, and a camera clip’s picture and sound are one file — so V1 and A1 would pick exactly the same recordings. Auto still considers every clip whatever track it sits on.</p>
+                <p class="ins-text ins-note">Every clip of one source file moves as a single piece, so a camera’s picture and its own sound never come apart. Audio <strong>linked from a different file</strong> — merged clips, <em>Synchronize</em>, a manual <em>Clip &gt; Link</em> — is detected by the span it shares with the picture and moved with it rather than synced separately; unlink it first if you want Syncitol to align it on its own. After every move the timeline is <strong>read back</strong>: anything that landed unevenly is nudged into line, and if that won’t take, put back exactly where it started — unsynced, but never torn. The log names whatever happened.</p>
+
                 <p class="ins-text ins-note">After Auto Sync, <strong>↩ Revert</strong> (in Sync Results) undoes exactly the shifts the fine pass applied. On overlaps longer than 10 minutes the panel also checks for <strong>clock drift</strong> — devices whose clocks run at different rates — and warns with the measured drift (a single offset can't fix both ends; split long clips before syncing if flagged).</p>
                 <div class="ins-subheading">Fine pass</div>
                 <div class="ins-range-table">
@@ -152,6 +176,16 @@
                     <div class="ins-range-row"><span class="ins-tag">2×</span><span>Samples overlap at 50% and 20% through the window</span></div>
                     <div class="ins-range-row"><span class="ins-tag">Fast</span><span>Skips the alternate window when centred score ≥0.70</span></div>
                 </div>
+            </div>
+
+            <div class="ins-section">
+                <div class="ins-heading">Reporting a problem</div>
+                <p class="ins-text">The <strong>Log</strong> at the bottom of the panel is the full record of a run. <strong>⬇ Export .txt</strong> writes the whole thing to a file — send that with a bug report and the sync can be replayed from it.</p>
+            </div>
+
+            <div class="ins-section">
+                <div class="ins-heading">Updates</div>
+                <p class="ins-text">Syncitol asks GitHub once a day whether a newer release exists and shows a banner at the top of the panel if so — dismissing it hides that version, not the next one. Clicking the <strong>version number in the footer</strong> checks immediately and reports either way; if the check can’t reach GitHub it just opens the releases page. Nothing else is ever sent or received.</p>
             </div>
 
             <div class="ins-section">
@@ -167,7 +201,7 @@
 
     <!-- Footer -->
     <div class="footer">
-        <span>Syncitol UXP v1.5.0</span>
+        <a id="footer-version" href="https://github.com/thinkvp/Syncitol/releases/latest" title="Check for updates on GitHub">Syncitol UXP v1.6.0</a>
         <span id="tool-status" class="tool-status"></span>
         <span>Premiere Pro 26+</span>
         <a id="footer-tips" href="https://ko-fi.com/thinkvp" title="Support development">Tips</a>

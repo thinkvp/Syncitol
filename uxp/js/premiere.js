@@ -169,13 +169,25 @@ async function scanSequence(sequence) {
 
     // PASS 2 — resolve media paths via the durable ClipProjectItem refs only.
     const clips = [];
+    const opaque = [];   // readable position, unreadable identity — see below
     let noPath = 0;
     for (const p of pending) {
         let filePath = null;
         try {
             if (p.clipPI && typeof p.clipPI.getMediaFilePath === "function") filePath = await val(p.clipPI.getMediaFilePath());
         } catch (e) {}
-        if (!filePath) { noPath++; continue; }
+        if (!filePath) {
+            noPath++;
+            // We know exactly WHERE this item is and how to address it (track +
+            // index), just not which file it came from. That is enough to carry
+            // it along with a linked partner, which is the difference between a
+            // silent tear and an intact clip — so keep it.
+            opaque.push({
+                clipName: p.clipName, trackType: p.trackType, trackIndex: p.trackIndex,
+                itemIndex: p.itemIndex, startSec: p.startSec, endSec: p.endSec
+            });
+            continue;
+        }
         clips.push({
             filePath, clipName: p.clipName, trackType: p.trackType, trackIndex: p.trackIndex,
             itemIndex: p.itemIndex, startSec: p.startSec, endSec: p.endSec, inPointSec: p.inPointSec,
@@ -186,7 +198,7 @@ async function scanSequence(sequence) {
     if (typeof scanSequence.onDiag === "function") {
         scanSequence.onDiag(`tracks v${vCount}/a${aCount} · raw ${rawItems} · keptClips ${clips.length} · noPath ${noPath} · itemErr ${itemErr}`);
     }
-    return { name, sequence, clips, dropped: { noPath, itemErr, raw: rawItems } };
+    return { name, sequence, clips, opaque, dropped: { noPath, itemErr, raw: rawItems } };
 }
 
 async function scanActiveSequence() { return scanSequence(await getActiveSequence()); }
@@ -315,19 +327,47 @@ async function applyStarts(project, sequence, targets, undoLabel) {
                 continue;
             }
 
-            // Phase 2 — queue them. addAction is documented to return a boolean;
-            // a false here means the host dropped that one move, which would
-            // leave the file half-shifted, so it is reported rather than counted.
+            // Phase 2 — queue them. addAction returns a boolean, and a false
+            // means the host dropped that one move: the file would come out
+            // half-shifted, which is precisely how a clip's audio ends up hanging
+            // off its video. Actions cannot be pulled back out of a compound, but
+            // a move is a DELTA, so queueing the inverse for everything already
+            // accepted nets the file back to zero. The file ends up unsynced and
+            // said so in the log — which beats a silent tear every time.
             let added = 0;
-            for (const action of actions) {
+            let refused = false;
+            for (let ai = 0; ai < actions.length; ai += 1) {
                 let ok = true;
-                try { ok = compound.addAction(action); }
+                try { ok = compound.addAction(actions[ai]); }
                 catch (e) { ok = false; }
-                if (ok === false) continue;
+                if (ok === false) { refused = true; break; }
                 added += 1;
             }
+            if (refused) {
+                let undone = 0;
+                for (let ui = 0; ui < added; ui += 1) {
+                    try {
+                        const back = list[ui].deltaSec;
+                        const items = itemsByTrack.get(`${list[ui].trackType}:${list[ui].trackIndex}`) || [];
+                        const item = items[list[ui].itemIndex];
+                        if (!item) continue;
+                        if (compound.addAction(item.createMoveAction(ppro.TickTime.createWithSeconds(-back))) !== false) undone += 1;
+                    } catch (e) { /* counted below */ }
+                }
+                if (undone === added) {
+                    skipped.push({
+                        filePath, instances: list.length,
+                        reason: `the host refused one of its ${list.length} moves, so the whole file was rolled back to keep its A/V together`
+                    });
+                } else {
+                    // Could not take them all back — the post-apply read-back is
+                    // the safety net, and it repairs what it can.
+                    applied += added;
+                    partial.push({ filePath, instances: actions.length, added });
+                }
+                continue;
+            }
             applied += added;
-            if (added !== actions.length) partial.push({ filePath, instances: actions.length, added });
         }
     });
 
@@ -347,6 +387,189 @@ async function verifyMovement(sequence, beforeClips, deltaByPath) {
     return report;
 }
 
+// Put a torn file back together. Detection on its own still leaves the user
+// with a broken timeline and a note about it, so this is the part that acts:
+//
+//   1. COMPLETE — nudge the instances that did not make it the rest of the way.
+//      If the host takes them, the file is both intact and synced.
+//   2. RESTORE  — if a tear survives that, move every instance of the file back
+//      to where it started. Unsynced but whole; the user can retry after
+//      unlocking the track or clearing whatever blocked the landing.
+//
+// Each attempt is its own transaction, so each is its own undo step — a user
+// undoing a repaired sync by hand needs one Ctrl/Cmd+Z per attempt. Returns
+// { attempts, repaired, restored, integrity }, where `integrity` is the
+// read-back after the last attempt: its `torn` list is what survived.
+// Costs nothing when nothing tore — it returns before the first re-scan.
+async function repairTornFiles(project, sequence, beforeClips, deltaByPath, integrity, minMoveSec) {
+    const floor = (minMoveSec === undefined) ? dsp.TEAR_REPAIR_MIN_SEC : minMoveSec;
+    const outcome = { attempts: [], repaired: [], restored: [], integrity };
+    let current = integrity;
+    let pending = (current.torn || []).filter(t => t.spreadSec > floor);
+    if (!pending.length) return outcome;
+
+    for (const mode of ["complete", "restore"]) {
+        // Always re-plan from the LATEST report: after an attempt the instances
+        // have moved, so last round's numbers no longer describe them.
+        const targets = dsp.planTearRepair(pending, mode, floor);
+        if (!targets.length) break;
+        const before = pending.map(t => t.filePath);
+
+        // planTearRepair addresses items individually on purpose — the whole
+        // point is to move one file's instances by DIFFERENT amounts so they end
+        // up level — so applyStarts' per-file all-or-nothing grouping must not
+        // apply here. A unique key per target switches it off.
+        const result = await applyStarts(
+            project, sequence,
+            targets.map((t, i) => Object.assign({}, t, { filePath: `${t.filePath}#repair${i}` })),
+            mode === "complete" ? "Syncitol: repair A/V sync" : "Syncitol: restore torn clips");
+
+        // Re-read the timeline and re-run the same comparison that found the
+        // tear, against the same original positions, so "fixed" means fixed by
+        // the one measure that matters.
+        current = await verifyMovement(sequence, beforeClips, deltaByPath);
+        pending = (current.torn || []).filter(t => t.spreadSec > floor);
+        const stillTorn = new Set(pending.map(t => t.filePath));
+        for (const filePath of before) {
+            if (stillTorn.has(filePath)) continue;
+            (mode === "complete" ? outcome.repaired : outcome.restored).push(filePath);
+        }
+        outcome.attempts.push({
+            mode, targets: targets.length, applied: result.applied,
+            fixed: before.length - pending.length
+        });
+        if (!pending.length) break;
+    }
+
+    outcome.integrity = current;
+    return outcome;
+}
+
+// Put every clip's sound back under its picture.
+//
+// The movement check (diffInstanceMovement) asks whether a file's instances
+// moved by the same amount. That is the right question about a move and the
+// wrong one about the timeline: instances can move together and still be in the
+// wrong place relative to each other, and a host that clamps or drops one move
+// — a destination blocked by a neighbour on THAT track but clear on the other —
+// produces exactly that. So after every apply we also look at where the video
+// and audio of each file actually sit, and slide the audio back under the
+// picture where they have come apart.
+//
+// Only files this apply broke are touched. A clip that arrived out of step is
+// reported, not silently "corrected" — that offset may well be deliberate.
+async function mendLinkAlignment(project, sequence, beforeAudit) {
+    const after = await scanSequence(sequence);
+    const afterAudit = dsp.auditLinkAlignment(after.clips);
+    const diff = dsp.diffLinkAlignment(beforeAudit, afterAudit);
+    const broke = diff.created.concat(diff.worsened);
+
+    const out = {
+        before: beforeAudit, after: afterAudit,
+        created: diff.created, worsened: diff.worsened, preexisting: diff.preexisting,
+        mended: [], remaining: []
+    };
+    if (!broke.length) return out;
+
+    const targets = dsp.planLinkRepair(broke);
+    if (!targets.length) return out;
+
+    // Each move is its own all-or-nothing group: these are corrections to
+    // individual items, not a file moving as one piece.
+    await applyStarts(
+        project, sequence,
+        targets.map((t, i) => Object.assign({}, t, { filePath: `${t.filePath}#link${i}` })),
+        "Syncitol: re-align clip audio");
+
+    const settled = await scanSequence(sequence);
+    const settledAudit = dsp.auditLinkAlignment(settled.clips);
+    const stillOff = new Set(settledAudit.misaligned.map(m => m.filePath));
+    for (const m of broke) {
+        (stillOff.has(m.filePath) ? out.remaining : out.mended).push(m);
+    }
+    out.after = settledAudit;
+    return out;
+}
+
+// The one road every move takes: plan the link groups, apply, read the timeline
+// back, and repair anything that came apart. `deltaByPath` is one delta per
+// source FILE; `scan` is the scan those deltas were computed against.
+//
+// The link-group step is what covers the A/V the per-file rule cannot see: a
+// video item linked to audio from a DIFFERENT file (merged clips, Synchronize,
+// a manual Clip > Link) and items whose media path would not resolve. Both used
+// to be moved apart from their partners, silently.
+const MIN_MOVE_SEC = 0.0005;
+
+async function planApplyVerify(project, sequence, scan, deltaByPath, undoLabel) {
+    const plan = dsp.planLinkGroups(scan.clips, scan.opaque, deltaByPath, 0.002);
+    // Where every clip's sound sat relative to its picture BEFORE we touched
+    // anything, so afterwards we can tell what this apply broke from what it
+    // merely inherited.
+    const beforeAudit = dsp.auditLinkAlignment(scan.clips);
+
+    // t=0 guard per FILE, run on the POST-plan deltas: unifying a group can
+    // change where a file lands. If any instance would go before zero, the whole
+    // file stays put — moving only some of its instances is the split we are
+    // here to prevent. And because a unified group only holds together while all
+    // of it moves, blocking one member blocks the group, which can block a file
+    // shared with another group: settle that before building any targets.
+    const blocked = new Set();
+    for (const c of scan.clips) {
+        const d = plan.deltas[c.filePath];
+        if (d !== undefined && c.startSec + d < 0) blocked.add(c.filePath);
+    }
+    for (let pass = 0; pass < plan.unified.length + 1; pass += 1) {
+        let grew = false;
+        for (const g of plan.unified) {
+            if (!g.paths.some(fp => blocked.has(fp))) continue;
+            for (const fp of g.paths) { if (!blocked.has(fp)) { blocked.add(fp); grew = true; } }
+        }
+        if (!grew) break;
+    }
+
+    const targets = [];
+    const requestedByPath = {};
+    for (const c of scan.clips) {
+        if (blocked.has(c.filePath)) continue;
+        const d = plan.deltas[c.filePath];
+        if (d === undefined || Math.abs(d) < MIN_MOVE_SEC) continue;
+        targets.push({ filePath: c.filePath, trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: d });
+        requestedByPath[c.filePath] = d;
+    }
+    // Unreadable items travelling with a linked partner. They are keyed by their
+    // position so applyStarts can still address them; they have no file path, so
+    // the read-back cannot check them — moving them is the whole win.
+    for (const t of plan.opaqueTargets) {
+        if ((t.groupPaths || []).some(fp => blocked.has(fp))) continue;
+        targets.push({
+            // Keyed by the file it travels with, so applyStarts treats the pair
+            // as one all-or-nothing move. A group of its own could be refused on
+            // its own and leave its partner behind — the exact split we are here
+            // to prevent.
+            filePath: t.anchorPath || `opaque:${t.trackType}:${t.trackIndex}:${t.itemIndex}`,
+            trackType: t.trackType, trackIndex: t.trackIndex, itemIndex: t.itemIndex, deltaSec: t.deltaSec
+        });
+    }
+
+    const result = await applyStarts(project, sequence, targets, undoLabel);
+    // Files applyStarts refused were never moved, so they are not expected to
+    // have shifted — drop them from the verification set.
+    for (const sk of result.skipped) delete requestedByPath[sk.filePath];
+
+    let integrity = await verifyMovement(sequence, scan.clips, requestedByPath);
+    const repair = await repairTornFiles(project, sequence, scan.clips, requestedByPath, integrity);
+    integrity = repair.integrity;
+
+    const links = await mendLinkAlignment(project, sequence, beforeAudit);
+
+    return {
+        applied: result.applied, total: targets.length,
+        skipped: result.skipped, partial: result.partial,
+        integrity, repair, links, linkPlan: plan, scanDropped: scan.dropped
+    };
+}
+
 // Match shifts (filePath -> deltaSec) to scanned clips, then move them by track
 // position. EVERY timeline instance of a file gets the same delta — a clip's
 // video and its linked audio must never move separately.
@@ -355,45 +578,23 @@ async function applyShifts(shifts, opts) {
     const project = await getActiveProject();
     const sequence = await val(project.getActiveSequence());
     const scan = await scanSequence(sequence);
-    const byPath = new Map();
-    for (const s of shifts) byPath.set(s.filePath, s.deltaSec);
-
-    // t=0 guard per FILE: if any instance would land before 0, skip the whole
-    // file — moving only some of its instances would split linked A/V.
-    const blocked = new Set();
-    for (const c of scan.clips) {
-        const d = byPath.get(c.filePath);
-        if (d !== undefined && c.startSec + d < 0) blocked.add(c.filePath);
-    }
-
-    const targets = [];
-    const requestedByPath = {};
-    for (const c of scan.clips) {
-        if (blocked.has(c.filePath)) continue;
-        const d = byPath.get(c.filePath);
-        if (d === undefined || Math.abs(d) < 0.0005) continue;
-        targets.push({ filePath: c.filePath, trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: d });
-        requestedByPath[c.filePath] = d;
-    }
-    const result = await applyStarts(project, sequence, targets, "Syncitol: align clips");
-    // Files applyStarts refused were never moved, so they are not expected to
-    // have shifted — drop them from the verification set.
-    for (const sk of result.skipped) delete requestedByPath[sk.filePath];
-    const integrity = await verifyMovement(sequence, scan.clips, requestedByPath);
-    return {
-        applied: result.applied, total: targets.length,
-        skipped: result.skipped, partial: result.partial,
-        integrity, scanDropped: scan.dropped
-    };
+    const deltaByPath = {};
+    for (const s of shifts) deltaByPath[s.filePath] = s.deltaSec;
+    return planApplyVerify(project, sequence, scan, deltaByPath, "Syncitol: align clips");
 }
 
 // ─── Build a synced sequence ──────────────────────────────────────────────────
 // Clone the active sequence (preserves track layout + A/V links), make it active,
 // then reposition every clip to its record-time offset in ONE transaction.
 // `clipPayload`: array of { filePath, trackType, trackIndex, recordStartMs, durationSec, … }
-// Each track anchors to its OWN earliest clip — a device whose clock is wrong
-// (factory reset, dead battery) won't push correctly-dated clips beyond 24 h.
-// Cross-track alignment is handled by the audio coarse + fine tune passes.
+//
+// Where a track's anchor sits is dsp.planBuildAnchors' decision: tracks whose
+// recordings overlap in clock time corroborate each other, so they share one
+// anchor and land at their true offsets from each other; a track nobody can
+// vouch for anchors to its own earliest clip and starts at 0:00, which keeps a
+// device with a wrong clock (factory reset, dead battery) from pushing
+// correctly-dated clips beyond 24 h. Either way the audio coarse + fine passes
+// have the last word — a shared anchor just starts them much closer in.
 const MAX_SPAN_SEC = 86400; // Premiere timelines cannot exceed 24 hours
 const MIN_PLACE_SEC = 0.001; // below this, a build placement delta is "already placed"
 
@@ -410,14 +611,13 @@ async function buildSyncSequence(clipPayload, baseName) {
     const active = await val(project.getActiveSequence());
 
     // ── Per-track earliest recording ─────────────────────────────────────────
+    // Where each track's 0:00 sits. Pure and deterministic, so the panel can run
+    // the same plan when it draws the Detected Clips table and get the same
+    // answer without having to be handed this one.
     const trackKeyOf = (c) => `${c.trackType}_${c.trackIndex}`;
-    const trackEarliestMs = {};
-    for (const c of clipPayload) {
-        const tk = trackKeyOf(c);
-        if (!(tk in trackEarliestMs) || c.recordStartMs < trackEarliestMs[tk]) {
-            trackEarliestMs[tk] = c.recordStartMs;
-        }
-    }
+    const layout = dsp.planBuildAnchors(clipPayload);
+    const trackEarliestMs = layout.anchorMsByTrack;
+    step(`layout: ${layout.groups.length} shared-clock group(s), ${layout.ungrouped.length} track(s) on their own`);
 
     // ── 24-hour span guard (per track) ───────────────────────────────────────
     for (const c of clipPayload) {
@@ -487,21 +687,18 @@ async function buildSyncSequence(clipPayload, baseName) {
     }
 
     step("8 applyStarts (" + scan.clips.length + " clips)");
-    const targets = [];
-    const requestedByPath = {};
-    for (const c of scan.clips) {
-        const d = deltaByPath[c.filePath];
-        if (d === undefined || Math.abs(d) < MIN_PLACE_SEC) continue;
-        targets.push({ filePath: c.filePath, trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, deltaSec: d });
-        requestedByPath[c.filePath] = d;
+    // Drop placements too small to be worth a move before the link-group pass
+    // sees them, so a sub-millisecond delta cannot look like a disagreement.
+    const placements = {};
+    for (const path in deltaByPath) {
+        if (Math.abs(deltaByPath[path]) >= MIN_PLACE_SEC) placements[path] = deltaByPath[path];
     }
-    const result = await applyStarts(project, clone, targets, "Syncitol: place by record time");
-    for (const sk of result.skipped) delete requestedByPath[sk.filePath];
-    const integrity = await verifyMovement(clone, scan.clips, requestedByPath);
+    const applied = await planApplyVerify(project, clone, scan, placements, "Syncitol: place by record time");
     return {
-        sequence: clone, name: await val(clone.name), placed: result.applied, total: scan.clips.length,
-        skipped: result.skipped, partial: result.partial,
-        integrity, scanDropped: scan.dropped
+        sequence: clone, name: await val(clone.name), placed: applied.applied, total: scan.clips.length,
+        skipped: applied.skipped, partial: applied.partial,
+        integrity: applied.integrity, repair: applied.repair, linkPlan: applied.linkPlan,
+        layout, scanDropped: applied.scanDropped
     };
 }
 
@@ -523,5 +720,6 @@ async function statMtimeMs(filePath) {
 module.exports = {
     getActiveProject, getActiveSequence, getActiveSequenceName, renameSequence,
     scanSequence, scanActiveSequence, listTracks, listActiveSequenceTracks,
-    applyStarts, applyShifts, buildSyncSequence, verifyMovement, statMtimeMs
+    applyStarts, applyShifts, buildSyncSequence, verifyMovement, repairTornFiles,
+    mendLinkAlignment, statMtimeMs
 };
