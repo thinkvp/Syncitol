@@ -1639,6 +1639,18 @@ async function comparePair(reference, target) {
         }
     }
 
+    // The mix is weak or found nothing: one channel of either file may still be
+    // the same microphone as the other side (see dsp.FINE_TUNE_MAX_CHANNELS).
+    if (!best || best.score < dsp.FINE_TUNE_DECENT_SCORE) {
+        try {
+            const channelBest = await channelMatch(reference, target, comparePlan.windows, best);
+            if (channelBest) best = channelBest;
+        } catch (e) {
+            if (e && e.cancelled) throw e;
+            // Peak files are opportunistic — the mix result stands.
+        }
+    }
+
     if (!best) {
         return {
             reference, target, usable: false,
@@ -1653,8 +1665,64 @@ async function comparePair(reference, target) {
     return {
         reference, target, usable: true,
         score: best.score, lagSec: best.lagSec, overlapSec: best.overlapSec,
-        overlapWindowSec: comparePlan.overlapSec, selectedWindow: best.window, attempts
+        overlapWindowSec: comparePlan.overlapSec, selectedWindow: best.window, attempts,
+        channels: best.refChannel !== undefined ? { ref: best.refChannel, target: best.targetChannel } : null
     };
+}
+
+// Per-channel fallback for comparePair: every pairing of the reference's
+// channels with the target's, over the same windows the mix used. Peak files
+// on BOTH sides — peak-derived and decoded envelopes are never correlated
+// against each other — so without a .pek for either file this does nothing.
+// Returns a findBestLag result tagged { refChannel, targetChannel } when it
+// clearly beats `baseline` (dsp.pickChannelMatch), else null.
+async function channelMatch(reference, target, windows, baseline) {
+    const [refPek, tgtPek] = await Promise.all([
+        pek.resolvePek(reference.filePath),
+        pek.resolvePek(target.filePath)
+    ]);
+    if (!refPek || !tgtPek) return null;
+    const refChans = dsp.fineChannelOptions(refPek.info.channels);
+    const tgtChans = dsp.fineChannelOptions(tgtPek.info.channels);
+    if (refChans.length < 2 && tgtChans.length < 2) return null; // both mono — the mix said it all
+
+    const envs = (resolved, chans, startSec, durSec) => Promise.all(chans.map(c =>
+        pek.getPekEnvelope(resolved, startSec, durSec, dsp.ENVELOPE_RATE, c)
+            .then(env => (dsp.envelopeActivity(env).usable ? env : null))));
+
+    const candidates = [];
+    for (let index = 0; index < windows.length; index += 1) {
+        throwIfCancelled();
+        const window = windows[index];
+        const [refEnvs, tgtEnvs] = await Promise.all([
+            envs(refPek, refChans, window.refSourceOffsetSec, window.compareDurationSec),
+            envs(tgtPek, tgtChans, window.targetSourceOffsetSec, window.compareDurationSec)
+        ]);
+        for (let r = 0; r < refChans.length; r += 1) {
+            if (!refEnvs[r]) continue; // a silent channel can't match anything
+            for (let t = 0; t < tgtChans.length; t += 1) {
+                if (!tgtEnvs[t]) continue;
+                const lag = dsp.findBestLag(refEnvs[r], tgtEnvs[t]);
+                if (!lag || lag.atRail) continue;
+                candidates.push({
+                    attemptIndex: index + 1, window,
+                    score: lag.score, lagSec: lag.lagSec, overlapSec: lag.overlapSec,
+                    refChannel: refChans[r], targetChannel: tgtChans[t]
+                });
+            }
+        }
+        await new Promise(resolve => setTimeout(resolve, 0)); // let the panel repaint between windows
+    }
+    return dsp.pickChannelMatch(baseline, candidates);
+}
+
+// "camA.MXF ch3" for a per-channel match; with `withTarget`, also which of the
+// target's own channels it was matched from.
+function describeMatch(pair, withTarget) {
+    const ch = pair.channels;
+    if (!ch) return pair.reference.clipName;
+    const refPart = ch.ref === null ? pair.reference.clipName : `${pair.reference.clipName} ch${ch.ref + 1}`;
+    return (withTarget && ch.target !== null) ? `${refPart} (from its ch${ch.target + 1})` : refPart;
 }
 
 // ─── Two-point check: agreement, then drift ─────────────────────────────────
@@ -1673,19 +1741,47 @@ async function comparePair(reference, target) {
 // Returns null when there is not enough overlap to place two windows, else
 // { agreement, driftSec, ppm, spanSec } with driftSec/ppm null when one of the
 // windows had nothing measurable in it.
-async function measureTwoPoints(reference, target) {
+//
+// Each point is measured the way the first match was: on the pairing it was
+// made on (`channels`, { ref, target } — see channelMatch), or on the mix with
+// the same per-channel fallback when the mix is not decent there. A mix-only
+// second point re-tests exactly the audio the channel search exists to get
+// away from: in the field it put an interviewer's questions against a lav and
+// "disagreed" by seconds on clips that were the same audio.
+async function measureTwoPoints(reference, target, channels) {
     const probe = dsp.buildDriftProbe(reference, target, dsp.FINE_TUNE_AGREE_MIN_OVERLAP_SEC);
     if (!probe) return null; // overlap too short to place two independent windows
 
-    const [refEarly, tgtEarly, refLate, tgtLate] = await Promise.all([
-        audio.getEnvelope(reference.filePath, probe.early.refSourceOffsetSec, probe.early.compareDurationSec),
-        audio.getEnvelope(target.filePath, probe.early.targetSourceOffsetSec, probe.early.compareDurationSec),
-        audio.getEnvelope(reference.filePath, probe.late.refSourceOffsetSec, probe.late.compareDurationSec),
-        audio.getEnvelope(target.filePath, probe.late.targetSourceOffsetSec, probe.late.compareDurationSec)
-    ]);
+    let refPek = null, tgtPek = null;
+    if (channels) {
+        [refPek, tgtPek] = await Promise.all([pek.resolvePek(reference.filePath), pek.resolvePek(target.filePath)]);
+        if (!refPek || !tgtPek) return null;
+    }
 
-    const early = dsp.findBestLag(refEarly, tgtEarly);
-    const late = dsp.findBestLag(refLate, tgtLate);
+    const lagAt = async (win) => {
+        if (channels) {
+            const [r, t] = await Promise.all([
+                pek.getPekEnvelope(refPek, win.refSourceOffsetSec, win.compareDurationSec, dsp.ENVELOPE_RATE, channels.ref),
+                pek.getPekEnvelope(tgtPek, win.targetSourceOffsetSec, win.compareDurationSec, dsp.ENVELOPE_RATE, channels.target)
+            ]);
+            return dsp.findBestLag(r, t);
+        }
+        const [r, t] = await Promise.all([
+            audio.getEnvelope(reference.filePath, win.refSourceOffsetSec, win.compareDurationSec),
+            audio.getEnvelope(target.filePath, win.targetSourceOffsetSec, win.compareDurationSec)
+        ]);
+        const mix = dsp.findBestLag(r, t);
+        if (mix && !mix.atRail && mix.score >= dsp.FINE_TUNE_DECENT_SCORE) return mix;
+        try {
+            const viaChannel = await channelMatch(reference, target, [win], (mix && !mix.atRail) ? mix : null);
+            if (viaChannel) return viaChannel;
+        } catch (e) {
+            if (e && e.cancelled) throw e;
+        }
+        return mix;
+    };
+
+    const [early, late] = await Promise.all([lagAt(probe.early), lagAt(probe.late)]);
     const agreement = dsp.judgeTwoPointAgreement(early, late, probe.spanSec);
     const out = { agreement, spanSec: probe.spanSec, driftSec: null, ppm: null };
     if (agreement.verdict === "inconclusive") return out;
@@ -1694,6 +1790,102 @@ async function measureTwoPoints(reference, target) {
     out.driftSec = Math.round(driftSec * 1000) / 1000;
     out.ppm = Math.round((driftSec / probe.spanSec) * 1e6);
     return out;
+}
+
+// ─── Wide per-clip re-search ──────────────────────────────────────────────────
+// For a clip the fine pass could not place: see dsp.FINE_WIDE_REACH_SEC. Each
+// probe slides a stretch of the target across ±reach of the reference at the
+// coarse envelope rate, one channel pairing at a time from the peak files when
+// both have one (else the decoded mix on both sides — never one of each).
+// Returns dsp.judgeWideSearch's { deltaSec, score, agreed } or null.
+async function wideSearch(reference, target) {
+    const probes = dsp.planWideSearch(reference, target);
+    if (!probes.length) return null;
+    const [refPek, tgtPek] = await Promise.all([pek.resolvePek(reference.filePath), pek.resolvePek(target.filePath)]);
+    const usePek = !!(refPek && tgtPek);
+    const refChans = usePek ? dsp.fineChannelOptions(refPek.info.channels) : [null];
+    const tgtChans = usePek ? dsp.fineChannelOptions(tgtPek.info.channels) : [null];
+    const envOpts = { sampleRate: COARSE_SAMPLE_RATE, windowSamples: COARSE_WINDOW_SAMPLES };
+    const envs = (anchor, resolved, chans, startSec, durSec) => Promise.all(chans.map(c =>
+        (usePek
+            ? pek.getPekEnvelope(resolved, startSec, durSec, COARSE_ENVELOPE_RATE, c)
+            : audio.getEnvelope(anchor.filePath, startSec, durSec, envOpts))
+            .then(env => (dsp.envelopeActivity(env).usable ? env : null))));
+
+    const points = [];
+    for (const probe of probes) {
+        throwIfCancelled();
+        const [refEnvs, tgtEnvs] = await Promise.all([
+            envs(reference, refPek, refChans, probe.refSourceOffsetSec, probe.refDurSec),
+            envs(target, tgtPek, tgtChans, probe.targetSourceOffsetSec, probe.probeDurSec)
+        ]);
+        let best = null;
+        for (let r = 0; r < refChans.length; r += 1) {
+            if (!refEnvs[r]) continue;
+            for (let t = 0; t < tgtChans.length; t += 1) {
+                if (!tgtEnvs[t]) continue;
+                const m = dsp.slideMatch(refEnvs[r], tgtEnvs[t], {
+                    envelopeRate: COARSE_ENVELOPE_RATE, minOverlapSec: probe.probeDurSec * 0.8
+                });
+                if (m && (!best || m.score > best.score)) best = m;
+            }
+        }
+        if (best) points.push({ score: best.score, deltaSec: dsp.wideProbeDelta(probe, best.lagSec) });
+        await new Promise(resolve => setTimeout(resolve, 0)); // let the panel repaint between probes
+    }
+    return dsp.judgeWideSearch(points, probes.length);
+}
+
+// The fine pass failed to place `target` from where it sits: search wider,
+// move it there, and run the whole fine pass again (`attempt`), so the result
+// still has to clear every gate an ordinary match does — score, rail, and the
+// two-point agreement on long clips. Undone if it doesn't. Returns the outcome
+// to report, which is `first` unchanged when nothing better was found.
+async function widenAndRetry(target, first, attempt, placed) {
+    let wide = null;
+    try {
+        for (const reference of first.overlapRefs) {
+            wide = await wideSearch(reference, target);
+            if (wide) break;
+        }
+    } catch (e) {
+        if (e && e.cancelled) throw e;
+        wide = null; // the wide search is opportunistic — the first outcome stands
+    }
+    if (!wide || Math.abs(wide.deltaSec) < dsp.FINE_TUNE_MIN_APPLY_SEC) return first;
+
+    target.resolvedStartSec += wide.deltaSec;
+    target.resolvedEndSec += wide.deltaSec;
+    const second = await attempt();
+    if (!placed(second)) {
+        target.resolvedStartSec -= wide.deltaSec;
+        target.resolvedEndSec -= wide.deltaSec;
+        first.lines.push([`ℹ ${target.clipName}: a wider ±${dsp.FINE_WIDE_REACH_SEC}s search pointed ${formatSignedSeconds(wide.deltaSec)} away, but the fine pass could not confirm it there — left in place.`, "info"]);
+        return first;
+    }
+
+    // The second attempt's own shift (if any) is already on the clip.
+    const fineSec = second.adjustment ? second.adjustment.deltaSec : 0;
+    const total = Math.round((wide.deltaSec + fineSec) * 1000) / 1000;
+    const lines = first.lines.concat(
+        [[`↻ ${target.clipName}: outside the fine pass's ±${dsp.FINE_TUNE_MAX_SHIFT_SEC}s reach — a wider ±${dsp.FINE_WIDE_REACH_SEC}s search puts it ${formatSignedSeconds(wide.deltaSec)} from where it sat (${wide.agreed} probe${wide.agreed !== 1 ? "s" : ""} agree, score ${wide.score.toFixed(2)}). Fine-tuning from there:`, "info"]],
+        second.lines,
+        [[`✓ ${target.clipName}: total shift ${formatSignedSeconds(total)}`, "success"]]);
+    const row = second.row;
+    if (Math.abs(total) < dsp.FINE_TUNE_MIN_APPLY_SEC) {
+        row.status = "aligned";
+        delete row.deltaSec;
+        return { ...second, lines, row, adjustment: null };
+    }
+    row.status = "shifted";
+    row.deltaSec = total;
+    return {
+        ...second, lines, row,
+        adjustment: {
+            clipName: target.clipName, filePath: target.filePath, deltaSec: total,
+            referenceName: row.method, score: row.score
+        }
+    };
 }
 
 async function analyzeFineTune(anchors, onProgress) {
@@ -1713,111 +1905,125 @@ async function analyzeFineTune(anchors, onProgress) {
     notes.push(`Fine tune compare window: up to ${dsp.FINE_TUNE_MAX_COMPARE_SEC}s per pair, max shift ±${dsp.FINE_TUNE_MAX_SHIFT_SEC}s, retries on an alternate window when first-window score is below ${dsp.FINE_TUNE_DECENT_SCORE.toFixed(2)}; ${SYNC_CONCURRENCY} clips at a time.`);
 
     const outcomes = await mapPool(targets, SYNC_CONCURRENCY, async ({ target, targetIndex }) => {
-        let bestPair = null;
-        const pairDiagnostics = [];
-        let railKept = false;    // a comparison matched only at the ±max-shift rail
-        let hadOverlap = false;  // some reference actually covered this clip
-        for (let refIndex = 0; refIndex < targetIndex; refIndex += 1) {
-            const reference = anchors[refIndex];
-            if (reference.layerOrder >= target.layerOrder) continue;
+        // One full fine-pass attempt from wherever the clip sits right now. It
+        // runs again, once, after the wide re-search below moves the clip.
+        const attempt = async () => {
+            let bestPair = null;
+            const pairDiagnostics = [];
+            let railKept = false;    // a comparison matched only at the ±max-shift rail
+            let hadOverlap = false;  // some reference actually covered this clip
+            const overlapRefs = [];  // references that cover it, for the wide re-search
+            for (let refIndex = 0; refIndex < targetIndex; refIndex += 1) {
+                const reference = anchors[refIndex];
+                if (reference.layerOrder >= target.layerOrder) continue;
 
-            const result = await comparePair(reference, target);
-            if (!result || !result.usable) {
-                if (result && !result.noOverlap) hadOverlap = true;
-                if (result && result.reason) pairDiagnostics.push(`${dsp.describeAnchor(reference)}: ${result.reason}`);
-                if (result && result.railRejected) railKept = true;
-                continue;
+                const result = await comparePair(reference, target);
+                if (result && !result.noOverlap) overlapRefs.push(reference);
+                if (!result || !result.usable) {
+                    if (result && !result.noOverlap) hadOverlap = true;
+                    if (result && result.reason) pairDiagnostics.push(`${dsp.describeAnchor(reference)}: ${result.reason}`);
+                    if (result && result.railRejected) railKept = true;
+                    continue;
+                }
+                hadOverlap = true;
+                if (!bestPair || result.score > bestPair.score) bestPair = result;
             }
-            hadOverlap = true;
-            if (!bestPair || result.score > bestPair.score) bestPair = result;
-        }
 
-        // Buffer this clip's lines so concurrent clips stay as intact blocks.
-        const lines = [];
-        let adjustment = null;
-        // filePath and trackKey let the rescue pass below reason about the
-        // track as a whole rather than about one clip at a time.
-        const row = {
-            scope: "clip", label: target.clipName,
-            filePath: target.filePath, trackKey: trackKeyOf(target)
+            // Buffer this clip's lines so concurrent clips stay as intact blocks.
+            const lines = [];
+            let adjustment = null;
+            // filePath and trackKey let the rescue pass below reason about the
+            // track as a whole rather than about one clip at a time.
+            const row = {
+                scope: "clip", label: target.clipName,
+                filePath: target.filePath, trackKey: trackKeyOf(target)
+            };
+
+            if (!bestPair && railKept) {
+                lines.push([`↳ ${target.clipName}: kept coarse alignment — fine-tune match was unreliable (pinned to ±${dsp.FINE_TUNE_MAX_SHIFT_SEC}s limit)`, "info"]);
+                row.status = "kept";
+                row.detail = "fine match unreliable — kept coarse alignment";
+            } else if (!bestPair) {
+                const detail = pairDiagnostics.length ? ` (${pairDiagnostics[0]})` : "";
+                lines.push([`⚠ Skip ${target.clipName}: no usable overlap/match${detail}`, "warn"]);
+                row.status = "unmatched";
+                // No reference recording covers this clip, so it never had a chance.
+                // That is a gap in the reference, not evidence about this track.
+                row.outOfRange = !hadOverlap;
+                row.detail = hadOverlap
+                    ? (pairDiagnostics.length ? pairDiagnostics[0] : "no usable match")
+                    : "no reference recording covers this clip";
+            } else if (bestPair.score < dsp.FINE_TUNE_MIN_SCORE) {
+                lines.push([`⚠ Skip ${target.clipName}: weak match score ${bestPair.score.toFixed(2)} vs ${describeMatch(bestPair, true)}`, "warn"]);
+                row.status = "weak";
+                row.score = bestPair.score;
+                row.method = describeMatch(bestPair);
+            } else {
+                // Positive lag means target starts later than reference — move it earlier.
+                const deltaSec = -(bestPair.lagSec);
+                row.score = bestPair.score;
+                row.method = describeMatch(bestPair);
+                let appliedDelta = 0;
+                if (Math.abs(deltaSec) < dsp.FINE_TUNE_MIN_APPLY_SEC) {
+                    lines.push([`${target.clipName} already aligned (delta < 20 ms)`, "info"]);
+                    row.status = "aligned";
+                } else {
+                    const roundedDelta = Math.round(deltaSec * 1000) / 1000;
+                    adjustment = {
+                        clipName: target.clipName,
+                        filePath: target.filePath,
+                        deltaSec: roundedDelta,
+                        referenceName: describeMatch(bestPair),
+                        score: bestPair.score
+                    };
+                    appliedDelta = roundedDelta;
+                    target.resolvedStartSec += roundedDelta;
+                    target.resolvedEndSec += roundedDelta;
+                    lines.push([`✓ ${target.clipName}: shift ${formatSignedSeconds(roundedDelta)} vs ${describeMatch(bestPair, true)} (score ${bestPair.score.toFixed(2)}, ${bestPair.attempts.length} window${bestPair.attempts.length !== 1 ? "s" : ""})`, "success"]);
+                    row.status = "shifted";
+                    row.deltaSec = roundedDelta;
+                }
+
+                // Long overlap: make the match prove itself at a second point near
+                // the other end before it is allowed to stand, and read the clock
+                // drift off the same two measurements.
+                try {
+                    const two = await measureTwoPoints(bestPair.reference, target, bestPair.channels);
+                    if (two && two.agreement.verdict === "disagree") {
+                        // The two ends of the overlap describe different alignments,
+                        // so whatever correlated was not shared audio. Undo it.
+                        if (appliedDelta) {
+                            target.resolvedStartSec -= appliedDelta;
+                            target.resolvedEndSec -= appliedDelta;
+                        }
+                        adjustment = null;
+                        lines.push([`⚠ Skip ${target.clipName}: the match vs ${describeMatch(bestPair, true)} scored ${bestPair.score.toFixed(2)} at one point but a second window ${formatDuration(two.spanSec * 1000)} later disagrees by ${two.agreement.disagreeSec.toFixed(2)}s (tolerance ${two.agreement.tolSec.toFixed(2)}s) — the two are not the same audio. Left in place.`, "warn"]);
+                        row.status = "unmatched";
+                        delete row.deltaSec;
+                        row.detail = `rejected: the two ends of the overlap disagree by ${two.agreement.disagreeSec.toFixed(2)}s`;
+                    } else if (two && two.driftSec !== null) {
+                        row.driftSec = two.driftSec;
+                        row.driftPpm = two.ppm;
+                        if (Math.abs(two.driftSec) >= dsp.DRIFT_MIN_REPORT_SEC) {
+                            lines.push([`⚠ ${target.clipName}: clock drift ${formatSignedSeconds(two.driftSec)} across ${formatDuration(two.spanSec * 1000)} (~${two.ppm} ppm) vs ${describeMatch(bestPair)} — the tail may be audibly off; consider splitting long clips before syncing.`, "warn"]);
+                        }
+                    } else if (two && two.agreement.verdict === "inconclusive" && bestPair.overlapWindowSec >= dsp.FINE_TUNE_AGREE_MIN_OVERLAP_SEC) {
+                        lines.push([`ℹ ${target.clipName}: could not second-guess the match — the other end of the overlap had no usable audio.`, "info"]);
+                    }
+                } catch (e) {
+                    if (e && e.cancelled) throw e;
+                    // The second point is best-effort — never fail the clip over it.
+                }
+            }
+            return { lines, row, adjustment, hadOverlap, overlapRefs };
         };
 
-        if (!bestPair && railKept) {
-            lines.push([`↳ ${target.clipName}: kept coarse alignment — fine-tune match was unreliable (pinned to ±${dsp.FINE_TUNE_MAX_SHIFT_SEC}s limit)`, "info"]);
-            row.status = "kept";
-            row.detail = "fine match unreliable — kept coarse alignment";
-        } else if (!bestPair) {
-            const detail = pairDiagnostics.length ? ` (${pairDiagnostics[0]})` : "";
-            lines.push([`⚠ Skip ${target.clipName}: no usable overlap/match${detail}`, "warn"]);
-            row.status = "unmatched";
-            // No reference recording covers this clip, so it never had a chance.
-            // That is a gap in the reference, not evidence about this track.
-            row.outOfRange = !hadOverlap;
-            row.detail = hadOverlap
-                ? (pairDiagnostics.length ? pairDiagnostics[0] : "no usable match")
-                : "no reference recording covers this clip";
-        } else if (bestPair.score < dsp.FINE_TUNE_MIN_SCORE) {
-            lines.push([`⚠ Skip ${target.clipName}: weak match score ${bestPair.score.toFixed(2)} vs ${bestPair.reference.clipName}`, "warn"]);
-            row.status = "weak";
-            row.score = bestPair.score;
-            row.method = bestPair.reference.clipName;
-        } else {
-            // Positive lag means target starts later than reference — move it earlier.
-            const deltaSec = -(bestPair.lagSec);
-            row.score = bestPair.score;
-            row.method = bestPair.reference.clipName;
-            let appliedDelta = 0;
-            if (Math.abs(deltaSec) < dsp.FINE_TUNE_MIN_APPLY_SEC) {
-                lines.push([`${target.clipName} already aligned (delta < 20 ms)`, "info"]);
-                row.status = "aligned";
-            } else {
-                const roundedDelta = Math.round(deltaSec * 1000) / 1000;
-                adjustment = {
-                    clipName: target.clipName,
-                    filePath: target.filePath,
-                    deltaSec: roundedDelta,
-                    referenceName: bestPair.reference.clipName,
-                    score: bestPair.score
-                };
-                appliedDelta = roundedDelta;
-                target.resolvedStartSec += roundedDelta;
-                target.resolvedEndSec += roundedDelta;
-                lines.push([`✓ ${target.clipName}: shift ${formatSignedSeconds(roundedDelta)} vs ${bestPair.reference.clipName} (score ${bestPair.score.toFixed(2)}, ${bestPair.attempts.length} window${bestPair.attempts.length !== 1 ? "s" : ""})`, "success"]);
-                row.status = "shifted";
-                row.deltaSec = roundedDelta;
-            }
-
-            // Long overlap: make the match prove itself at a second point near
-            // the other end before it is allowed to stand, and read the clock
-            // drift off the same two measurements.
-            try {
-                const two = await measureTwoPoints(bestPair.reference, target);
-                if (two && two.agreement.verdict === "disagree") {
-                    // The two ends of the overlap describe different alignments,
-                    // so whatever correlated was not shared audio. Undo it.
-                    if (appliedDelta) {
-                        target.resolvedStartSec -= appliedDelta;
-                        target.resolvedEndSec -= appliedDelta;
-                    }
-                    adjustment = null;
-                    lines.push([`⚠ Skip ${target.clipName}: the match vs ${bestPair.reference.clipName} scored ${bestPair.score.toFixed(2)} at one point but a second window ${formatDuration(two.spanSec * 1000)} later disagrees by ${formatDuration(two.agreement.disagreeSec * 1000)} (tolerance ${formatDuration(two.agreement.tolSec * 1000)}) — the two are not the same audio. Left in place.`, "warn"]);
-                    row.status = "unmatched";
-                    delete row.deltaSec;
-                    row.detail = `rejected: the two ends of the overlap disagree by ${two.agreement.disagreeSec.toFixed(2)}s`;
-                } else if (two && two.driftSec !== null) {
-                    row.driftSec = two.driftSec;
-                    row.driftPpm = two.ppm;
-                    if (Math.abs(two.driftSec) >= dsp.DRIFT_MIN_REPORT_SEC) {
-                        lines.push([`⚠ ${target.clipName}: clock drift ${formatSignedSeconds(two.driftSec)} across ${formatDuration(two.spanSec * 1000)} (~${two.ppm} ppm) vs ${bestPair.reference.clipName} — the tail may be audibly off; consider splitting long clips before syncing.`, "warn"]);
-                    }
-                } else if (two && two.agreement.verdict === "inconclusive" && bestPair.overlapWindowSec >= dsp.FINE_TUNE_AGREE_MIN_OVERLAP_SEC) {
-                    lines.push([`ℹ ${target.clipName}: could not second-guess the match — the other end of the overlap had no usable audio.`, "info"]);
-                }
-            } catch (e) {
-                if (e && e.cancelled) throw e;
-                // The second point is best-effort — never fail the clip over it.
-            }
+        let outcome = await attempt();
+        const placed = (o) => !!o.adjustment || o.row.status === "aligned";
+        if (!placed(outcome) && outcome.overlapRefs.length) {
+            outcome = await widenAndRetry(target, outcome, attempt, placed);
         }
+        const { lines, row, adjustment } = outcome;
 
         doneCount += 1;
         log(`Fine tune: [${doneCount}/${nonBaseTotal}] ${target.clipName} (${target.trackType.toUpperCase()} ${target.trackIndex + 1})`);
@@ -2092,8 +2298,8 @@ function reportApplyIntegrity(result, rows) {
                 `"correcting" an offset that may be deliberate.`, "warn");
         }
         if (links.after && links.after.ambiguous.length) {
-            log(`ℹ ${links.after.ambiguous.length} file(s) appear more than once on a track, so their audio could not be ` +
-                `checked against their video automatically.`, "info");
+            log(`ℹ ${links.after.ambiguous.length} file(s) have more than one video or audio instance (multi-channel audio on separate tracks, or a clip cut ` +
+                `into pieces), so their audio could not be checked against their video automatically.`, "info");
         }
     }
 

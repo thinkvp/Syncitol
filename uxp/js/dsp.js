@@ -54,6 +54,48 @@
     var FINE_TUNE_WINDOW_POSITIONS = [0.5, 0.2];
     var FINE_TUNE_DECENT_SCORE = 0.7;
 
+    // ─── Per-channel fine tune ────────────────────────────────────────────────
+    // The decoder hands the fine pass ONE audio stream downmixed to mono. On a
+    // pro camera that is channel 1 — usually a lav — while the other camera
+    // only has its internal mic. A lav hears its wearer and barely anyone else;
+    // an internal mic hears the whole room at similar levels, so any window
+    // holding an interviewer's questions or crosstalk correlates weakly or a
+    // few frames wrong, even though the camera's OWN internal-mic channel would
+    // match almost perfectly. When the mix comparison is not decent, every
+    // channel pairing is tried from the peak files instead.
+    //
+    // Cap per side, so a 16-channel recorder cannot blow up into 256 pairings.
+    var FINE_TUNE_MAX_CHANNELS = 8;
+    // Taking the best of many pairings flatters the winner — chance alone finds
+    // something that scores a little higher than the mix. A channel match must
+    // beat the mix (or the minimum score, whichever is higher) by this much.
+    var FINE_TUNE_CHANNEL_MIN_GAIN = 0.1;
+
+    // ─── Wide per-clip re-search ──────────────────────────────────────────────
+    // The coarse pass gives a whole track ONE offset, and the fine pass only
+    // reaches ±FINE_TUNE_MAX_SHIFT_SEC around it. A device's own clips do not
+    // all sit at that offset: timestamps have whole-second resolution, the two
+    // clocks drift apart over a day of shooting, and now and then one clip's
+    // timestamp is simply off. In the field an A7S3 ran 64–71 s behind an FX6
+    // across the day, with two clips at 55 s and 79 s — 12 s outside reach, so
+    // the fine pass matched noise and the clips were never synced. A clip the
+    // fine pass cannot place is therefore searched again over a wider span, at
+    // the coarse envelope rate, from several probe windows that must agree.
+    var FINE_WIDE_REACH_SEC = 30;        // ± searched around the clip's current place
+    var FINE_WIDE_PROBE_SEC = 20;        // target audio per probe
+    var FINE_WIDE_MIN_PROBE_SEC = 8;     // shorter overlaps cannot hold a probe worth trusting
+    var FINE_WIDE_PROBES = 3;            // probes spread across the overlap
+    var FINE_WIDE_MIN_SCORE = 0.5;       // per probe
+    var FINE_WIDE_AGREE_TOL_SEC = 0.3;   // ~3 frames of the 10 Hz envelope
+    // A lone probe (an overlap too short for two) has nothing to confirm it, so
+    // it has to score well on its own.
+    var FINE_WIDE_LONE_MIN_SCORE = 0.75;
+
+    // The rescue pass hands a track's consensus residual to clips the fine pass
+    // could not match — only when the matched clips agree this tightly. See
+    // summarizeTrackResiduals.
+    var FINE_RESCUE_MAX_SPREAD_SEC = 0.15;
+
     // ─── Two-point agreement ──────────────────────────────────────────────────
     // One window, however well it scores, only proves the two files share THAT
     // stretch of audio. On a long recording that is weak evidence: a repeated
@@ -810,17 +852,35 @@
         // A link group is a V/A pair, so demand both media types and more than
         // one track. Same-type coincidences (two cameras, a stereo pair split
         // over A1/A2) are not link groups and must not be touched.
+        //
+        // And it must hold something the per-file delta does not already carry:
+        // audio from a file with no picture in the group, or an unreadable item.
+        // Two cameras trimmed to the same in/out each bring their own audio —
+        // every member follows its own file's picture — so the group is two
+        // cameras that happen to line up, not a link to enforce. Treating it as
+        // one demanded both pictures share a shift, and blocked every pair.
         var candidates = [];
         for (k = 0; k < groups.length; k += 1) {
             var g = groups[k];
-            var hasVideo = false, hasAudio = false, tracks = {};
-            for (var m = 0; m < g.length; m += 1) {
-                if (g[m].trackType === "video") hasVideo = true; else hasAudio = true;
+            var hasVideo = false, hasAudio = false, tracks = {}, pictured = {};
+            var m;
+            for (m = 0; m < g.length; m += 1) {
+                if (g[m].trackType === "video") {
+                    hasVideo = true;
+                    if (g[m].filePath) pictured[g[m].filePath] = true;
+                } else {
+                    hasAudio = true;
+                }
                 tracks[g[m].trackType + "_" + g[m].trackIndex] = true;
             }
             var trackCount = 0;
             for (var tkey in tracks) { if (Object.prototype.hasOwnProperty.call(tracks, tkey)) trackCount += 1; }
-            if (hasVideo && hasAudio && trackCount > 1) candidates.push(g);
+            if (!hasVideo || !hasAudio || trackCount < 2) continue;
+            var carried = false;
+            for (m = 0; m < g.length; m += 1) {
+                if (g[m].opaque || !Object.prototype.hasOwnProperty.call(pictured, g[m].filePath)) { carried = true; break; }
+            }
+            if (carried) candidates.push(g);
         }
         if (!candidates.length) return result;
 
@@ -1846,6 +1906,102 @@
         };
     }
 
+    // Channel options for one side of a per-channel comparison: each channel on
+    // its own (capped), or [null] — the averaged mix — for a mono file, where
+    // there is nothing to separate.
+    function fineChannelOptions(channelCount) {
+        var n = Math.min(channelCount || 1, FINE_TUNE_MAX_CHANNELS);
+        if (n <= 1) return [null];
+        var out = [];
+        for (var c = 0; c < n; c += 1) out.push(c);
+        return out;
+    }
+
+    // Decide whether a per-channel match replaces the mix match. `baseline` is
+    // the mix result ({ score }) or null when the mix found nothing usable;
+    // `candidates` are findBestLag results tagged { refChannel, targetChannel },
+    // already stripped of rail hits. Returns the winning candidate, or null to
+    // keep the baseline.
+    function pickChannelMatch(baseline, candidates, minGain) {
+        var gain = (minGain === undefined || minGain === null) ? FINE_TUNE_CHANNEL_MIN_GAIN : minGain;
+        var best = null;
+        for (var i = 0; i < (candidates || []).length; i += 1) {
+            var c = candidates[i];
+            if (!c || c.atRail || typeof c.score !== "number") continue;
+            if (!best || c.score > best.score) best = c;
+        }
+        if (!best) return null;
+        var floor = Math.max(baseline ? baseline.score : -Infinity, FINE_TUNE_MIN_SCORE);
+        return best.score >= floor + gain ? best : null;
+    }
+
+    // Probe windows for the wide re-search (see FINE_WIDE_REACH_SEC). Each probe
+    // is a stretch of the target inside the timeline overlap, paired with the
+    // reference audio from `reachSec` before it to `reachSec` after it (clamped
+    // to the reference recording). Anchors are { inPointSec, resolvedStartSec,
+    // resolvedEndSec }. Returns [] when the overlap cannot hold a probe.
+    function planWideSearch(reference, target, opts) {
+        opts = opts || {};
+        var reach = opts.reachSec || FINE_WIDE_REACH_SEC;
+        var count = opts.count || FINE_WIDE_PROBES;
+        var oStart = Math.max(reference.resolvedStartSec, target.resolvedStartSec);
+        var oEnd = Math.min(reference.resolvedEndSec, target.resolvedEndSec);
+        var overlap = oEnd - oStart;
+        var probeSec = Math.min(opts.probeSec || FINE_WIDE_PROBE_SEC, overlap);
+        if (!(probeSec >= FINE_WIDE_MIN_PROBE_SEC)) return [];
+
+        var slack = overlap - probeSec;
+        var n = Math.max(1, Math.min(count, Math.floor(overlap / probeSec)));
+        var out = [];
+        for (var i = 0; i < n; i += 1) {
+            var t = oStart + slack * ((i + 1) / (n + 1));
+            if (n === 1) t = oStart + slack / 2;
+            var r0 = Math.max(reference.resolvedStartSec, t - reach);
+            var r1 = Math.min(reference.resolvedEndSec, t + probeSec + reach);
+            out.push({
+                targetTimelineSec: t,
+                targetSourceOffsetSec: target.inPointSec + (t - target.resolvedStartSec),
+                probeDurSec: probeSec,
+                refTimelineSec: r0,
+                refSourceOffsetSec: reference.inPointSec + (r0 - reference.resolvedStartSec),
+                refDurSec: r1 - r0
+            });
+        }
+        return out;
+    }
+
+    // slideMatch on a probe puts the target's audio `lagSec` into the reference
+    // window — that is where on the timeline it belongs. Returns how far to MOVE
+    // the target (positive = later).
+    function wideProbeDelta(probe, lagSec) {
+        return Math.round((probe.refTimelineSec + lagSec - probe.targetTimelineSec) * 1000) / 1000;
+    }
+
+    // Combine the probes. `points` are { deltaSec, score } (one per probe that
+    // found anything). Two or more probes must agree within the tolerance, and
+    // they must outnumber the probes that found something else; a single probe
+    // stands only when it is the only one the overlap could hold. Returns
+    // { deltaSec, score, agreed } or null.
+    function judgeWideSearch(points, probeCount) {
+        var good = [];
+        for (var i = 0; i < (points || []).length; i += 1) {
+            if (points[i] && isFinite(points[i].deltaSec) && points[i].score >= FINE_WIDE_MIN_SCORE) good.push(points[i]);
+        }
+        if (!good.length) return null;
+        if ((probeCount || good.length) === 1) {
+            var lone = good[0];
+            return lone.score >= FINE_WIDE_LONE_MIN_SCORE ? { deltaSec: lone.deltaSec, score: lone.score, agreed: 1 } : null;
+        }
+        var cluster = largestCluster(good.map(function (p) { return p.deltaSec; }), FINE_WIDE_AGREE_TOL_SEC);
+        if (!cluster || cluster.members.length < 2 || cluster.members.length * 2 <= good.length) return null;
+        var lo = cluster.members[0], hi = cluster.members[cluster.members.length - 1];
+        var best = 0;
+        for (i = 0; i < good.length; i += 1) {
+            if (good[i].deltaSec >= lo && good[i].deltaSec <= hi && good[i].score > best) best = good[i].score;
+        }
+        return { deltaSec: cluster.centre, score: best, agreed: cluster.members.length };
+    }
+
     // ─── Cross-clip corroboration ─────────────────────────────────────────────
     // The coarse pass matches ONE clip per track and then shifts every clip on
     // that track by what it found. That is a track-wide claim resting on a single
@@ -1974,10 +2130,20 @@
         }
         if (!out.total) return out;
 
+        // The cluster is found loosely (`tol`), but it is only a consensus if it
+        // is TIGHT: a coarse offset that was off puts every clip out by the same
+        // amount, to within a frame or two. Residuals spread across a second or
+        // more mean each clip sits at its own offset (per-clip timestamps, clock
+        // drift over the day), and their middle value is a guess that fits none
+        // of the clips that failed — in the field it handed +0.41 s to a clip
+        // that was 12 s out.
         var cluster = largestCluster(deltas, tol);
         if (cluster && cluster.members.length >= 2) {
-            out.consensusDeltaSec = cluster.centre;
-            out.consensusCount = cluster.members.length;
+            out.consensusSpreadSec = cluster.spreadSec;
+            if (cluster.spreadSec <= FINE_RESCUE_MAX_SPREAD_SEC) {
+                out.consensusDeltaSec = cluster.centre;
+                out.consensusCount = cluster.members.length;
+            }
         }
         // More of the track failed than matched, counting only the clips that
         // had a reference to fail against. One clip failing is ordinary; half a
@@ -2002,6 +2168,18 @@
         FINE_TUNE_MIN_APPLY_SEC: FINE_TUNE_MIN_APPLY_SEC,
         FINE_TUNE_WINDOW_POSITIONS: FINE_TUNE_WINDOW_POSITIONS,
         FINE_TUNE_DECENT_SCORE: FINE_TUNE_DECENT_SCORE,
+        FINE_TUNE_MAX_CHANNELS: FINE_TUNE_MAX_CHANNELS,
+        FINE_TUNE_CHANNEL_MIN_GAIN: FINE_TUNE_CHANNEL_MIN_GAIN,
+        fineChannelOptions: fineChannelOptions,
+        pickChannelMatch: pickChannelMatch,
+        FINE_WIDE_REACH_SEC: FINE_WIDE_REACH_SEC,
+        FINE_WIDE_MIN_SCORE: FINE_WIDE_MIN_SCORE,
+        FINE_WIDE_AGREE_TOL_SEC: FINE_WIDE_AGREE_TOL_SEC,
+        FINE_WIDE_LONE_MIN_SCORE: FINE_WIDE_LONE_MIN_SCORE,
+        FINE_RESCUE_MAX_SPREAD_SEC: FINE_RESCUE_MAX_SPREAD_SEC,
+        planWideSearch: planWideSearch,
+        wideProbeDelta: wideProbeDelta,
+        judgeWideSearch: judgeWideSearch,
         FINE_TUNE_AGREE_MIN_OVERLAP_SEC: FINE_TUNE_AGREE_MIN_OVERLAP_SEC,
         FINE_TUNE_AGREE_BASE_TOL_SEC: FINE_TUNE_AGREE_BASE_TOL_SEC,
         COARSE_MULTI_PROBE_MIN_SEC: COARSE_MULTI_PROBE_MIN_SEC,

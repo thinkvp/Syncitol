@@ -9,6 +9,57 @@ The earlier internal history is a **separate 1.x line** that ran to its own
 1.4.0 before that reset — unrelated to the 1.4.0 below — and is preserved in
 [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
+## [1.7.0] - 2026-10-30
+
+### Fixed
+- **Interviews shot on a multi-channel camera synced some clips well and
+  others a few frames off.** The fine pass only ever heard the camera's first
+  audio stream, usually a lav. A lav hears its wearer and barely anyone else,
+  but the other camera's internal mic hears the whole room. So any window full
+  of an interviewer's questions or crosstalk had little to line up with, and
+  scored weakly or a little wrong. A camera's own internal-mic channel would
+  have matched almost perfectly.
+
+  When the mix comparison scores below 0.70, the fine pass now tries every
+  pairing of the two files' channels from Premiere's peak files (up to 8 per
+  side). It takes a channel match only if it beats the mix by at least 0.10,
+  since picking the best of many pairings flatters the winner. The two-point
+  agreement check then re-tests the match on the same channels. The log names
+  the pairing, e.g. `vs C0012.MXF ch3 (from its ch1)`. Clips whose mix already
+  matched well are untouched. When either file has no peak file, nothing
+  changes.
+- **Two cameras trimmed to the same in/out were never synced.** The link-group
+  check treats items with matching start and end across video and audio as
+  one linked group, and needs every picture in a group to share one shift.
+  Two camera clips cut to the same span looked exactly like that, so each pair
+  was logged "Left alone … linked but need different shifts". In the field
+  log that blocked 19 of 23 pairs, and the run adjusted 0 clips. A group is
+  now only enforced when it holds audio from a file with no picture in the
+  group, or an unreadable item, which is what a real cross-file link is. Each
+  camera's own audio already moves with its picture.
+- **The second-point check rejected good matches on the mixed audio.** It now
+  measures on the channel pairing the match was made on. On a mix match, each
+  point gets the per-channel fallback when the mix scores below 0.70.
+  Rejection lines also show the disagreement and tolerance to the hundredth of
+  a second instead of rounding them to "0s".
+- **A clip more than 5 s from where the track's offset put it could never be
+  synced.** The coarse pass gives a whole track one offset, and the fine pass
+  only reaches ±5 s around it. But a device's clips don't all sit at one
+  offset: timestamps have whole-second resolution, two clocks drift apart over
+  a day, and now and then one clip's timestamp is just off. In the field an
+  A7S3 ran 64–71 s behind an FX6, with C1031 at 55 s and C1020 at 79 s. Both
+  were about 12 s out of reach, matched noise, and stayed out of sync. A clip
+  the fine pass can't place is now searched again over ±30 s of the reference,
+  at the coarse rate and one channel pairing at a time. Probes from three
+  points in the overlap must agree, then the whole fine pass, including the
+  second-point check, runs again from the new position. The shift stands only
+  if that passes, and the log shows the wide offset plus the total.
+- **The rescue pass gave failed clips a "consensus" shift that fit none of
+  them.** It averaged the residuals of matched clips within 2 s of each other,
+  so a spread of per-clip offsets became one meaningless correction: +0.41 s
+  handed to two clips that were 12 s out. It now acts only when the matched
+  clips agree within 0.15 s, which is what one shared clock error looks like.
+
 ## [1.6.0] - 2026-09-21
 
 ### Fixed

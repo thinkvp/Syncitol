@@ -1270,6 +1270,38 @@ test("planLinkGroups blocks a file two groups want in two different places", () 
     assert.strictEqual(plan.unified.length, 0);
 });
 
+// Two cameras whose clips were trimmed to the same in/out: an FX6 (picture +
+// three audio channels on their own tracks) above an A7S3 (picture + stereo).
+function twoCamerasSameSpan(startSec, endSec) {
+    const item = (filePath, trackType, trackIndex) =>
+        ({ filePath, clipName: filePath, trackType, trackIndex, itemIndex: 0, startSec, endSec });
+    return [
+        item("fx6.mxf", "video", 0), item("fx6.mxf", "audio", 0), item("fx6.mxf", "audio", 1), item("fx6.mxf", "audio", 2),
+        item("a7s.mp4", "video", 1), item("a7s.mp4", "audio", 3)
+    ];
+}
+
+test("planLinkGroups lets two cameras trimmed to the same span sync independently", () => {
+    // Field log: every FX6/A7S3 pair was "Left alone … linked but need different
+    // shifts" and the run adjusted 0 clips. Each camera's audio is its own file,
+    // which the per-file delta already keeps with its picture — nothing to link.
+    const plan = dsp.planLinkGroups(twoCamerasSameSpan(0, 377), [], { "fx6.mxf": 0, "a7s.mp4": -0.03 }, 0.002);
+    assert.deepStrictEqual(plan.deltas, { "fx6.mxf": 0, "a7s.mp4": -0.03 });
+    assert.strictEqual(plan.blocked.length, 0);
+    assert.strictEqual(plan.unified.length, 0);
+});
+
+test("planLinkGroups still blocks foreign audio when the pictures beside it disagree", () => {
+    // Same two cameras plus a recorder track in the same span: which picture
+    // the recorder is linked to cannot be told, so moving it would be a guess.
+    const clips = twoCamerasSameSpan(0, 377).concat([
+        { filePath: "rec.wav", clipName: "rec.wav", trackType: "audio", trackIndex: 5, itemIndex: 0, startSec: 0, endSec: 377 }
+    ]);
+    const plan = dsp.planLinkGroups(clips, [], { "fx6.mxf": 0, "a7s.mp4": -0.03, "rec.wav": 1 }, 0.002);
+    assert.strictEqual(plan.blocked.length, 1);
+    assert.strictEqual(plan.deltas["rec.wav"], undefined);
+});
+
 test("planLinkGroups does not mutate the deltas it was handed", () => {
     const deltas = { "camA.mp4": 3, "rec.wav": 3.4 };
     dsp.planLinkGroups(crossFilePair(0, 10), [], deltas, 0.002);
@@ -1897,4 +1929,135 @@ test("planTearRepair refuses to act on an ambiguous pairing", () => {
     assert.deepStrictEqual(dsp.planTearRepair(torn, "complete"), []);
     torn[0].ambiguous = false;
     assert.strictEqual(dsp.planTearRepair(torn, "complete").length, 1);
+});
+
+// ─── Per-channel fine tune ───────────────────────────────────────────────────
+
+test("fineChannelOptions: every channel of a multi-channel file, the mix for mono, capped", () => {
+    assert.deepStrictEqual(dsp.fineChannelOptions(1), [null]);
+    assert.deepStrictEqual(dsp.fineChannelOptions(0), [null]);
+    assert.deepStrictEqual(dsp.fineChannelOptions(undefined), [null]);
+    assert.deepStrictEqual(dsp.fineChannelOptions(3), [0, 1, 2]);
+    assert.strictEqual(dsp.fineChannelOptions(16).length, dsp.FINE_TUNE_MAX_CHANNELS);
+});
+
+test("pickChannelMatch only replaces the mix when a channel clearly beats it", () => {
+    const cand = (score, refChannel, extra) => Object.assign({ score, lagSec: 0.2, refChannel, targetChannel: 0 }, extra);
+    // Clearly better than the mix → taken, and the best of the candidates wins.
+    const won = dsp.pickChannelMatch({ score: 0.45 }, [cand(0.6, 0), cand(0.92, 2), cand(0.5, 1)]);
+    assert.ok(won);
+    assert.strictEqual(won.refChannel, 2);
+    // Only marginally better → chance alone does that across many pairings; keep the mix.
+    assert.strictEqual(dsp.pickChannelMatch({ score: 0.6 }, [cand(0.65, 2)]), null);
+    // A rail hit is never a match, however well it scores.
+    assert.strictEqual(dsp.pickChannelMatch({ score: 0.3 }, [cand(0.9, 2, { atRail: true })]), null);
+    // No usable mix: the channel still has to clear the minimum score plus the margin.
+    assert.ok(dsp.pickChannelMatch(null, [cand(dsp.FINE_TUNE_MIN_SCORE + dsp.FINE_TUNE_CHANNEL_MIN_GAIN + 0.01, 1)]));
+    assert.strictEqual(dsp.pickChannelMatch(null, [cand(dsp.FINE_TUNE_MIN_SCORE + 0.05, 1)]), null);
+    assert.strictEqual(dsp.pickChannelMatch({ score: 0.4 }, []), null);
+});
+
+test("an interview: the camera's room-mic channel matches the other camera where its lav mix cannot", () => {
+    // Camera A (FX6-style): ch1 + ch2 = the subject's lav, ch3 = internal mic.
+    // Camera B (A7S3-style): internal mic only, stereo, recording 0.2 s later.
+    // The interviewer sits near both internal mics: loud there, barely on the lav.
+    const blocks = 1000;           // 10 s with a 100 Hz block rate (25.6 kHz / 256)
+    const D = 20;                  // camera B lags by 20 frames = 0.2 s
+    const subjectSig = makeSignal(blocks + D, 7);
+    const askerSig = makeSignal(blocks + D, 99);
+    // Turns alternate every 1.5 s: subject answers, interviewer asks.
+    const subject = (i) => (Math.floor(i / 150) % 2 === 0 ? subjectSig[i] : 0);
+    const asker = (i) => (Math.floor(i / 150) % 2 === 1 ? askerSig[i] : 0);
+    const lav = (i) => subject(i) + 0.05 * asker(i);
+    const room = (i) => 0.6 * subject(i) + asker(i);
+
+    const camA = makePek(3, blocks, 25600, (c, b) => Math.round(c < 2 ? lav(b) : room(b)));
+    const camB = makePek(2, blocks, 25600, (c, b) => Math.round(b >= D ? room(b - D) : 0));
+    const infoA = dsp.parsePekInfo(camA);
+    const infoB = dsp.parsePekInfo(camB);
+
+    // The mix is dominated by the two lav channels — the questions in camera B
+    // have almost nothing to line up with.
+    const mix = dsp.findBestLag(dsp.pekToEnvelope(camA, infoA, 100, 0, null), dsp.pekToEnvelope(camB, infoB, 100, 0, null));
+
+    const candidates = [];
+    for (const rc of dsp.fineChannelOptions(infoA.channels)) {
+        for (const tc of dsp.fineChannelOptions(infoB.channels)) {
+            const lag = dsp.findBestLag(dsp.pekToEnvelope(camA, infoA, 100, 0, null, rc), dsp.pekToEnvelope(camB, infoB, 100, 0, null, tc));
+            if (lag && !lag.atRail) candidates.push(Object.assign(lag, { refChannel: rc, targetChannel: tc }));
+        }
+    }
+    const pick = dsp.pickChannelMatch(mix, candidates);
+    assert.ok(pick, `a channel should beat the mix (mix score ${mix && mix.score.toFixed(2)})`);
+    assert.strictEqual(pick.refChannel, 2, "the internal-mic channel is the one that hears the same room");
+    assert.ok(Math.abs(pick.lagSec - 0.2) <= 0.01, `lagSec ${pick.lagSec} should be ~0.2`);
+    assert.ok(pick.score > 0.95, `score ${pick.score}`);
+});
+
+// ─── Wide per-clip re-search ─────────────────────────────────────────────────
+
+const wideAnchor = (start, end, inPoint) => ({ resolvedStartSec: start, resolvedEndSec: end, inPointSec: inPoint || 0 });
+
+test("planWideSearch spreads probes across the overlap with ± reach of reference around each", () => {
+    const probes = dsp.planWideSearch(wideAnchor(0, 312), wideAnchor(10, 336, 2));
+    assert.strictEqual(probes.length, 3);
+    for (const p of probes) {
+        assert.strictEqual(p.probeDurSec, 20);
+        assert.ok(p.targetTimelineSec >= 10 && p.targetTimelineSec + 20 <= 312, "probe sits inside the overlap");
+        assert.strictEqual(p.targetSourceOffsetSec, 2 + (p.targetTimelineSec - 10));
+        assert.strictEqual(p.refTimelineSec, Math.max(0, p.targetTimelineSec - dsp.FINE_WIDE_REACH_SEC));
+        assert.ok(p.refTimelineSec + p.refDurSec <= 312, "reference window clamped to the recording");
+    }
+    assert.ok(probes[0].targetTimelineSec < probes[1].targetTimelineSec && probes[1].targetTimelineSec < probes[2].targetTimelineSec);
+});
+
+test("planWideSearch: one probe for a short overlap, none when it cannot hold one", () => {
+    assert.strictEqual(dsp.planWideSearch(wideAnchor(0, 30), wideAnchor(0, 30)).length, 1);
+    assert.strictEqual(dsp.planWideSearch(wideAnchor(0, 30), wideAnchor(25, 60)).length, 0, "5 s of overlap");
+});
+
+test("judgeWideSearch wants probes that agree, and a lone probe that is strong", () => {
+    const pt = (deltaSec, score) => ({ deltaSec, score });
+    const agreed = dsp.judgeWideSearch([pt(12.4, 0.8), pt(12.5, 0.7), pt(-3, 0.55)], 3);
+    assert.ok(agreed);
+    assert.ok(Math.abs(agreed.deltaSec - 12.45) < 0.01);
+    assert.strictEqual(agreed.agreed, 2);
+    assert.strictEqual(agreed.score, 0.8);
+    assert.strictEqual(dsp.judgeWideSearch([pt(12.4, 0.8), pt(-3, 0.8), pt(7, 0.8)], 3), null, "three different answers");
+    assert.strictEqual(dsp.judgeWideSearch([pt(12.4, 0.8), pt(-3, 0.8)], 2), null, "a tie is not a majority");
+    assert.strictEqual(dsp.judgeWideSearch([pt(12.4, 0.9), pt(12.4, 0.3)], 2), null, "the weak probe does not count");
+    assert.ok(dsp.judgeWideSearch([pt(4, 0.8)], 1), "only probe the overlap could hold, and strong");
+    assert.strictEqual(dsp.judgeWideSearch([pt(4, 0.6)], 1), null);
+    assert.strictEqual(dsp.judgeWideSearch([pt(4, 0.9)], 3), null, "two of three probes found nothing");
+});
+
+test("wide search finds a clip 12 s outside the fine pass's reach (the C1031 case)", () => {
+    const rate = 10;                 // the coarse envelope rate
+    const TRUE = 12.4;               // the clip belongs 12.4 s later than it sits
+    const R = makeSignal(400 * rate, 31);
+    const T = new Float32Array(330 * rate);
+    for (let i = 0; i < T.length; i += 1) T[i] = R[i + TRUE * rate];
+    const reference = wideAnchor(0, 312);
+    const target = wideAnchor(0, 326);
+    const points = dsp.planWideSearch(reference, target).map(p => {
+        const ref = R.slice(Math.round(p.refSourceOffsetSec * rate), Math.round((p.refSourceOffsetSec + p.refDurSec) * rate));
+        const tgt = T.slice(Math.round(p.targetSourceOffsetSec * rate), Math.round((p.targetSourceOffsetSec + p.probeDurSec) * rate));
+        const m = dsp.slideMatch(ref, tgt, { envelopeRate: rate, minOverlapSec: p.probeDurSec * 0.8 });
+        return { score: m.score, deltaSec: dsp.wideProbeDelta(p, m.lagSec) };
+    });
+    const found = dsp.judgeWideSearch(points, points.length);
+    assert.ok(found, "the probes should agree");
+    assert.ok(Math.abs(found.deltaSec - TRUE) <= 0.1, `deltaSec ${found.deltaSec} should be ~${TRUE}`);
+    assert.strictEqual(found.agreed, 3);
+});
+
+test("summarizeTrackResiduals gives no consensus when the matched clips are spread out", () => {
+    // Field log: residuals from -3 s to +4 s, one per clip (per-clip timestamps
+    // and drift), and the loose 2 s cluster's middle — +0.41 s — went to two
+    // clips that were 12 s out. A spread like that is not one clock error.
+    const rows = [-0.12, 0.02, 0.99, 1, 0.97, 1, -0.04, 0.8, 1.97, 0.03, 2, 0.99]
+        .map((d, i) => fineRow(`c${i}`, "shifted", d)).concat([fineRow("C1031", "unmatched")]);
+    const r = dsp.summarizeTrackResiduals(rows, 2);
+    assert.strictEqual(r.consensusDeltaSec, null);
+    assert.ok(r.consensusSpreadSec > dsp.FINE_RESCUE_MAX_SPREAD_SEC);
 });
