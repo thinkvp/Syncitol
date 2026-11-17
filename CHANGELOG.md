@@ -60,6 +60,15 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   coarse align, fine align).
 
 ### Fixed
+- **A first sync spent minutes decoding audio it did not need.** The coarse
+  pass matches a track from Premiere's peak files in a moment, but then
+  confirmed that match by decoding real audio: two more points in the clip,
+  plus the track's other clips. From a network drive that took about 4
+  minutes on a field test's first run, and about 2 seconds once the
+  envelope disk cache had those stretches. A match made on peak files is now
+  confirmed on peak files. The log also says what each phase actually
+  decoded and how long it took. The old line claimed "no audio decoded" even
+  when the confirmation had decoded plenty.
 - **The coarse pass's relay retry crashed after its search** ("relay
   unavailable: scanned is not defined"). It read a variable that only
   existed inside a loop, so the confirmation of a relay match never ran.

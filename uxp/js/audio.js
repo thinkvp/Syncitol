@@ -152,6 +152,10 @@ function writeEnvelopeToDisk(diskPath, envelope) {
 
 // ─── Envelope extraction (cached per file|offset|dur|rate|window) ─────────────
 const envelopeCache = new Map();
+// What getEnvelope actually did, for the log: decodes are the expensive part.
+let decodeStats = { decodes: 0, audioSec: 0, decodeMs: 0, diskHits: 0 };
+function resetDecodeStats() { decodeStats = { decodes: 0, audioSec: 0, decodeMs: 0, diskHits: 0 }; }
+function getDecodeStats() { return Object.assign({}, decodeStats); }
 
 function getEnvelope(filePath, sourceOffsetSec, durationSec, opts) {
     opts = opts || {};
@@ -164,7 +168,7 @@ function getEnvelope(filePath, sourceOffsetSec, durationSec, opts) {
         const diskPath = await envelopeDiskPath(filePath, cacheKey);
         if (diskPath) {
             const cached = await readEnvelopeFromDisk(diskPath);
-            if (cached && cached.length) return cached;
+            if (cached && cached.length) { decodeStats.diskHits += 1; return cached; }
         }
 
         throwIfCancelled();
@@ -172,7 +176,11 @@ function getEnvelope(filePath, sourceOffsetSec, durationSec, opts) {
         throwIfCancelled();
 
         const a = await addon();
+        const t0 = Date.now();
         const buf = a.decodePcm(filePath, sourceOffsetSec, durationSec, sampleRate);
+        decodeStats.decodes += 1;
+        decodeStats.audioSec += durationSec;
+        decodeStats.decodeMs += Date.now() - t0;
         const samples = new Int16Array(buf); // little-endian int16 mono
         if (!samples.length) throw new Error(`No audio samples: ${baseName(filePath)}`);
         const envelope = dsp.buildEnvelope(samples, windowSamples);
@@ -242,6 +250,8 @@ module.exports = {
     setCancelCheck,
     getEnvelope,
     clearCache,
+    resetDecodeStats,
+    getDecodeStats,
     probeRecordStart,
     clearProbeCache,
     baseName

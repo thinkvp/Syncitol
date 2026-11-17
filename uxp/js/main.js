@@ -1176,7 +1176,16 @@ async function analyzeCoarseAlign(anchors, onProgress) {
                 envelopeRate: COARSE_ENVELOPE_RATE,
                 minOverlapSec: Math.min(probeDur, COARSE_MATCH_OVERLAP_SEC)
             });
-            if (dsp.coarseConsider(cand.state, plan, candidate, cand.geom, job.cfg)) return true;
+            if (dsp.coarseConsider(cand.state, plan, candidate, cand.geom, job.cfg)) {
+                // Matched on peaks, so confirm on peaks too: refEnvFor /
+                // tgtEnvFor / envForFile follow cand.pek. Confirmation used to
+                // decode real audio here — minutes from a network drive on a
+                // first run, for a match the peak files had already made.
+                cand.pek = refPek;
+                cand.channel = null;
+                job.targetPek = tgtPek;
+                return true;
+            }
         }
         return false;
     }
@@ -1643,7 +1652,7 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         pekMatched += 1;
     }
     if (pekMatched > 0) {
-        notes.push(`Coarse align: ${pekMatched} of ${jobs.length} track${jobs.length !== 1 ? "s" : ""} matched from Premiere's peak-file cache — no audio decoded.`);
+        notes.push(`Coarse align: ${pekMatched} of ${jobs.length} track${jobs.length !== 1 ? "s" : ""} matched from Premiere's peak-file cache.`);
     }
 
     // ── Staged execution across tracks ────────────────────────────────────────
@@ -2691,6 +2700,24 @@ function applyRecordingDays(files, opts) {
     return sessions.closeGaps(files, plan);
 }
 
+// What a phase actually read from disk: decoding audio is the slow part of a
+// first run (and slower still from a network drive); the disk envelope cache is
+// why the second run of the same footage takes seconds.
+function logDecodeStats(phase) {
+    const st = audio.getDecodeStats();
+    if (!st.decodes && !st.diskHits) {
+        log(`${phase}: no audio decoded.`);
+        return;
+    }
+    const parts = [];
+    if (st.decodes) {
+        parts.push(`decoded ${st.decodes} stretch${st.decodes !== 1 ? "es" : ""} of audio ` +
+            `(${formatDuration(st.audioSec * 1000)} of recording) in ${formatDuration(st.decodeMs)}`);
+    }
+    if (st.diskHits) parts.push(`${st.diskHits} more came from the disk cache`);
+    log(`${phase}: ${parts.join("; ")}.`);
+}
+
 // path → recording-session index, when the days were closed up; else null.
 // Only files with an EMBEDDED clock get a day. A file dated by when it was
 // copied or processed could belong to any day — DBTX-1 _001.wav, dated two
@@ -3106,20 +3133,24 @@ async function fineTuneAudio() {
         enterStep(3);
         setBusy("Fine tuning — coarse align…");
         log("Coarse align: scanning audio to find each track's offset — this can take a minute on long clips…");
+        audio.resetDecodeStats();
         const coarse = await analyzeCoarseAlign(anchors, (done, total) => {
             setProgress(10 + Math.round((done / total) * 25));
         });
         coarse.notes.forEach(msg => log(msg));
+        logDecodeStats("Coarse align");
         for (const [key, d] of coarse.deltaByKey) coarseDeltaByKey.set(key, d);
         syncRows.push(...coarse.results);
 
         // Phase 2 — fine residual via per-clip waveform correlation.
         enterStep(4);
         setBusy("Fine tuning — per-clip pass…");
+        audio.resetDecodeStats();
         const fine = await analyzeFineTune(anchors, (done, total) => {
             setProgress(35 + Math.round((done / total) * 50));
         });
         fine.notes.forEach(msg => log(msg));
+        logDecodeStats("Fine pass");
         syncRows.push(...fine.results);
 
         // Merge coarse + fine deltas per FILE so each file moves exactly once.
