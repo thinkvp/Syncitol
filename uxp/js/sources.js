@@ -578,7 +578,31 @@ function placementTimes(plan, anchorMsByTrack) {
     });
 }
 
+// The track in a (rebuilt) sequence that best holds `paths`: most of them,
+// then fewest other files, then the lowest index. For carrying a forced
+// Audio reference across a rebuild by device.
+function followTrack(clips, paths, trackType) {
+    const want = new Set(paths || []);
+    const byTrack = new Map();
+    for (const c of clips || []) {
+        if (trackType && c.trackType !== trackType) continue;
+        const key = c.trackType + "_" + c.trackIndex;
+        const e = byTrack.get(key) || { key, index: c.trackIndex, hit: new Set(), other: new Set() };
+        (want.has(c.filePath) ? e.hit : e.other).add(c.filePath);
+        byTrack.set(key, e);
+    }
+    let best = null;
+    for (const e of byTrack.values()) {
+        if (!e.hit.size) continue;
+        if (!best || e.hit.size > best.hit.size ||
+            (e.hit.size === best.hit.size && (e.other.size < best.other.size ||
+                (e.other.size === best.other.size && e.index < best.index)))) best = e;
+    }
+    return best ? best.key : null;
+}
+
 module.exports = {
+    followTrack,
     OVERLAP_TOL_SEC,
     MAX_PARALLEL_DEVICES,
     deviceFolder,

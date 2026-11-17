@@ -2061,3 +2061,41 @@ test("summarizeTrackResiduals gives no consensus when the matched clips are spre
     assert.strictEqual(r.consensusDeltaSec, null);
     assert.ok(r.consensusSpreadSec > dsp.FINE_RESCUE_MAX_SPREAD_SEC);
 });
+
+// ─── Per-session reference (recording days closed up) ─────────────────────────
+
+function dayClips() {
+    // Day 1: long main camera on V1, short B-cam on V2.
+    // Day 2: main camera on V3 (its own folder → its own track), recorder on A6.
+    const c = (filePath, trackType, trackIndex, startSec, endSec) =>
+        ({ filePath, clipName: filePath, trackType, trackIndex, startSec, endSec, inPointSec: 0, startTicks: String(startSec * 254016000000 + 1) });
+    return [
+        c("d1_main.mp4", "video", 0, 0, 10000), c("d1_b.mp4", "video", 1, 100, 3000),
+        c("d2_main.mp4", "video", 2, 10300, 14000), c("d2_rec.wav", "audio", 5, 10250, 13000)
+    ];
+}
+
+test("buildFineTuneAnchors without sessions keeps one reference for the whole sequence", () => {
+    const anchors = dsp.buildFineTuneAnchors(dayClips());
+    assert.deepStrictEqual(anchors.filter(a => a.isReference).map(a => a.filePath), ["d1_main.mp4"]);
+});
+
+test("buildFineTuneAnchors with sessions picks each day's own reference", () => {
+    const sessionOf = { "d1_main.mp4": 0, "d1_b.mp4": 0, "d2_main.mp4": 1, "d2_rec.wav": 1 };
+    const anchors = dsp.buildFineTuneAnchors(dayClips(), null, sessionOf);
+    assert.deepStrictEqual(anchors.filter(a => a.isReference).map(a => a.filePath).sort(), ["d1_main.mp4", "d2_main.mp4"]);
+    assert.strictEqual(anchors.find(a => a.filePath === "d2_rec.wav").session, 1);
+    const plans = dsp.planReferenceLayers(anchors, dayClips(), null, sessionOf);
+    assert.deepStrictEqual(plans.map(p => [p.session, p.plan.refTrackKey]), [[0, "video_0"], [1, "video_2"]]);
+});
+
+test("planReferenceLayers honours a forced track on its day and falls back on the other", () => {
+    const sessionOf = { "d1_main.mp4": 0, "d1_b.mp4": 0, "d2_main.mp4": 1, "d2_rec.wav": 1 };
+    const anchors = dsp.buildFineTuneAnchors(dayClips(), "audio_5", sessionOf);
+    const plans = dsp.planReferenceLayers(anchors, dayClips(), "audio_5", sessionOf);
+    assert.strictEqual(plans[0].plan.forced, false);
+    assert.ok(plans[0].plan.fallbackReason);
+    assert.strictEqual(plans[1].plan.forced, true);
+    assert.strictEqual(plans[1].plan.refTrackKey, "audio_5");
+    assert.deepStrictEqual(anchors.filter(a => a.isReference).map(a => a.filePath).sort(), ["d1_main.mp4", "d2_rec.wav"]);
+});

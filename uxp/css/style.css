@@ -274,6 +274,7 @@ body {
     margin-right: 8px; /* UXP ignores the row's flex gap */
 }
 @keyframes busy-spin { to { transform: rotate(360deg); } }
+.busy-time { color: var(--text-lo); margin-left: 8px; margin-right: 8px; flex-shrink: 0; }
 
 /* ── Buttons ────────────────────────────────────────────────────────────────── */
 /* UXP renders native <button> widgets that ignore author backgrounds, so all

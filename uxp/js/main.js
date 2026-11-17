@@ -84,6 +84,7 @@ const instructionsPanel = $("instructions-panel");
 const seqInfo = $("seq-info");
 const busyRow = $("busy-row");
 const busyText = $("busy-text");
+const busyTime = $("busy-time");
 const logContainer = $("log");
 const clipTable = $("clip-table");
 const clipBody = $("clip-body");
@@ -344,6 +345,61 @@ checkForUpdates(false).catch(() => {});
 function setProgress(pct, visible = true) {
     progressWrap.style.display = visible ? "block" : "none";
     progressBar.style.width = pct + "%";
+    noteProgress(visible ? pct : null);
+}
+
+// ─── Elapsed / remaining ──────────────────────────────────────────────────────
+// Elapsed counts from the start of the top-level operation (all of Auto Sync).
+// Remaining is an estimate for the CURRENT step only, extrapolated from how
+// fast its progress bar has been moving: each step restarts the bar, and the
+// audio search is lumpy (one stubborn track can take longer than the rest put
+// together), so it is shown only once the step has run long enough to say
+// anything, and always as "about".
+const ETA_MIN_ELAPSED_MS = 15000;
+const ETA_MIN_PROGRESS = 5;
+let opStartedAt = 0;
+let phase = null;   // { startedAt, startPct, pct }
+let clockTimer = null;
+
+function noteProgress(pct) {
+    if (pct === null || pct === undefined) { phase = null; return; }
+    if (!phase || pct < phase.pct) phase = { startedAt: Date.now(), startPct: pct, pct };
+    else phase.pct = pct;
+}
+function formatClock(ms) {
+    const total = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), sec = total % 60;
+    const two = (n) => (n < 10 ? "0" : "") + n;
+    return h ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+}
+function remainingText() {
+    if (!phase || phase.pct >= 100) return "";
+    const ran = Date.now() - phase.startedAt;
+    const moved = phase.pct - phase.startPct;
+    if (ran < ETA_MIN_ELAPSED_MS || moved < ETA_MIN_PROGRESS) return "";
+    const leftMs = ran * (100 - phase.pct) / moved;
+    if (leftMs < 60000) return "under a minute left in this step";
+    return `about ${Math.round(leftMs / 60000)} min left in this step`;
+}
+function updateClock() {
+    if (!busyTime) return;
+    if (!opStartedAt) { busyTime.textContent = ""; return; }
+    const left = remainingText();
+    busyTime.textContent = formatClock(Date.now() - opStartedAt) + (left ? ` · ${left}` : "");
+}
+function startClock() {
+    opStartedAt = Date.now();
+    phase = null;
+    updateClock();
+    if (!clockTimer) clockTimer = setInterval(updateClock, 1000);
+}
+function stopClock() {
+    if (clockTimer) { clearInterval(clockTimer); clockTimer = null; }
+    const took = opStartedAt ? Date.now() - opStartedAt : 0;
+    opStartedAt = 0;
+    phase = null;
+    if (busyTime) busyTime.textContent = "";
+    return took;
 }
 function setBusy(text) {
     if (text) {
@@ -357,6 +413,7 @@ function beginOp(text) {
     if (opDepth === 0) {
         cancelRequested = false; // a fresh top-level operation resets Cancel
         setDisabled(btnCancel, false);
+        startClock();
     }
     opDepth += 1;
     closeRefMenu();
@@ -371,6 +428,7 @@ function endOp() {
         setDisabled(refTrigger, false);
         setModePickersDisabled(false);
         setBusy(null);
+        stopClock();
     }
 }
 
@@ -840,28 +898,34 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         // the track was abandoned while dozens of usable clips sat beside it.
         // Timeline length is still the first guess — more audio is more to match
         // on — but it is now only the first.
-        const targets = group
-            .filter(a => Math.min(a.resolvedEndSec - a.resolvedStartSec, COARSE_TARGET_MAX_SEC) >= COARSE_MIN_OVERLAP_SEC)
-            .sort(byDurationDesc)
-            .slice(0, COARSE_MAX_TARGET_CLIPS);
         const usable = pool.filter(r =>
             Math.min(r.resolvedEndSec - r.resolvedStartSec, COARSE_REF_MAX_SEC) >= COARSE_MIN_OVERLAP_SEC);
+        // With the days of a shoot closed up, only clips from a day that HAS a
+        // reference recording are worth probing (see useNextTarget).
+        const refDays = new Set(usable.map(r => r.session));
+        const onRefDay = (a) => a.session === undefined || refDays.has(a.session) || refDays.has(undefined);
+        const targets = group
+            .filter(a => Math.min(a.resolvedEndSec - a.resolvedStartSec, COARSE_TARGET_MAX_SEC) >= COARSE_MIN_OVERLAP_SEC)
+            .filter(onRefDay)
+            .sort(byDurationDesc)
+            .slice(0, COARSE_MAX_TARGET_CLIPS);
+        if (usable.length && !group.some(onRefDay)) {
+            log(`Coarse align: ${trackLabel} — recorded on a day with no reference recording, so it stays where its clock ` +
+                `put it relative to that day's other clips.`, "info");
+            results.push({ scope: "track", label: trackLabel, status: "skipped", detail: "no reference recording on its day — laid out by its clock" });
+            continue;
+        }
         if (!targets.length || !usable.length) {
             log(`Coarse align: ${trackLabel} — clips too short to match, leaving to fine pass.`);
             results.push({ scope: "track", label: trackLabel, status: "skipped", detail: "clips too short to match — left to fine pass" });
             continue;
         }
 
-        const candidates = usable.slice(0, COARSE_MAX_REF_CANDIDATES);
-        if (usable.length > candidates.length) {
-            const dropped = usable.length - candidates.length;
-            log(`Coarse align: ${trackLabel} — searching the ${candidates.length} longest of ${usable.length} reference clips; ${dropped} shorter one${dropped !== 1 ? "s" : ""} not searched.`, "info");
-        }
-
         jobs.push({
             group, trackLabel, targets, targetIndex: -1,
             target: null, tgtAvail: 0,
-            refCandidates: candidates,
+            usable,                   // every reference clip, longest first
+            refCandidates: [],        // the ones searched for the current target (useNextTarget)
             cfg,                      // replaced per target by useNextTarget
             cands: [],
             lines: [],                // buffered log lines, flushed as one block
@@ -899,6 +963,21 @@ async function analyzeCoarseAlign(anchors, onProgress) {
             const next = job.targets[job.targetIndex];
             job.target = next;
             job.tgtAvail = next.resolvedEndSec - next.resolvedStartSec;
+
+            // Reference clips from the target's own recording day only: a
+            // different day holds nothing to match, and proving that costs the
+            // full staged search — whole-file decodes included — per candidate.
+            const sameDay = job.usable.filter(r => next.session === undefined || r.session === undefined || r.session === next.session);
+            if (!sameDay.length) {
+                job.lines.push([`Coarse align: ${job.trackLabel} — ${next.clipName} was recorded on a day with no reference recording; ` +
+                    `it stays where its clock put it, relative to that day's other clips.`, "info"]);
+                continue;
+            }
+            job.refCandidates = sameDay.slice(0, COARSE_MAX_REF_CANDIDATES);
+            if (sameDay.length > job.refCandidates.length && job.targetIndex === 0) {
+                const dropped = sameDay.length - job.refCandidates.length;
+                job.lines.push([`Coarse align: ${job.trackLabel} — searching the ${job.refCandidates.length} longest of ${sameDay.length} reference clips; ${dropped} shorter one${dropped !== 1 ? "s" : ""} not searched.`, "info"]);
+            }
 
             // No trustworthy Build position → a weak "timestamp" prediction is
             // not evidence. Raising minScore to strongScore makes the prediction
@@ -2585,6 +2664,14 @@ function applyRecordingDays(files, opts) {
     return sessions.closeGaps(files, plan);
 }
 
+// path → recording-session index, when the days were closed up; else null.
+function sessionIndexByPath() {
+    if (!lastDays || !lastDays.closed || lastDays.plan.sessions.length < 2) return null;
+    const out = {};
+    for (const sess of lastDays.plan.sessions) for (const p of sess.files) out[p] = sess.index;
+    return out;
+}
+
 // Drop a sequence marker at the start of each recording session, once the
 // audio pass has put every clip in its final place.
 async function markRecordingDays() {
@@ -2633,6 +2720,13 @@ async function refreshSequence(opts) {
         scannedSeqName = scan.name;   // mark this sequence as the scanned one
         lastLiveSeqName = scan.name;  // keep the idle poll from re-flagging it
         log(`Sequence: "${scan.name}" — ${videoClips} video, ${audioClips} audio clips`);
+        if (opts.refFollow && opts.refFollow.length) {
+            const moved = sources.followTrack(scan.clips, opts.refFollow, "audio");
+            if (moved && moved !== forcedRefTrackKey) {
+                log(`Audio reference follows its recordings into the rebuilt sequence: ${dsp.trackKeyLabel(forcedRefTrackKey)} → ${dsp.trackKeyLabel(moved)}.`, "info");
+                forcedRefTrackKey = moved;
+            }
+        }
         await refreshTrackOptions(); // the reference dropdown follows the sequence
         setProgress(30);
 
@@ -2727,6 +2821,11 @@ async function refreshSequence(opts) {
         clipLayoutOpts = layoutOpts;
         if (pendingPlan) {
             rebuildPlan = { blocks: sources.placementTimes(pendingPlan, trackEarliestMs) };
+            if (forcedRefTrackKey) {
+                rebuildPlan.refPaths = [...new Set(scan.clips
+                    .filter(c => `${c.trackType}_${c.trackIndex}` === forcedRefTrackKey)
+                    .map(c => c.filePath))];
+            }
         }
         for (const group of layout.groups) {
             const names = group.trackKeys.map(dsp.trackKeyLabel).join(", ");
@@ -2893,6 +2992,9 @@ async function buildSync() {
             finalName = await premiere.renameSequence(project, built.sequence, wantName);
         } catch (e) { /* keep the clone's default name */ }
 
+        // A forced Audio reference names a TRACK of the original timeline; a
+        // rebuild puts those recordings on different tracks, so follow them.
+        const refFollow = (rebuildPlan && forcedRefTrackKey && rebuildPlan.refPaths) ? rebuildPlan.refPaths : null;
         if (rebuildPlan) {
             reportRebuild(built, finalName);
         } else {
@@ -2905,7 +3007,7 @@ async function buildSync() {
 
         // Refresh UI state so ACTIVE SEQUENCE reflects the newly opened sequence.
         // Its layout is decided — don't re-detect devices on it.
-        await refreshSequence({ planLayout: false });
+        await refreshSequence({ planLayout: false, refFollow });
         return true;
 
     } catch (e) {
@@ -2934,20 +3036,31 @@ async function fineTuneAudio() {
         await audio.ensureAddon();
 
         const scan = await premiere.scanActiveSequence();
-        const anchors = dsp.buildFineTuneAnchors(scan.clips, forcedRefTrackKey);
+        // Days closed up → one reference per recording session, and the audio
+        // search never compares two different days.
+        const sessionOf = sessionIndexByPath();
+        const anchors = dsp.buildFineTuneAnchors(scan.clips, forcedRefTrackKey, sessionOf);
         if (anchors.length < 2) {
             throw new Error("Need at least two clips with accessible audio for fine tune.");
         }
 
         // Same pure decision the anchors were marked with — read back for the log.
-        const refPlan = dsp.planReferenceLayer(anchors, scan.clips, forcedRefTrackKey);
-        if (refPlan.fallbackReason) {
-            log(`Audio reference ${dsp.trackKeyLabel(refPlan.rejectedTrackKey)} can't be the reference — ${refPlan.fallbackReason}. Falling back to Auto.`, "warn");
-        }
-        if (refPlan.refTrackKey) {
-            const refCount = anchors.filter(a => a.isReference).length;
-            const how = refPlan.forced ? "chosen in the panel" : "longest coverage";
-            log(`Reference track: ${dsp.trackKeyLabel(refPlan.refTrackKey)} — ${how} (${refCount} clip${refCount !== 1 ? "s" : ""}). All other tracks align to it.`);
+        const refPlans = dsp.planReferenceLayers(anchors, scan.clips, forcedRefTrackKey, sessionOf);
+        const dayNames = sessionOf ? sessions.sessionLabels(lastDays.plan) : null;
+        for (const { session, plan: refPlan } of refPlans) {
+            const where = session === null ? "" : `${dayNames[session].name}: `;
+            if (refPlan.fallbackReason && session !== null && refPlans.some(r => r.plan.forced)) {
+                // The chosen track simply has no recordings on this day.
+                log(`${where}the chosen audio reference has no recordings on this day — using the track with the most coverage.`, "info");
+            } else if (refPlan.fallbackReason) {
+                log(`${where}Audio reference ${dsp.trackKeyLabel(refPlan.rejectedTrackKey)} can't be the reference — ${refPlan.fallbackReason}. Falling back to Auto.`, "warn");
+            }
+            if (refPlan.refTrackKey) {
+                const refCount = anchors.filter(a => a.isReference && (session === null || a.session === session)).length;
+                const how = refPlan.forced ? "chosen in the panel" : "longest coverage";
+                log(`${where}Reference track: ${dsp.trackKeyLabel(refPlan.refTrackKey)} — ${how} (${refCount} clip${refCount !== 1 ? "s" : ""}). ` +
+                    (session === null ? "All other tracks align to it." : "That day's other tracks align to it."));
+            }
         }
 
         log(`Fine tune: evaluating ${anchors.length} clips.`);

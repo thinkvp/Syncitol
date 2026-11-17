@@ -50,6 +50,7 @@
             <div id="busy-row" class="busy-row" style="display:none;">
                 <span class="busy-spinner"></span>
                 <span id="busy-text">Working…</span>
+                <span id="busy-time" class="busy-time"></span>
                 <div id="btn-cancel" class="btn btn-mini btn-cancel" title="Stop the current operation">✕ Cancel</div>
             </div>
             <div id="progress-wrap" style="display:none;"><div id="progress-bar"></div></div>
@@ -180,7 +181,7 @@
 
             <div class="ins-section">
                 <div class="ins-heading">⚡ Auto Sync</div>
-                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>scan → build sync sequence → align</strong> (coarse whole-track + fine per-clip). Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code> — Auto Sync refuses those), then click Auto Sync. It stops with a clear message if a step can't proceed, and a <strong>✕ Cancel</strong> button next to the spinner stops long audio scans at any time. When it finishes, the <strong>Sync Results</strong> table shows each track and clip's shift, the signal it matched on, and a confidence score.</p>
+                <p class="ins-text">One click runs the whole pipeline hands-off: <strong>scan → build sync sequence → align</strong> (coarse whole-track + fine per-clip). Make your <strong>original</strong> sequence active first (not an already-built <code>-SYNC</code> — Auto Sync refuses those), then click Auto Sync. It stops with a clear message if a step can't proceed, and a <strong>✕ Cancel</strong> button next to the spinner stops long audio scans at any time. Beside the spinner, the elapsed time counts up; once a step has run long enough to tell, an estimate of the time left <em>in that step</em> joins it (the audio search is uneven, so treat it as a rough guide). When it finishes, the <strong>Sync Results</strong> table shows each track and clip's shift, the signal it matched on, and a confidence score.</p>
             </div>
 
             <div class="ins-section">
@@ -197,6 +198,8 @@
                 <p class="ins-text ins-note">A mix-up is only proven by things one device cannot do: files in different containers (<code>.MXF</code> and <code>.MP4</code>), camera clips beside sound-only recordings, two camera serials (read from Sony <code>M01.XML</code> sidecars), or two files recorded at the same moment. Folder, bin and file naming keep files apart when grouping but never trigger a rebuild on their own — one camera's two cards on V1 is a perfectly good layout. A rebuild places every file <em>whole</em> from the project, so trims, effects and titles on the original timeline are not carried over; the original sequence is never touched.</p>
 
                 <p class="ins-text">The <strong>Recording days</strong> dropdown is for shoots over more than one day. Laid out by the clock, day 2 would land a whole night after day 1, past Premiere's 24-hour timecode. Syncitol finds the <strong>recording sessions</strong> — footage across every device with no break longer than two hours — and closes the gaps between them to five minutes. Within a session nothing moves, so every device keeps its real offset from the others, and a sequence <strong>marker</strong> names each day once the sync is done. <strong>Auto-detect</strong> (default) does this only when the footage's recording clocks span more than 24 hours; <strong>Single day</strong> never does; <strong>Multiple days</strong> always closes breaks over two hours.</p>
+
+                <p class="ins-text ins-note">With the days closed up, <strong>each day gets its own audio reference</strong> (the track with the most coverage that day, or your chosen Audio reference on the days it recorded), and clips are only ever compared with recordings from the same day. A forced Audio reference also follows its recordings when Track layout rebuilds the sequence by device.</p>
 
                 <p class="ins-text ins-note">Only embedded recording clocks decide what a day is. A recorder whose files carry the date they were copied or processed is not a second day, and gets no marker. If even the closed-up timeline runs past 24 hours, it is built anyway: Premiere accepts that, but its timecode display rolls over at 24:00:00 — the day markers are the way around.</p>
 

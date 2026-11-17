@@ -312,7 +312,13 @@
     // layer-0 reference. `forcedRefTrackKey` ("video_0", "audio_2") is the
     // panel's reference dropdown; without it the reference is picked
     // automatically — see planReferenceLayer.
-    function buildFineTuneAnchors(clips, forcedRefTrackKey) {
+    //
+    // `sessionOf` (path → recording-session index, when the days of a shoot
+    // were closed up) gives every session its OWN reference: day 2's cameras
+    // have nothing in common with day 1's recordings, so aligning them to a
+    // day-1 reference sends the coarse pass through every expensive stage to
+    // find nothing. Each anchor then carries `session`.
+    function buildFineTuneAnchors(clips, forcedRefTrackKey, sessionOf) {
         var byKey = {};
         var order = [];
 
@@ -362,11 +368,20 @@
         var anchors = [];
         for (var k = 0; k < order.length; k += 1) anchors.push(byKey[order[k]]);
 
-        var plan = planReferenceLayer(anchors, clips, forcedRefTrackKey);
+        var plans = planReferenceLayers(anchors, clips, forcedRefTrackKey, sessionOf);
+        var refPaths = {};
+        for (var pl = 0; pl < plans.length; pl += 1) {
+            for (var rp in plans[pl].plan.refPaths) {
+                if (Object.prototype.hasOwnProperty.call(plans[pl].plan.refPaths, rp)) refPaths[rp] = true;
+            }
+        }
         for (var b = 0; b < anchors.length; b += 1) {
-            var isRef = Object.prototype.hasOwnProperty.call(plan.refPaths, anchors[b].filePath);
+            var isRef = Object.prototype.hasOwnProperty.call(refPaths, anchors[b].filePath);
             anchors[b].layerOrder = isRef ? 0 : 1;
             anchors[b].isReference = isRef;
+            if (sessionOf && Object.prototype.hasOwnProperty.call(sessionOf, anchors[b].filePath)) {
+                anchors[b].session = sessionOf[anchors[b].filePath];
+            }
         }
 
         return anchors.sort(function (a, b) {
@@ -431,6 +446,37 @@
         }
 
         return autoReferenceLayer(anchors, null, null);
+    }
+
+    // One reference plan per recording session ([{ session, plan }]), or a
+    // single plan (session null) when there are no sessions to separate.
+    function planReferenceLayers(anchors, clips, forcedRefTrackKey, sessionOf) {
+        var sessionsSeen = [];
+        var bySession = {};
+        if (sessionOf) {
+            for (var i = 0; i < anchors.length; i += 1) {
+                var s = Object.prototype.hasOwnProperty.call(sessionOf, anchors[i].filePath) ? sessionOf[anchors[i].filePath] : null;
+                if (s === null) continue;
+                if (!Object.prototype.hasOwnProperty.call(bySession, s)) { bySession[s] = []; sessionsSeen.push(s); }
+                bySession[s].push(anchors[i]);
+            }
+        }
+        if (sessionsSeen.length < 2) {
+            return [{ session: null, plan: planReferenceLayer(anchors, clips, forcedRefTrackKey) }];
+        }
+        sessionsSeen.sort(function (a, b) { return a - b; });
+        var out = [];
+        for (var k = 0; k < sessionsSeen.length; k += 1) {
+            var sAnchors = bySession[sessionsSeen[k]];
+            var inSession = {};
+            for (var j = 0; j < sAnchors.length; j += 1) inSession[sAnchors[j].filePath] = true;
+            var sClips = [];
+            for (var c = 0; c < clips.length; c += 1) {
+                if (Object.prototype.hasOwnProperty.call(inSession, clips[c].filePath)) sClips.push(clips[c]);
+            }
+            out.push({ session: sessionsSeen[k], plan: planReferenceLayer(sAnchors, sClips, forcedRefTrackKey) });
+        }
+        return out;
     }
 
     function autoReferenceLayer(anchors, rejectedTrackKey, fallbackReason) {
@@ -2216,6 +2262,7 @@
         planLinkGroups: planLinkGroups,
         TEAR_REPAIR_MIN_SEC: TEAR_REPAIR_MIN_SEC,
         planReferenceLayer: planReferenceLayer,
+        planReferenceLayers: planReferenceLayers,
         trackKeyLabel: trackKeyLabel,
         buildCompareWindow: buildCompareWindow,
         buildDriftProbe: buildDriftProbe,

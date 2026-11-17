@@ -299,3 +299,17 @@ test("placementTimes lays out sources that rolled together at their real offsets
     assert.strictEqual(startOf(/C0524/), 72);
     assert.strictEqual(startOf(/111_3872/), 32 * 60);
 });
+
+test("followTrack finds where a forced reference's recordings went after a rebuild", () => {
+    const clips = [
+        { filePath: "cam.mxf", trackType: "audio", trackIndex: 0 },
+        { filePath: "rec_1.wav", trackType: "audio", trackIndex: 5 },
+        { filePath: "rec_2.wav", trackType: "audio", trackIndex: 5 },
+        { filePath: "rec_2.wav", trackType: "audio", trackIndex: 6 },
+        { filePath: "other.wav", trackType: "audio", trackIndex: 6 },
+        { filePath: "rec_1.wav", trackType: "video", trackIndex: 0 }
+    ];
+    assert.strictEqual(sources.followTrack(clips, ["rec_1.wav", "rec_2.wav"], "audio"), "audio_5");
+    assert.strictEqual(sources.followTrack(clips, ["rec_2.wav"], "audio"), "audio_5", "the purer track wins a tie");
+    assert.strictEqual(sources.followTrack(clips, ["missing.wav"], "audio"), null);
+});

@@ -40,13 +40,25 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   files dated by a later copy or processing pass get no marker. A shoot that
   is still over 24 hours with the gaps closed now builds anyway. Premiere
   accepts it; only its timecode display rolls over.
+- **Each recording day gets its own audio reference.** The audio pass used
+  one reference track for the whole sequence: the one with the most
+  recorded time. In a two-day shoot that is one day's device, so every
+  track from the other day was searched against recordings it could never
+  match. Each search fell through to whole-file decodes before giving up,
+  which made a sync that took a minute per day run for 20 minutes or more.
+  With the days closed up, each day now picks its own reference, and the
+  coarse pass only compares clips from the same day.
+- **Elapsed time while syncing**, with an estimate of the time left in the
+  current step once it has run long enough to tell.
 - **Recording days dropdown.** **Auto-detect** (default) closes the gaps only
   when the clock-dated footage spans more than 24 hours. **Single day** keeps
   the old layout. **Multiple days** always closes gaps over two hours.
 - **Track layout dropdown.** **Auto-detect** (default) rebuilds only when a
   track mixes devices. **Keep my tracks** always clones the timeline as it is,
   the old behaviour. **Rebuild by device** always rebuilds. The choice is
-  remembered.
+  remembered. A forced **Audio reference** follows its recordings into the
+  rebuilt sequence. It names a track of the original timeline, and a rebuild
+  puts those recordings on a different one.
 
 ## [1.7.0] - 2026-10-30
 
