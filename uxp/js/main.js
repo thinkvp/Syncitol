@@ -14,6 +14,7 @@ const dsp = require("./js/dsp");
 const audio = require("./js/audio");
 const premiere = require("./js/premiere");
 const pek = require("./js/pek");
+const sources = require("./js/sources");
 
 // How many clips' decode passes to run concurrently. The addon decode itself is
 // synchronous on the scripting thread, so this mostly overlaps cache/disk reads
@@ -69,6 +70,7 @@ let scannedSeqName = null;     // name of the sequence the panel last scanned
 let lastLiveSeqName;           // last active-sequence name the idle poll reflected
 let cancelRequested = false;   // set by the Cancel button; checked at every async seam
 let lastFineTuneRevert = null; // inverse shift list that undoes the last applied fine tune
+let rebuildPlan = null;        // set by refreshSequence when Build must lay the sequence out by source
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -93,6 +95,9 @@ const toolStatusEl = $("tool-status");
 const refTrigger = $("ref-trigger");
 const refTriggerText = $("ref-trigger-text");
 const refMenu = $("ref-menu");
+const layoutTrigger = $("layout-trigger");
+const layoutTriggerText = $("layout-trigger-text");
+const layoutMenu = $("layout-menu");
 
 // Actions are styled <div class="btn"> elements (UXP's native <button> widget
 // ignores author backgrounds), so disabled state is a class, not a property.
@@ -213,6 +218,7 @@ async function exportLog() {
 const HOST_DEBUG = false;
 premiere.scanSequence.onDiag = (m) => { if (HOST_DEBUG) log("scan: " + m); };
 premiere.buildSyncSequence.onStep = (m) => { if (HOST_DEBUG) log("build: " + m); };
+premiere.buildSourceSequence.onStep = (m) => { if (HOST_DEBUG) log("rebuild: " + m); };
 premiere.applyStarts.onStep = (m) => { if (HOST_DEBUG) log("apply: " + m); };
 pek.onDiag = (m) => log(m);
 
@@ -354,13 +360,16 @@ function beginOp(text) {
     }
     opDepth += 1;
     closeRefMenu();
+    closeLayoutMenu();
     setDisabled(refTrigger, true);
+    setDisabled(layoutTrigger, true);
     setBusy(text);
 }
 function endOp() {
     opDepth = Math.max(0, opDepth - 1);
     if (opDepth === 0) {
         setDisabled(refTrigger, false);
+        setDisabled(layoutTrigger, false);
         setBusy(null);
     }
 }
@@ -502,6 +511,7 @@ function renderRefMenu() {
 }
 
 function openRefMenu() {
+    closeLayoutMenu();
     renderRefMenu();
     refMenu.style.display = "block";
     refTrigger.classList.add("is-open");
@@ -584,7 +594,71 @@ refTrigger.addEventListener("click", (e) => {
 // is a no-op on some build.
 (document.body || document).addEventListener("click", (e) => {
     if (refMenuOpen && !isInside(e.target, refMenu) && !isInside(e.target, refTrigger)) closeRefMenu();
+    if (layoutMenuOpen && !isInside(e.target, layoutMenu) && !isInside(e.target, layoutTrigger)) closeLayoutMenu();
 });
+
+// ─── Track layout picker ──────────────────────────────────────────────────────
+// Every stage after the build treats one TRACK as one recording device. When
+// the editor's timeline is not laid out that way — two cameras on V1, a
+// recorder sharing a camera's audio track — the -SYNC sequence is built fresh
+// with one block of tracks per device instead of cloned (sources.js decides
+// which files belong together; premiere.buildSourceSequence places them).
+//   auto    — rebuild only when a track provably holds two devices
+//   keep    — always clone the timeline as it is (the pre-1.8 behaviour)
+//   rebuild — always rebuild by device
+const LAYOUT_MODE_KEY = "syncitol-track-layout";
+const LAYOUT_MODES = [
+    { key: "auto", short: "Auto-detect", meta: "rebuild only if a track mixes devices" },
+    { key: "keep", short: "Keep my tracks", meta: "each track is already one device" },
+    { key: "rebuild", short: "Rebuild by device", meta: "one track block per camera / recorder" }
+];
+let layoutMode = (() => {
+    const saved = lsGet(LAYOUT_MODE_KEY);
+    return LAYOUT_MODES.some(m => m.key === saved) ? saved : "auto";
+})();
+let layoutMenuOpen = false;
+
+function updateLayoutTrigger() {
+    const m = LAYOUT_MODES.find(x => x.key === layoutMode) || LAYOUT_MODES[0];
+    layoutTriggerText.textContent = m.short;
+}
+function renderLayoutMenu() {
+    layoutMenu.innerHTML = "";
+    for (const opt of LAYOUT_MODES) {
+        const item = document.createElement("div");
+        item.className = "picker-item" + (opt.key === layoutMode ? " is-selected" : "");
+        item.innerHTML =
+            `<span class="picker-item-key">${escapeHtml(opt.short)}</span>` +
+            `<span class="picker-item-meta">${escapeHtml(opt.meta)}</span>`;
+        item.addEventListener("click", () => selectLayoutMode(opt.key));
+        layoutMenu.appendChild(item);
+    }
+}
+function closeLayoutMenu() {
+    if (!layoutMenu) return;
+    layoutMenu.style.display = "none";
+    layoutTrigger.classList.remove("is-open");
+    layoutMenuOpen = false;
+}
+function selectLayoutMode(key) {
+    closeLayoutMenu();
+    if (key === layoutMode) return;
+    layoutMode = key;
+    lsSet(LAYOUT_MODE_KEY, key);
+    updateLayoutTrigger();
+    const m = LAYOUT_MODES.find(x => x.key === key);
+    log(`Track layout: ${m.short} — ${m.meta}.`);
+}
+layoutTrigger.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (layoutMenuOpen) { closeLayoutMenu(); return; }
+    closeRefMenu();
+    renderLayoutMenu();
+    layoutMenu.style.display = "block";
+    layoutTrigger.classList.add("is-open");
+    layoutMenuOpen = true;
+});
+updateLayoutTrigger();
 
 // ─── Decoder availability (footer chip) ───────────────────────────────────────
 function updateToolStatus(ok, detail) {
@@ -2349,12 +2423,111 @@ function reportApplyIntegrity(result, rows) {
     return clean;
 }
 
+// ─── Track layout: which device recorded each file ────────────────────────────
+// Detects the recording devices (sources.js), checks whether the timeline's
+// tracks already hold one device each, and — per the Track layout picker —
+// decides whether Build clones the timeline or rebuilds it by device. Returns
+// { payload, plan }: `payload` is what the build layout is planned on (re-keyed
+// to the tracks each file will be placed on when rebuilding), `plan` is null
+// when the timeline is cloned as it is.
+const SIDECAR_EXTS = new Set(["mxf", "mp4", "mov", "mts", "m2ts"]);
+
+async function planTrackLayout(scan, enriched) {
+    const instByPath = new Map();
+    for (const c of scan.clips) {
+        let e = instByPath.get(c.filePath);
+        if (!e) { e = { hasVideo: false, projectItem: c.projectItem }; instByPath.set(c.filePath, e); }
+        if (c.trackType === "video") e.hasVideo = true;
+    }
+
+    const detectInput = [];
+    let sidecars = 0;
+    for (const f of enriched) {
+        throwIfCancelled();
+        const e = instByPath.get(f.filePath) || {};
+        const binPath = e.projectItem ? await premiere.getBinPath(e.projectItem) : "";
+        let device = null;
+        const ext = (f.filePath.split(".").pop() || "").toLowerCase();
+        if (SIDECAR_EXTS.has(ext)) {
+            for (const sc of sources.sidecarPaths(f.filePath)) {
+                const txt = await premiere.readTextFile(sc);
+                if (txt) { device = sources.parseSonyDevice(txt); if (device) sidecars += 1; break; }
+            }
+        }
+        detectInput.push({
+            filePath: f.filePath, hasVideo: !!e.hasVideo, binPath, device,
+            recordStartMs: f.recordStartMs, durationSec: f.durationSec, timingSource: f.timingSource
+        });
+    }
+
+    const detection = sources.detectSources(detectInput);
+    const check = sources.checkTrackLayout(scan.clips, detection, detectInput);
+    const labelOf = {};
+    for (const src of detection.sources) labelOf[src.id] = src.label;
+
+    const listing = detection.sources.map(src =>
+        `${src.label} (${src.files.length} file${src.files.length !== 1 ? "s" : ""}${src.hasVideo ? "" : ", sound only"})`).join(" · ");
+    log(`Devices: ${detection.sources.length} detected — ${listing}` +
+        (sidecars ? ` (${sidecars} camera sidecar${sidecars !== 1 ? "s" : ""} read)` : "") + ".");
+    for (const src of detection.sources) {
+        if (src.timingSuspect) {
+            log(`⚠ ${src.label}: its files all claim to have been recorded at once — their timestamps are batch stamps, ` +
+                `so they were kept together as one device.`, "warn");
+        }
+    }
+    for (const m of check.mixed.slice(0, 6)) {
+        const names = m.sourceIds.map(id => labelOf[id]).join(", ");
+        log(`Track layout: ${dsp.trackKeyLabel(m.trackKey)} holds ${names} — ${m.reason} cannot be one device.`, "warn");
+    }
+    if (check.mixed.length > 6) log(`Track layout: ${check.mixed.length - 6} more mixed track(s).`, "warn");
+
+    const rebuild = layoutMode === "rebuild" || (layoutMode === "auto" && !check.ok);
+    if (!rebuild) {
+        if (check.ok) {
+            log("Track layout: each track holds one device — the sequence will be cloned as it is.");
+        } else {
+            log("⚠ Track layout is set to Keep my tracks, so the sequence will be cloned as it is — every track is " +
+                "treated as one device, and the mixed tracks above will sync unreliably.", "warn");
+        }
+        return { payload: enriched, plan: null };
+    }
+
+    const plan = sources.planSourceLayout(enriched, detection, scan.clips);
+    const vBlocks = plan.blocks.filter(b => b.hasVideo).length;
+    log(`Track layout: ${layoutMode === "rebuild" ? "rebuilding by device as selected" : "a track mixes devices, so"} — ` +
+        `the -SYNC sequence will be built fresh with one track block per device (${vBlocks} video track${vBlocks !== 1 ? "s" : ""}, ` +
+        `${plan.blocks.length - vBlocks} sound-only source${plan.blocks.length - vBlocks !== 1 ? "s" : ""}). ` +
+        `Every file is placed whole from the project — trims, effects and titles on the original timeline are not carried over.`, "info");
+    for (const b of plan.blocks) {
+        if (b.lane > 0) {
+            log(`ℹ ${b.label}: some of this device's files claim to overlap in time (file dates are often when a file was ` +
+                `copied or processed, not recorded), so they go on a track of their own and are aligned separately.`, "info");
+        }
+    }
+    if (plan.nudged.length) {
+        const worst = Math.max.apply(null, plan.nudged.map(n => n.nudgedMs));
+        log(`ℹ ${plan.nudged.length} file(s) started up to ${formatDuration(worst)} before the previous take from the same device ` +
+            `ended (whole-second timestamps) and were placed just after it instead.`, "info");
+    }
+    const scanned = new Set(scan.clips.map(c => c.filePath));
+    const missing = [...scanned].filter(p => !enriched.some(f => f.filePath === p));
+    if (missing.length) {
+        log(`⚠ ${missing.length} file(s) had no readable recording time and will be left out of the rebuilt sequence.`, "warn");
+    }
+    return { payload: plan.payload, plan };
+}
+
 // ─── Scan: read active sequence ───────────────────────────────────────────────
-async function refreshSequence() {
+// opts.planLayout === false skips the device detection: used for the re-scan
+// of a freshly built -SYNC sequence, whose layout is already decided — and that
+// re-scan keeps the log, so what the build did stays readable.
+async function refreshSequence(opts) {
+    opts = opts || {};
     beginOp("Scanning sequence…");
-    clearLog();
+    if (opts.planLayout !== false) clearLog();
     clearSyncSummary();
     clipPayload = null;
+    rebuildPlan = null;
     clipTable.style.display = "none";
     seqInfo.textContent = "Reading sequence…";
     setProgress(10);
@@ -2409,7 +2582,7 @@ async function refreshSequence() {
             }
         });
 
-        const enriched = [];
+        let enriched = [];
         const sourceCounts = {};
         for (const { file, r, errorMessage } of outcomes) {
             if (errorMessage !== undefined) {
@@ -2445,8 +2618,17 @@ async function refreshSequence() {
         // corroborates keeps its own earliest clip as its anchor. Same call and
         // same inputs as buildSyncSequence makes — so the Offset column below
         // shows what will actually be built.
+        let pendingPlan = null;
+        if (opts.planLayout !== false) {
+            const tl = await planTrackLayout(scan, enriched);
+            enriched = tl.payload;
+            pendingPlan = tl.plan;
+        }
         const layout = dsp.planBuildAnchors(enriched);
         const trackEarliestMs = layout.anchorMsByTrack;
+        if (pendingPlan) {
+            rebuildPlan = { blocks: sources.placementTimes(pendingPlan, trackEarliestMs) };
+        }
         for (const group of layout.groups) {
             const names = group.trackKeys.map(dsp.trackKeyLabel).join(", ");
             log(`Build layout: ${names} were recording at the same time, so their clocks agree — ` +
@@ -2530,7 +2712,7 @@ async function refreshSequence() {
 
         if (hasSpanViolation) {
             log("Cannot build the sync sequence \u2014 it must fit within Premiere\u2019s 24-hour maximum. Process one recording day at a time.", "error");
-        } else {
+        } else if (opts.planLayout !== false) {
             log(`Ready to build "${scan.name}-SYNC".`, "success");
         }
 
@@ -2551,6 +2733,24 @@ async function refreshSequence() {
     }
 }
 
+// What a rebuild by device did, for the log.
+function reportRebuild(built, finalName) {
+    const failed = built.failed.length;
+    log(`✓ Created sequence: "${finalName}" — rebuilt by device: placed ${built.placed}/${built.total} files on ` +
+        `${built.tracks.video} video and ${built.tracks.audio} audio track${built.tracks.audio !== 1 ? "s" : ""}.`,
+        failed ? "warn" : "success");
+    for (const f of built.failed.slice(0, 5)) log(`⚠ ${audio.baseName(f.filePath)} was not placed: ${f.reason}.`, "warn");
+    if (failed > 5) log(`⚠ …and ${failed - 5} more file(s) were not placed.`, "warn");
+    for (const m of built.misplaced.slice(0, 5)) log(`⚠ ${audio.baseName(m.filePath)}: ${m.reason}.`, "warn");
+    if (built.misaligned.length) {
+        log(`⚠ ${built.misaligned.length} placed clip(s) have sound that does not start with the picture — check them before editing.`, "warn");
+    }
+    if (built.carriedOver) {
+        log(`ℹ ${built.carriedOver} timeline item(s) without a media file (titles, graphics, nested sequences) were not ` +
+            `carried into the rebuilt sequence — the original sequence still has them.`, "info");
+    }
+}
+
 // ─── Build sync sequence ──────────────────────────────────────────────────────
 async function buildSync() {
     if (!clipPayload) return false;
@@ -2565,7 +2765,9 @@ async function buildSync() {
     log("Building sync sequence…");
 
     try {
-        const built = await premiere.buildSyncSequence(clipPayload, scannedSeqName);
+        const built = rebuildPlan
+            ? await premiere.buildSourceSequence(rebuildPlan.blocks)
+            : await premiere.buildSyncSequence(clipPayload, scannedSeqName);
         setProgress(80);
 
         // Rename the clone to "<original>-SYNC".
@@ -2576,14 +2778,19 @@ async function buildSync() {
             finalName = await premiere.renameSequence(project, built.sequence, wantName);
         } catch (e) { /* keep the clone's default name */ }
 
-        log(`✓ Created sequence: "${finalName}" — placed ${built.placed}/${built.total} clips by record time.`, "success");
-        reportApplyIntegrity(built, null);
+        if (rebuildPlan) {
+            reportRebuild(built, finalName);
+        } else {
+            log(`✓ Created sequence: "${finalName}" — placed ${built.placed}/${built.total} clips by record time.`, "success");
+            reportApplyIntegrity(built, null);
+        }
         setProgress(100);
         setTimeout(() => setProgress(0, false), 800);
         log(`Done! "${finalName}" is now open.`, "success");
 
         // Refresh UI state so ACTIVE SEQUENCE reflects the newly opened sequence.
-        await refreshSequence();
+        // Its layout is decided — don't re-detect devices on it.
+        await refreshSequence({ planLayout: false });
         return true;
 
     } catch (e) {

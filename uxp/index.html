@@ -66,6 +66,20 @@
                     <div id="ref-menu" class="picker-menu" style="display:none;"></div>
                 </div>
             </div>
+
+            <!-- Track layout: whether each track already holds one recording
+                 device. Auto-detect rebuilds the -SYNC sequence by device only
+                 when a track provably mixes two of them. -->
+            <div class="ref-row">
+                <span class="ref-row-label">Track layout</span>
+                <div class="picker">
+                    <div id="layout-trigger" class="picker-trigger" title="How the -SYNC sequence's tracks are organised">
+                        <span id="layout-trigger-text">Auto-detect</span>
+                        <span class="picker-caret">▾</span>
+                    </div>
+                    <div id="layout-menu" class="picker-menu" style="display:none;"></div>
+                </div>
+            </div>
         </div>
 
         <!-- Action buttons -->
@@ -164,6 +178,10 @@
 
                 <p class="ins-text ins-note">Afterwards the fine pass’s own results are read back as an audit of the coarse one. If most of a track failed to match, the log says so plainly — that is what a wrong coarse offset looks like. If several clips on a track all needed the <em>same</em> correction, that correction is also given to the clips on that track the fine pass could not match: they are one device carrying one clock error, and their track-mates are better evidence than leaving them behind.</p>
                 <p class="ins-text">The <strong>Audio reference</strong> dropdown in the Active Sequence card overrides that pick: choose any populated <strong>audio</strong> track (your field recorder, the main camera’s sound) and every other clip is aligned to the recordings on it. <strong>Auto</strong> is the default. A forced track that holds <em>every</em> clip in the sequence would leave nothing to align, so the panel falls back to Auto and says so in the log.</p>
+
+                <p class="ins-text">The <strong>Track layout</strong> dropdown is about the timeline you start from. Everything after the build treats <strong>one track as one recording device</strong>. If a track holds two devices — every clip dumped on V1, a sound recorder sharing a camera's audio track — Syncitol works out which device recorded each file and builds the <code>-SYNC</code> sequence fresh, with one block of tracks per camera and per recorder. <strong>Auto-detect</strong> (default) does that only when a track provably mixes devices; <strong>Keep my tracks</strong> always clones your timeline as it is; <strong>Rebuild by device</strong> always rebuilds.</p>
+
+                <p class="ins-text ins-note">A mix-up is only proven by things one device cannot do: files in different containers (<code>.MXF</code> and <code>.MP4</code>), camera clips beside sound-only recordings, two camera serials (read from Sony <code>M01.XML</code> sidecars), or two files recorded at the same moment. Folder, bin and file naming keep files apart when grouping but never trigger a rebuild on their own — one camera's two cards on V1 is a perfectly good layout. A rebuild places every file <em>whole</em> from the project, so trims, effects and titles on the original timeline are not carried over; the original sequence is never touched.</p>
 
                 <p class="ins-text ins-note">The list shows audio tracks only. Forcing a track really selects the <em>files</em> on it, and a camera clip’s picture and sound are one file — so V1 and A1 would pick exactly the same recordings. Auto still considers every clip whatever track it sits on.</p>
                 <p class="ins-text ins-note">Every clip of one source file moves as a single piece, so a camera’s picture and its own sound never come apart. Audio <strong>linked from a different file</strong> — merged clips, <em>Synchronize</em>, a manual <em>Clip &gt; Link</em> — is detected by the span it shares with the picture and moved with it rather than synced separately; unlink it first if you want Syncitol to align it on its own. After every move the timeline is <strong>read back</strong>: anything that landed unevenly is nudged into line, and if that won’t take, put back exactly where it started — unsynced, but never torn. The log names whatever happened.</p>

@@ -4,7 +4,7 @@
 //
 // Stages ONLY what the plugin needs at runtime:
 //   manifest.json, index.html (dev-harness script tag stripped),
-//   js/{dsp,audio,pek,premiere,main}.js, css/, fonts/,
+//   js/{dsp,audio,pek,premiere,main,sources}.js, css/, fonts/,
 //   win/x64/syncitol.uxpaddon, mac/*/syncitol.uxpaddon
 // Explicitly NOT staged: js/selftest.js, tests/, scripts/, node_modules/,
 // debug-*.json, docs -- a previous package accidentally bundled a full shared
@@ -36,7 +36,7 @@ function copy(rel) {
 
 // Manifest + plugin code.
 copy("manifest.json");
-for (const f of ["dsp.js", "audio.js", "pek.js", "premiere.js", "main.js"]) copy(`js/${f}`);
+for (const f of ["dsp.js", "audio.js", "pek.js", "premiere.js", "main.js", "sources.js"]) copy(`js/${f}`);
 
 // index.html with the dev harness stripped.
 const html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8")

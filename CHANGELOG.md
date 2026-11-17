@@ -9,6 +9,28 @@ The earlier internal history is a **separate 1.x line** that ran to its own
 1.4.0 before that reset — unrelated to the 1.4.0 below — and is preserved in
 [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
+## [Unreleased]
+
+### Added
+- **Timelines that aren't one device per track now sync.** Every stage of
+  the sync treats a track as one recording device. Two cameras on V1 looked
+  like one camera whose clips overlapped in time, which reads as
+  batch-stamped timestamps, so the whole track's clock was thrown away and
+  the audio pass worked from nothing. Syncitol now works out which device
+  recorded each file. Hard evidence is the container, picture vs sound-only,
+  the camera model and serial from Sony `<clip>M01.XML` sidecars, and
+  embedded clocks that say two files were recording at once. Folder, bin and
+  file-name pattern keep files apart without proving anything. When a track
+  provably holds two devices, the `-SYNC` sequence is built fresh instead of
+  cloned: the clone is emptied and every file is placed whole from the project
+  onto its device's own block of tracks, at its recording time, before the
+  audio pass runs as usual. Sequence settings carry over from the original.
+  Trims, effects and titles do not, and the log says so.
+- **Track layout dropdown.** **Auto-detect** (default) rebuilds only when a
+  track mixes devices. **Keep my tracks** always clones the timeline as it is,
+  the old behaviour. **Rebuild by device** always rebuilds. The choice is
+  remembered.
+
 ## [1.7.0] - 2026-10-30
 
 ### Fixed

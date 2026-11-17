@@ -702,6 +702,173 @@ async function buildSyncSequence(clipPayload, baseName) {
     };
 }
 
+// ─── Build a sequence laid out by source ──────────────────────────────────────
+// For a timeline whose tracks do not hold one device each. Moving clips can
+// only slide them along the track they are on, so instead: clone the active
+// sequence (keeps its frame rate, size and audio settings), empty the clone, and
+// place every file fresh from the project onto its source's own tracks.
+//
+// Verified on PPro 26.3.2: SequenceEditor overwrite actions want the PLAIN
+// ProjectItem (a ClipProjectItem.cast() one is "Invalid parameter"); a track
+// index past the end appends tracks without leaving empty ones; a placed clip's
+// picture and channels arrive A/V-linked, a 4-channel MXF taking 4 mono tracks;
+// a sound-only file takes video track -1.
+//
+// `blocks`: sources.placementTimes(...) — ordered, cameras first:
+//   [{ label, hasVideo, videoTrack, files: [{ filePath, startSec }] }]
+// Audio track positions are NOT taken from the plan: how many tracks a camera's
+// sound takes is up to Premiere's channel mapping, so after each block the
+// timeline is read and the next block starts below the last occupied track.
+async function buildSourceSequence(blocks) {
+    const step = (m) => { try { console.log("[rebuild] " + m); } catch (e) {} if (typeof buildSourceSequence.onStep === "function") buildSourceSequence.onStep(m); };
+    const msgOf = (e) => (e && (e.message || String(e))) || "unknown error";
+
+    const project = await getActiveProject();
+    const before = await val(project.getSequences());
+    const beforeIds = new Set(before.map(s => seqId(s)));
+    const active = await val(project.getActiveSequence());
+    if (!active) throw new Error("No active sequence.");
+
+    // Project items come from the ORIGINAL timeline's instances, read through
+    // this same project wrapper.
+    const original = await scanSequence(active);
+    const itemByPath = {};
+    for (const c of original.clips) {
+        if (!itemByPath[c.filePath] && c.projectItem) itemByPath[c.filePath] = c.projectItem;
+    }
+    const carriedOver = original.opaque.length;
+
+    step("clone");
+    await lockedTransaction(project, "Syncitol: clone for rebuild", (compound) => {
+        compound.addAction(active.createCloneAction());
+    });
+    const after = await val(project.getSequences());
+    const clone = after.find(s => !beforeIds.has(seqId(s)));
+    if (!clone) throw new Error("Could not find the cloned sequence.");
+    try { await val(project.openSequence(clone)); } catch (e) {}
+    try { await val(project.setActiveSequence(clone)); } catch (e) {}
+
+    const editor = ppro.SequenceEditor && ppro.SequenceEditor.getEditor
+        ? ppro.SequenceEditor.getEditor(clone) : null;
+    if (!editor || typeof editor.createOverwriteItemAction !== "function") {
+        throw new Error("This Premiere build has no SequenceEditor placement API — use Keep my tracks.");
+    }
+
+    // ── Empty the clone ─────────────────────────────────────────────────────
+    step("empty clone");
+    const vCount = await val(clone.getVideoTrackCount());
+    const aCount = await val(clone.getAudioTrackCount());
+    const trackObjs = [];
+    for (let v = 0; v < vCount; v++) trackObjs.push(await val(clone.getVideoTrack(v)));
+    for (let a = 0; a < aCount; a++) trackObjs.push(await val(clone.getAudioTrack(a)));
+    const MT = (ppro.Constants && ppro.Constants.MediaType) || {};
+    const mediaAny = MT.ANY !== undefined ? MT.ANY : 0;
+    const selection = await val(clone.getSelection());
+    if (!selection || typeof selection.addItem !== "function") throw new Error("Could not get a selection on the cloned sequence.");
+    let toRemove = 0;
+    await lockedTransaction(project, "Syncitol: clear clone", (compound) => {
+        for (const t of trackObjs) {
+            for (const it of (t.getTrackItems(TRACK_ITEM_CLIP, false) || [])) { selection.addItem(it); toRemove += 1; }
+        }
+        if (toRemove) compound.addAction(editor.createRemoveItemsAction(selection, false, mediaAny, false));
+    });
+    try { await val(clone.clearSelection()); } catch (e) {}
+    {
+        const left = (await listTracks(clone)).tracks.reduce((n, t) => n + t.clipCount, 0);
+        if (left) throw new Error(`Could not clear the cloned sequence (${left} of ${toRemove} items remain).`);
+    }
+
+    // ── Place each block ────────────────────────────────────────────────────
+    const placed = [];
+    const failed = []; // [{ filePath, reason }]
+    let nextAudio = 0;
+    let nextVideo = 0;
+    for (const block of blocks) {
+        const vIdx = block.hasVideo ? nextVideo++ : -1;
+        const aIdx = nextAudio;
+        step(`place ${block.label}: ${block.files.length} file(s) at V${vIdx + 1}/A${aIdx + 1}`);
+        await lockedTransaction(project, "Syncitol: place " + block.label, (compound) => {
+            for (const f of block.files) {
+                const pi = itemByPath[f.filePath];
+                if (!pi) { failed.push({ filePath: f.filePath, reason: "its project item could not be read" }); continue; }
+                try {
+                    const ok = compound.addAction(editor.createOverwriteItemAction(
+                        pi, ppro.TickTime.createWithSeconds(f.startSec), vIdx, aIdx));
+                    if (ok === false) failed.push({ filePath: f.filePath, reason: "Premiere refused the placement" });
+                    else placed.push(Object.assign({ videoTrack: vIdx, audioTrack: aIdx, label: block.label }, f));
+                } catch (e) {
+                    failed.push({ filePath: f.filePath, reason: msgOf(e) });
+                }
+            }
+        });
+        // Next block starts below the lowest audio track now holding a clip.
+        const inv = await listTracks(clone);
+        let lastAudio = -1;
+        for (const t of inv.tracks) if (t.trackType === "audio" && t.clipCount > 0) lastAudio = Math.max(lastAudio, t.trackIndex);
+        nextAudio = Math.max(nextAudio, lastAudio + 1);
+    }
+
+    // ── Read back ───────────────────────────────────────────────────────────
+    // Every file once, where it was asked to go, with its sound under its
+    // picture. A frame of snapping is expected; anything more is reported.
+    const scan = await scanSequence(clone);
+    const firstByPath = {};
+    for (const c of scan.clips) {
+        const cur = firstByPath[c.filePath];
+        if (!cur || (c.trackType === "video" && cur.trackType !== "video")) firstByPath[c.filePath] = c;
+    }
+    const misplaced = [];
+    for (const p of placed) {
+        const c = firstByPath[p.filePath];
+        if (!c) { misplaced.push({ filePath: p.filePath, reason: "not found on the timeline after placing" }); continue; }
+        if (Math.abs(c.startSec - p.startSec) > 0.1) {
+            misplaced.push({ filePath: p.filePath, reason: `landed at ${c.startSec.toFixed(2)} s instead of ${p.startSec.toFixed(2)} s` });
+        }
+    }
+    const links = dsp.auditLinkAlignment(scan.clips);
+
+    return {
+        sequence: clone, name: await val(clone.name),
+        placed: placed.length, total: blocks.reduce((n, b) => n + b.files.length, 0),
+        failed, misplaced, misaligned: links.misaligned || [], removed: toRemove, carriedOver,
+        tracks: { video: nextVideo, audio: nextAudio }
+    };
+}
+
+// Which bin a project item sits in, as "Parent/Child" from the project root
+// down. "" when unknown. Never throws: a bin is only a hint.
+async function getBinPath(projectItem) {
+    const names = [];
+    try {
+        let node = projectItem;
+        for (let d = 0; d < 12 && node; d++) {
+            if (typeof node.getParentBin !== "function" && ppro.ProjectItem && ppro.ProjectItem.cast) {
+                try { node = ppro.ProjectItem.cast(node); } catch (e) { break; }
+            }
+            if (!node || typeof node.getParentBin !== "function") break;
+            const bin = await val(node.getParentBin());
+            if (!bin) break;
+            const name = String(await val(bin.name));
+            if (names.length && names[names.length - 1] === name) break; // the root reports itself
+            names.push(name);
+            node = bin;
+        }
+    } catch (e) { /* partial chain is fine */ }
+    // The last name is the project root itself; it says nothing.
+    if (names.length) names.pop();
+    return names.reverse().join("/");
+}
+
+// A small text file's contents, or null.
+async function readTextFile(filePath) {
+    try {
+        const fs = require("fs");
+        return String(await fs.readFile(filePath, "utf-8"));
+    } catch (e) {
+        return null;
+    }
+}
+
 // File modification time (ms) — fallback record-start source when a file carries
 // no embedded creation_time/modification_date. UXP fs is promise-based with
 // fullAccess (manifest). Returns null on any failure (it's only a fallback).
@@ -721,5 +888,5 @@ module.exports = {
     getActiveProject, getActiveSequence, getActiveSequenceName, renameSequence,
     scanSequence, scanActiveSequence, listTracks, listActiveSequenceTracks,
     applyStarts, applyShifts, buildSyncSequence, verifyMovement, repairTornFiles,
-    mendLinkAlignment, statMtimeMs
+    mendLinkAlignment, statMtimeMs, buildSourceSequence, getBinPath, readTextFile
 };

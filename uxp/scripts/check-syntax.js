@@ -16,7 +16,9 @@ const FILES = [
     "js/pek.js",
     "js/premiere.js",
     "js/main.js",
+    "js/sources.js",
     "tests/dsp.test.js",
+    "tests/sources.test.js",
     "scripts/check-syntax.js",
 ];
 

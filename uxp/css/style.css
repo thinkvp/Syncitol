@@ -173,7 +173,9 @@ body {
     color: var(--text-lo);
     flex-shrink: 0;
     margin-right: 10px;
+    width: 96px;
 }
+.ref-row + .ref-row { margin-top: 6px; padding-top: 0; border-top: none; }
 .picker { position: relative; flex: 1; min-width: 0; }
 .picker-trigger {
     display: flex;
@@ -191,7 +193,7 @@ body {
 .picker-trigger:hover { border-color: var(--border-lit); }
 .picker-trigger.is-open { border-color: var(--accent); }
 .picker-trigger.is-disabled { opacity: 0.35; cursor: default; pointer-events: none; }
-#ref-trigger-text { flex: 1; min-width: 0; overflow: hidden; }
+#ref-trigger-text, #layout-trigger-text { flex: 1; min-width: 0; overflow: hidden; }
 .picker-caret { color: var(--text-lo); font-size: 9px; margin-left: 6px; flex-shrink: 0; }
 .picker-menu {
     position: absolute;

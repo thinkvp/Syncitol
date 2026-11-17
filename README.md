@@ -24,6 +24,14 @@ If Syncitol saves you a re-sync session, consider tipping on
   **Audio reference** dropdown overrides that: pick any track with clips (your
   field recorder, the main camera) and everything else is aligned to the
   recordings on it. Default is **Auto**.
+- **Messy timelines welcome.** The sync treats each track as one recording
+  device. If a track holds two of them — every clip dumped on V1, a recorder
+  sharing a camera's audio track — Syncitol works out which device recorded
+  each file (container, camera model/serial from Sony sidecars, folder, bin,
+  file naming, and which files were recording at the same time) and builds the
+  `-SYNC` sequence fresh with one track block per device. The **Track layout**
+  dropdown is **Auto-detect** by default; **Keep my tracks** always clones the
+  timeline as it is, and **Rebuild by device** always rebuilds.
 
 ## Requirements
 
@@ -88,7 +96,7 @@ resolves from Premiere's `.pek` peak cache with no audio decoding.
 | Host ops (`uxp/js/premiere.js`) | Verified live: scan, clone-based Build (**createMoveAction**, not createSetStartAction — see note), transactional shifts, undo = one step, per-file all-or-nothing moves + post-apply A/V integrity read-back |
 | Engine (`uxp/js/main.js`) | Staged coarse (pek → timecode → timestamp → learned → head → full), fine pass with rail guard, clock-drift report, cancel, boundary compensation |
 | Caches | Envelope disk cache in the plugin data folder (30-day prune); `.pek`/`.mcdb` index via UXP fs |
-| UI | Auto Sync, Audio reference picker, Detected Clips + Sync Results tables, score badges, Revert, Cancel, copy-log button, active-sequence polling, instructions overlay |
+| UI | Auto Sync, Audio reference + Track layout pickers, Detected Clips + Sync Results tables, score badges, Revert, Cancel, copy-log button, active-sequence polling, instructions overlay |
 | Packaging | `npm run build` → `uxp/dist/Syncitol-UXP-<version>.ccx` (minimal staging; never bundles native sources or shared FFmpeg DLLs) |
 
 ---
@@ -108,7 +116,11 @@ The plugin source lives in [`uxp/`](uxp/); all commands below run from there.
 3. **Pek fast path:** `js/pek.js` — maps media → `.pek` via Adobe's `.mcdb`
    media-cache records and serves coarse envelopes straight from the peaks.
 4. **Host (JS → UXP DOM):** `js/premiere.js` — scan, clone-based build, delta
-   moves, rename, all inside `lockedAccess` + `executeTransaction`.
+   moves, rename, rebuild-by-device placement, all inside `lockedAccess` +
+   `executeTransaction`.
+
+Device detection and the rebuild layout are pure and unit-tested in
+`js/sources.js`.
 
 ### Host API notes (verified on PPro 26.3)
 
@@ -119,6 +131,9 @@ The plugin source lives in [`uxp/`](uxp/); all commands below run from there.
   group by the same delta. Links (including 4-item MXF video+3×audio groups)
   survive clone + move — no re-link API is needed (UXP has none).
 - `Constants.TrackItemType`: EMPTY 0, CLIP 1, TRANSITION 2, PREVIEW 3, FEEDBACK 4.
+- `SequenceEditor` overwrite/insert actions need the **plain** `ProjectItem`
+  (a `ClipProjectItem.cast()` one is "Invalid parameter"). A track index past
+  the end appends tracks without gaps, and placed clips arrive A/V-linked.
 - UXP `<button>` widgets ignore author CSS backgrounds — actions are styled
   `<div class="btn">` elements with an `.is-disabled` class.
 
