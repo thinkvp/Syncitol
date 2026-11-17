@@ -598,7 +598,7 @@ async function applyShifts(shifts, opts) {
 const MAX_SPAN_SEC = 86400; // Premiere timelines cannot exceed 24 hours
 const MIN_PLACE_SEC = 0.001; // below this, a build placement delta is "already placed"
 
-async function buildSyncSequence(clipPayload, baseName) {
+async function buildSyncSequence(clipPayload, baseName, layoutOpts) {
     const step = (m) => { try { console.log("[build] " + m); } catch (e) {} if (typeof buildSyncSequence.onStep === "function") buildSyncSequence.onStep(m); };
 
     step("1 getActiveProject");
@@ -615,19 +615,22 @@ async function buildSyncSequence(clipPayload, baseName) {
     // the same plan when it draws the Detected Clips table and get the same
     // answer without having to be handed this one.
     const trackKeyOf = (c) => `${c.trackType}_${c.trackIndex}`;
-    const layout = dsp.planBuildAnchors(clipPayload);
+    const layout = dsp.planBuildAnchors(clipPayload, layoutOpts);
     const trackEarliestMs = layout.anchorMsByTrack;
     step(`layout: ${layout.groups.length} shared-clock group(s), ${layout.ungrouped.length} track(s) on their own`);
 
     // ── 24-hour span guard (per track) ───────────────────────────────────────
+    // Lifted when recording days were closed up (maxSpanSec Infinity): the
+    // timeline then deliberately runs as long as the shoot.
+    const spanLimit = (layoutOpts && layoutOpts.maxSpanSec !== undefined) ? layoutOpts.maxSpanSec : MAX_SPAN_SEC;
     for (const c of clipPayload) {
         const tk = trackKeyOf(c);
         const endSec = (c.recordStartMs - trackEarliestMs[tk]) / 1000 + (c.durationSec || 0);
-        if (endSec > MAX_SPAN_SEC) {
+        if (endSec > spanLimit) {
             const typeLabel = c.trackType === "video" ? "Video" : "Audio";
             throw new Error(
                 `${typeLabel} track ${c.trackIndex + 1} spans ${Math.round(endSec / 3600)}h — ` +
-                `exceeds Premiere's 24-hour maximum. Process one recording day at a time.`);
+                `past Premiere's 24-hour timecode. Set Recording days to Multiple days.`);
         }
     }
 
@@ -869,6 +872,30 @@ async function readTextFile(filePath) {
     }
 }
 
+// Sequence markers on the active sequence: [{ name, comment, startSec }].
+// Verified on PPro 26.3.2: Markers.getMarkers(seq).createAddMarkerAction(name,
+// markerType, start, duration, comments). Returns how many the host accepted.
+async function addMarkers(markers) {
+    if (!markers || !markers.length || !ppro.Markers) return 0;
+    const project = await getActiveProject();
+    const seq = await val(project.getActiveSequence());
+    if (!seq) return 0;
+    const list = await val(ppro.Markers.getMarkers(seq));
+    if (!list || typeof list.createAddMarkerAction !== "function") return 0;
+    let added = 0;
+    await lockedTransaction(project, "Syncitol: mark recording days", (compound) => {
+        for (const m of markers) {
+            try {
+                const action = list.createAddMarkerAction(m.name, "Comment",
+                    ppro.TickTime.createWithSeconds(Math.max(0, m.startSec)),
+                    ppro.TickTime.createWithSeconds(0), m.comment || "");
+                if (compound.addAction(action) !== false) added += 1;
+            } catch (e) { /* counted as not added */ }
+        }
+    });
+    return added;
+}
+
 // File modification time (ms) — fallback record-start source when a file carries
 // no embedded creation_time/modification_date. UXP fs is promise-based with
 // fullAccess (manifest). Returns null on any failure (it's only a fallback).
@@ -888,5 +915,5 @@ module.exports = {
     getActiveProject, getActiveSequence, getActiveSequenceName, renameSequence,
     scanSequence, scanActiveSequence, listTracks, listActiveSequenceTracks,
     applyStarts, applyShifts, buildSyncSequence, verifyMovement, repairTornFiles,
-    mendLinkAlignment, statMtimeMs, buildSourceSequence, getBinPath, readTextFile
+    mendLinkAlignment, statMtimeMs, buildSourceSequence, getBinPath, readTextFile, addMarkers
 };

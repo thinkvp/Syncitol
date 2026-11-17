@@ -1811,8 +1811,19 @@
 
         // Sorted by start, a run of overlapping spans is contiguous: each track
         // either reaches the running end of the current group or begins a new one.
+        // shareAnchor (recording days closed up, sessions.js): every clock-dated
+        // track is one run — no clock can push clips days away any more, so a
+        // track nothing overlaps still belongs at its clock position.
         var runs = [];
         var run = null;
+        if (opts.shareAnchor && eligible.length > 1) {
+            run = { members: eligible.slice(), startMs: eligible[0].startMs, endMs: eligible[0].endMs, shared: true };
+            for (var sr = 1; sr < eligible.length; sr += 1) {
+                if (eligible[sr].endMs > run.endMs) run.endMs = eligible[sr].endMs;
+            }
+            runs.push(run);
+            eligible = [];
+        }
         for (var r = 0; r < eligible.length; r += 1) {
             var track = eligible[r];
             if (run && track.startMs < run.endMs) {
@@ -1852,7 +1863,7 @@
                 keys.push(members[n].trackKey);
                 out.anchorMsByTrack[members[n].trackKey] = runs[k].startMs;
             }
-            out.groups.push({ trackKeys: keys, anchorMs: runs[k].startMs, spanSec: spanSec });
+            out.groups.push({ trackKeys: keys, anchorMs: runs[k].startMs, spanSec: spanSec, shared: !!runs[k].shared });
         }
 
         return out;

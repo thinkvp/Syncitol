@@ -15,6 +15,7 @@ const audio = require("./js/audio");
 const premiere = require("./js/premiere");
 const pek = require("./js/pek");
 const sources = require("./js/sources");
+const sessions = require("./js/sessions");
 
 // How many clips' decode passes to run concurrently. The addon decode itself is
 // synchronous on the scripting thread, so this mostly overlaps cache/disk reads
@@ -71,6 +72,8 @@ let lastLiveSeqName;           // last active-sequence name the idle poll reflec
 let cancelRequested = false;   // set by the Cancel button; checked at every async seam
 let lastFineTuneRevert = null; // inverse shift list that undoes the last applied fine tune
 let rebuildPlan = null;        // set by refreshSequence when Build must lay the sequence out by source
+let lastDays = null;           // { closed, plan, embeddedPaths } from the last planning scan
+let clipLayoutOpts;            // dsp.planBuildAnchors options clipPayload was planned with
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -95,9 +98,6 @@ const toolStatusEl = $("tool-status");
 const refTrigger = $("ref-trigger");
 const refTriggerText = $("ref-trigger-text");
 const refMenu = $("ref-menu");
-const layoutTrigger = $("layout-trigger");
-const layoutTriggerText = $("layout-trigger-text");
-const layoutMenu = $("layout-menu");
 
 // Actions are styled <div class="btn"> elements (UXP's native <button> widget
 // ignores author backgrounds), so disabled state is a class, not a property.
@@ -360,16 +360,16 @@ function beginOp(text) {
     }
     opDepth += 1;
     closeRefMenu();
-    closeLayoutMenu();
+    closeModePickers();
     setDisabled(refTrigger, true);
-    setDisabled(layoutTrigger, true);
+    setModePickersDisabled(true);
     setBusy(text);
 }
 function endOp() {
     opDepth = Math.max(0, opDepth - 1);
     if (opDepth === 0) {
         setDisabled(refTrigger, false);
-        setDisabled(layoutTrigger, false);
+        setModePickersDisabled(false);
         setBusy(null);
     }
 }
@@ -511,7 +511,7 @@ function renderRefMenu() {
 }
 
 function openRefMenu() {
-    closeLayoutMenu();
+    closeModePickers();
     renderRefMenu();
     refMenu.style.display = "block";
     refTrigger.classList.add("is-open");
@@ -594,71 +594,101 @@ refTrigger.addEventListener("click", (e) => {
 // is a no-op on some build.
 (document.body || document).addEventListener("click", (e) => {
     if (refMenuOpen && !isInside(e.target, refMenu) && !isInside(e.target, refTrigger)) closeRefMenu();
-    if (layoutMenuOpen && !isInside(e.target, layoutMenu) && !isInside(e.target, layoutTrigger)) closeLayoutMenu();
+    for (const p of modePickers) if (p.open && !p.contains(e.target)) p.close();
 });
 
-// ─── Track layout picker ──────────────────────────────────────────────────────
-// Every stage after the build treats one TRACK as one recording device. When
-// the editor's timeline is not laid out that way — two cameras on V1, a
-// recorder sharing a camera's audio track — the -SYNC sequence is built fresh
-// with one block of tracks per device instead of cloned (sources.js decides
-// which files belong together; premiere.buildSourceSequence places them).
+// ─── Mode pickers (Track layout, Recording days) ──────────────────────────────
+// Fixed-choice dropdowns built like the reference picker, remembered per
+// install. `pick.mode` is the current key.
+const modePickers = [];
+function makeModePicker(cfg) {
+    const pick = {
+        mode: (() => {
+            const saved = lsGet(cfg.storageKey);
+            return cfg.modes.some(m => m.key === saved) ? saved : cfg.modes[0].key;
+        })(),
+        open: false,
+        trigger: cfg.trigger,
+        close() {
+            cfg.menu.style.display = "none";
+            cfg.trigger.classList.remove("is-open");
+            pick.open = false;
+        },
+        select(key) {
+            pick.close();
+            if (key === pick.mode || !cfg.modes.some(m => m.key === key)) return;
+            pick.mode = key;
+            lsSet(cfg.storageKey, key);
+            update();
+            const m = cfg.modes.find(x => x.key === key);
+            log(`${cfg.title}: ${m.short} — ${m.meta}.`);
+        },
+        contains(node) { return isInside(node, cfg.menu) || isInside(node, cfg.trigger); }
+    };
+    function update() {
+        cfg.text.textContent = (cfg.modes.find(x => x.key === pick.mode) || cfg.modes[0]).short;
+    }
+    cfg.trigger.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (pick.open) { pick.close(); return; }
+        closeRefMenu();
+        closeModePickers();
+        cfg.menu.innerHTML = "";
+        for (const opt of cfg.modes) {
+            const item = document.createElement("div");
+            item.className = "picker-item" + (opt.key === pick.mode ? " is-selected" : "");
+            item.innerHTML =
+                `<span class="picker-item-key">${escapeHtml(opt.short)}</span>` +
+                `<span class="picker-item-meta">${escapeHtml(opt.meta)}</span>`;
+            item.addEventListener("click", () => pick.select(opt.key));
+            cfg.menu.appendChild(item);
+        }
+        cfg.menu.style.display = "block";
+        cfg.trigger.classList.add("is-open");
+        pick.open = true;
+    });
+    update();
+    modePickers.push(pick);
+    return pick;
+}
+function closeModePickers() { for (const p of modePickers) if (p.open) p.close(); }
+function setModePickersDisabled(d) { for (const p of modePickers) setDisabled(p.trigger, d); }
+
+// Track layout. Every stage after the build treats one TRACK as one recording
+// device. When the editor's timeline is not laid out that way — two cameras on
+// V1, a recorder sharing a camera's audio track — the -SYNC sequence is built
+// fresh with one block of tracks per device instead of cloned (sources.js
+// decides which files belong together; premiere.buildSourceSequence places
+// them).
 //   auto    — rebuild only when a track provably holds two devices
 //   keep    — always clone the timeline as it is (the pre-1.8 behaviour)
 //   rebuild — always rebuild by device
-const LAYOUT_MODE_KEY = "syncitol-track-layout";
-const LAYOUT_MODES = [
-    { key: "auto", short: "Auto-detect", meta: "rebuild only if a track mixes devices" },
-    { key: "keep", short: "Keep my tracks", meta: "each track is already one device" },
-    { key: "rebuild", short: "Rebuild by device", meta: "one track block per camera / recorder" }
-];
-let layoutMode = (() => {
-    const saved = lsGet(LAYOUT_MODE_KEY);
-    return LAYOUT_MODES.some(m => m.key === saved) ? saved : "auto";
-})();
-let layoutMenuOpen = false;
-
-function updateLayoutTrigger() {
-    const m = LAYOUT_MODES.find(x => x.key === layoutMode) || LAYOUT_MODES[0];
-    layoutTriggerText.textContent = m.short;
-}
-function renderLayoutMenu() {
-    layoutMenu.innerHTML = "";
-    for (const opt of LAYOUT_MODES) {
-        const item = document.createElement("div");
-        item.className = "picker-item" + (opt.key === layoutMode ? " is-selected" : "");
-        item.innerHTML =
-            `<span class="picker-item-key">${escapeHtml(opt.short)}</span>` +
-            `<span class="picker-item-meta">${escapeHtml(opt.meta)}</span>`;
-        item.addEventListener("click", () => selectLayoutMode(opt.key));
-        layoutMenu.appendChild(item);
-    }
-}
-function closeLayoutMenu() {
-    if (!layoutMenu) return;
-    layoutMenu.style.display = "none";
-    layoutTrigger.classList.remove("is-open");
-    layoutMenuOpen = false;
-}
-function selectLayoutMode(key) {
-    closeLayoutMenu();
-    if (key === layoutMode) return;
-    layoutMode = key;
-    lsSet(LAYOUT_MODE_KEY, key);
-    updateLayoutTrigger();
-    const m = LAYOUT_MODES.find(x => x.key === key);
-    log(`Track layout: ${m.short} — ${m.meta}.`);
-}
-layoutTrigger.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (layoutMenuOpen) { closeLayoutMenu(); return; }
-    closeRefMenu();
-    renderLayoutMenu();
-    layoutMenu.style.display = "block";
-    layoutTrigger.classList.add("is-open");
-    layoutMenuOpen = true;
+const layoutPicker = makeModePicker({
+    title: "Track layout", storageKey: "syncitol-track-layout",
+    trigger: $("layout-trigger"), text: $("layout-trigger-text"), menu: $("layout-menu"),
+    modes: [
+        { key: "auto", short: "Auto-detect", meta: "rebuild only if a track mixes devices" },
+        { key: "keep", short: "Keep my tracks", meta: "each track is already one device" },
+        { key: "rebuild", short: "Rebuild by device", meta: "one track block per camera / recorder" }
+    ]
 });
-updateLayoutTrigger();
+
+// Recording days. The build lays clips out by their recording clock, so a
+// second day lands a whole night after the first — past the 24-hour timecode.
+// Multiple days closes the gaps between recording sessions (sessions.js) and
+// marks where each day starts.
+//   auto   — close the gaps only when the clock layout would pass 24 hours
+//   single — never (the pre-1.8 behaviour: a build over 24 hours is refused)
+//   multi  — always close gaps longer than two hours
+const daysPicker = makeModePicker({
+    title: "Recording days", storageKey: "syncitol-recording-days",
+    trigger: $("days-trigger"), text: $("days-trigger-text"), menu: $("days-menu"),
+    modes: [
+        { key: "auto", short: "Auto-detect", meta: "close overnight gaps only if over 24 h" },
+        { key: "single", short: "Single day", meta: "lay out by real clock time" },
+        { key: "multi", short: "Multiple days", meta: "close gaps over 2 h between sessions" }
+    ]
+});
 
 // ─── Decoder availability (footer chip) ───────────────────────────────────────
 function updateToolStatus(ok, detail) {
@@ -2481,6 +2511,7 @@ async function planTrackLayout(scan, enriched) {
     }
     if (check.mixed.length > 6) log(`Track layout: ${check.mixed.length - 6} more mixed track(s).`, "warn");
 
+    const layoutMode = layoutPicker.mode;
     const rebuild = layoutMode === "rebuild" || (layoutMode === "auto" && !check.ok);
     if (!rebuild) {
         if (check.ok) {
@@ -2515,6 +2546,64 @@ async function planTrackLayout(scan, enriched) {
         log(`⚠ ${missing.length} file(s) had no readable recording time and will be left out of the rebuilt sequence.`, "warn");
     }
     return { payload: plan.payload, plan };
+}
+
+// ─── Recording days ───────────────────────────────────────────────────────────
+// Decides whether to close the gaps between recording sessions and, if so,
+// returns the payload with every recordStartMs moved by its session's shift
+// (the clock reading stays in rawRecordStartMs). The re-scan of a freshly
+// built -SYNC sequence repeats the decision the build was planned with.
+function applyRecordingDays(files, opts) {
+    const plan = sessions.planSessions(files);
+    const multi = plan.sessions.length > 1;
+    let close;
+    if (opts.planLayout === false && lastDays) close = lastDays.closed && multi;
+    else if (daysPicker.mode === "multi") close = multi;
+    else if (daysPicker.mode === "single") close = false;
+    else close = multi && sessions.spansDays(files);
+
+    if (opts.planLayout === false) return close ? sessions.closeGaps(files, plan) : files;
+
+    lastDays = {
+        closed: close, plan,
+        embeddedPaths: new Set(files.filter(f => isEmbeddedSource(f.timingSource)).map(f => f.filePath))
+    };
+    if (!close) {
+        if (multi && daysPicker.mode === "single") {
+            log(`ℹ Recording days: ${plan.sessions.length} recording sessions with breaks of over 2 h between them, ` +
+                `built as one day because Single day is selected. If they are separate days, choose Multiple days so ` +
+                `each day follows the last instead of starting at 0:00.`, "info");
+        }
+        return files;
+    }
+    const labels = sessions.sessionLabels(plan, dsp.formatDate);
+    log(`Recording days: ${plan.sessions.length} recording sessions — ` +
+        labels.map(l => l.fileDated ? `files dated ${l.comment} (copy or processing times)` : `${l.name} from ${l.comment}`).join(", ") +
+        `. The ${formatDuration(plan.closedSec * 1000)} ` +
+        `of gaps between them are closed up, so each session starts five minutes after the last one ends; within a ` +
+        `session every clip keeps its real offset. A marker names each day once the sync is done.`, "info");
+    return sessions.closeGaps(files, plan);
+}
+
+// Drop a sequence marker at the start of each recording session, once the
+// audio pass has put every clip in its final place.
+async function markRecordingDays() {
+    if (!lastDays || !lastDays.closed || lastDays.plan.sessions.length < 2) return;
+    try {
+        const scan = await premiere.scanActiveSequence();
+        const starts = sessions.sessionStarts(lastDays.plan, scan.clips, lastDays.embeddedPaths);
+        const labels = sessions.sessionLabels(lastDays.plan, dsp.formatDate);
+        const markers = starts.map(st => ({
+            name: labels[st.index].name,
+            comment: `Recorded ${labels[st.index].comment}`,
+            startSec: st.startSec
+        }));
+        const added = await premiere.addMarkers(markers);
+        if (added) log(`Marked ${added} recording day${added !== 1 ? "s" : ""} on the timeline (${markers.map(m => m.name).join(", ")}).`, "success");
+        else if (markers.length) log("⚠ Could not add the recording-day markers to the timeline.", "warn");
+    } catch (e) {
+        log(`⚠ Could not add the recording-day markers: ${e.message}`, "warn");
+    }
 }
 
 // ─── Scan: read active sequence ───────────────────────────────────────────────
@@ -2618,19 +2707,34 @@ async function refreshSequence(opts) {
         // corroborates keeps its own earliest clip as its anchor. Same call and
         // same inputs as buildSyncSequence makes — so the Offset column below
         // shows what will actually be built.
+        // Recording days: close the overnight gaps when the shoot spans more
+        // than one recording session. Every plan below works on the
+        // closed-up times.
+        enriched = applyRecordingDays(enriched, opts);
+        const daysClosed = enriched.some(f => f.rawRecordStartMs !== undefined);
+        // Closed-up days: every clock-dated track shares one anchor, and the
+        // timeline may run past 24 hours (only the timecode display wraps).
+        const layoutOpts = daysClosed ? { shareAnchor: true, maxSpanSec: Infinity } : undefined;
+
         let pendingPlan = null;
         if (opts.planLayout !== false) {
             const tl = await planTrackLayout(scan, enriched);
             enriched = tl.payload;
             pendingPlan = tl.plan;
         }
-        const layout = dsp.planBuildAnchors(enriched);
+        const layout = dsp.planBuildAnchors(enriched, layoutOpts);
         const trackEarliestMs = layout.anchorMsByTrack;
+        clipLayoutOpts = layoutOpts;
         if (pendingPlan) {
             rebuildPlan = { blocks: sources.placementTimes(pendingPlan, trackEarliestMs) };
         }
         for (const group of layout.groups) {
             const names = group.trackKeys.map(dsp.trackKeyLabel).join(", ");
+            if (group.shared) {
+                log(`Build layout: ${names} carry recording clocks, and with the gaps between days closed they share one ` +
+                    `anchor — each is laid out at its clock position (${formatDuration(group.spanSec * 1000)} of timeline).`, "success");
+                continue;
+            }
             log(`Build layout: ${names} were recording at the same time, so their clocks agree — ` +
                 `they will be laid out at their real offsets from each other ` +
                 `(${formatDuration(group.spanSec * 1000)} of shoot). The audio pass only has to fine-tune.`, "success");
@@ -2679,7 +2783,7 @@ async function refreshSequence(opts) {
             tr.innerHTML = `
                 <td class="cell-name" title="${escapeHtml(f.filePath)}">${escapeHtml(audio.baseName(f.filePath))}</td>
                 <td class="cell-type ${f.trackType}">${f.trackType === "video" ? "🎬" : "🎵"} ${f.trackType}</td>
-                <td class="cell-time" title="timing source: ${escapeHtml(f.timingSource)}">${formatTime(f.recordStartMs)} <span class="cell-src">${srcTag}</span></td>
+                <td class="cell-time" title="timing source: ${escapeHtml(f.timingSource)}">${f.rawRecordStartMs !== undefined ? dsp.formatDate(f.rawRecordStartMs) : formatTime(f.recordStartMs)} <span class="cell-src">${srcTag}</span></td>
                 <td class="cell-offset">${formatDuration(offsetMs)}</td>
             `;
             clipBody.appendChild(tr);
@@ -2690,7 +2794,7 @@ async function refreshSequence(opts) {
         // When one device has a wildly wrong clock (years off) the per-track
         // anchor keeps each track compact; the audio pass aligns tracks later.
         let hasSpanViolation = false;
-        for (const f of enriched) {
+        for (const f of (daysClosed ? [] : enriched)) {
             const tk = `${f.trackType}_${f.trackIndex}`;
             const endSec = (f.recordStartMs - trackEarliestMs[tk]) / 1000 + f.durationSec;
             if (endSec > dsp.MAX_SPAN_SEC) {
@@ -2700,9 +2804,20 @@ async function refreshSequence(opts) {
         }
         const globalSpanSec = (Math.max(...enriched.map(f => f.recordStartMs + f.durationSec * 1000)) - globalEarliestMs) / 1000;
         if (hasSpanViolation) {
-            log(`\u26a0 A track exceeds Premiere\u2019s 24-hour maximum — process one recording day at a time.`, "warn");
+            log(`\u26a0 A track runs past Premiere\u2019s 24-hour timecode — the footage looks like more than one day. ` +
+                `Set Recording days to Multiple days (or Auto-detect) to close the gaps between days.`, "warn");
         }
-        if (!hasSpanViolation && globalSpanSec > dsp.MAX_SPAN_SEC) {
+        if (daysClosed) {
+            let endSec = 0;
+            for (const f of enriched) {
+                const a = trackEarliestMs[`${f.trackType}_${f.trackIndex}`];
+                if (isFinite(a)) endSec = Math.max(endSec, (f.recordStartMs - a) / 1000 + f.durationSec);
+            }
+            if (endSec > dsp.MAX_SPAN_SEC) {
+                log(`ℹ Even with the gaps closed the timeline runs ${formatDuration(endSec * 1000)}. Premiere accepts that, but its ` +
+                    `timecode display rolls over at 24:00:00 — use the day markers to find your way. Exporting past 24 hours is untested.`, "info");
+            }
+        } else if (!hasSpanViolation && globalSpanSec > dsp.MAX_SPAN_SEC) {
             log(`\u2139 Device clocks differ by ${(globalSpanSec / 3600).toFixed(0)}h (likely a wrong date on one device) — the tracks that disagree were anchored separately, so each stays compact; audio alignment will bring them together.`, "info");
         }
 
@@ -2711,7 +2826,7 @@ async function refreshSequence(opts) {
         setTimeout(() => setProgress(0, false), 600);
 
         if (hasSpanViolation) {
-            log("Cannot build the sync sequence \u2014 it must fit within Premiere\u2019s 24-hour maximum. Process one recording day at a time.", "error");
+            log("Cannot build the sync sequence \u2014 laid out by real clock time it runs past 24 hours. Set Recording days to Multiple days.", "error");
         } else if (opts.planLayout !== false) {
             log(`Ready to build "${scan.name}-SYNC".`, "success");
         }
@@ -2767,7 +2882,7 @@ async function buildSync() {
     try {
         const built = rebuildPlan
             ? await premiere.buildSourceSequence(rebuildPlan.blocks)
-            : await premiere.buildSyncSequence(clipPayload, scannedSeqName);
+            : await premiere.buildSyncSequence(clipPayload, scannedSeqName, clipLayoutOpts);
         setProgress(80);
 
         // Rename the clone to "<original>-SYNC".
@@ -2977,6 +3092,7 @@ async function autoSync() {
         }
 
         await fineTuneAudio();
+        if (!cancelRequested) await markRecordingDays();
         log(cancelRequested ? "Auto Sync cancelled." : "Auto Sync complete.", cancelRequested ? "warn" : "success");
         if (!cancelRequested) {
             const clipCount = (clipPayload || []).length;

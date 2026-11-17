@@ -32,6 +32,13 @@ If Syncitol saves you a re-sync session, consider tipping on
   `-SYNC` sequence fresh with one track block per device. The **Track layout**
   dropdown is **Auto-detect** by default; **Keep my tracks** always clones the
   timeline as it is, and **Rebuild by device** always rebuilds.
+- **Shoots over several days.** Laid out by the clock, day 2 would land a
+  whole night after day 1, past Premiere's 24-hour timecode. The **Recording
+  days** dropdown (default **Auto-detect**) finds the recording sessions and
+  closes the gaps between them to five minutes. Every clip keeps its real
+  offset within its day, and a sequence marker names each day. **Single day**
+  keeps the old layout; **Multiple days** always closes gaps longer than two
+  hours.
 
 ## Requirements
 
@@ -96,7 +103,7 @@ resolves from Premiere's `.pek` peak cache with no audio decoding.
 | Host ops (`uxp/js/premiere.js`) | Verified live: scan, clone-based Build (**createMoveAction**, not createSetStartAction — see note), transactional shifts, undo = one step, per-file all-or-nothing moves + post-apply A/V integrity read-back |
 | Engine (`uxp/js/main.js`) | Staged coarse (pek → timecode → timestamp → learned → head → full), fine pass with rail guard, clock-drift report, cancel, boundary compensation |
 | Caches | Envelope disk cache in the plugin data folder (30-day prune); `.pek`/`.mcdb` index via UXP fs |
-| UI | Auto Sync, Audio reference + Track layout pickers, Detected Clips + Sync Results tables, score badges, Revert, Cancel, copy-log button, active-sequence polling, instructions overlay |
+| UI | Auto Sync, Audio reference / Track layout / Recording days pickers, Detected Clips + Sync Results tables, score badges, Revert, Cancel, copy-log button, active-sequence polling, instructions overlay |
 | Packaging | `npm run build` → `uxp/dist/Syncitol-UXP-<version>.ccx` (minimal staging; never bundles native sources or shared FFmpeg DLLs) |
 
 ---
@@ -120,7 +127,7 @@ The plugin source lives in [`uxp/`](uxp/); all commands below run from there.
    `executeTransaction`.
 
 Device detection and the rebuild layout are pure and unit-tested in
-`js/sources.js`.
+`js/sources.js`; recording sessions and gap closing in `js/sessions.js`.
 
 ### Host API notes (verified on PPro 26.3)
 

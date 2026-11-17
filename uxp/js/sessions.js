@@ -1,0 +1,175 @@
+/**
+ * Syncitol — sessions.js
+ * Pure, host-independent: footage shot over more than one day.
+ *
+ * The build lays clips out by their recording clock, so a two-day shoot puts
+ * day 2 a full night after day 1 — past Premiere's 24-hour timecode (the
+ * timeline itself accepts it, but the timecode display wraps back to 00:00 and
+ * the editor is left scrolling across 16 empty hours). Instead, recording
+ * SESSIONS are found — runs of footage, across every device, with no break
+ * longer than SESSION_GAP_SEC — and the gaps between them are closed up to
+ * SESSION_PAD_SEC. Within a session nothing moves relative to anything else,
+ * so every device keeps its real offset from every other, and each device's
+ * clock error is the same on both days, which is what the coarse pass needs.
+ *
+ * With the gaps closed, a device's clock can no longer push its clips days
+ * away from everyone else's, so the build lays every clock-dated track out on
+ * ONE shared anchor (dsp.planBuildAnchors shareAnchor) — day 2's cameras land
+ * after day 1's instead of each day starting at 0:00. A long shoot can run past
+ * 24 hours; Premiere accepts that (verified to ~50 h on 26.3.2), only its
+ * timecode display rolls over, and a marker names each day.
+ *
+ * The mapping is a pure shift per session, applied to every file's
+ * recordStartMs before anything else plans on it. Overlaps are preserved
+ * exactly (a closed gap held no recording), so the timing plausibility checks
+ * and device detection see what they would have seen.
+ *
+ * Loadable as a CommonJS module (UXP `require()` and node:test).
+ */
+
+"use strict";
+
+const SESSION_GAP_SEC = 2 * 3600; // a break longer than this ends a recording session
+const SESSION_PAD_SEC = 300;      // what is left of a closed-up gap
+const MAX_SPAN_SEC = 86400;       // Premiere's 24-hour timecode
+
+const EMBEDDED = new Set(["creation_time", "modification_date", "timecode"]);
+
+// files: [{ filePath, recordStartMs, durationSec, timingSource }]
+// Returns {
+//   sessions: [{ index, startMs, endMs, files:[path], embedded, shiftMs }]
+//   shiftByPath: { path: ms subtracted from its recordStartMs }
+//   closedSec:  total time removed
+// }
+function planSessions(files, opts) {
+    opts = opts || {};
+    const gapMs = (opts.gapSec === undefined ? SESSION_GAP_SEC : opts.gapSec) * 1000;
+    const padMs = (opts.padSec === undefined ? SESSION_PAD_SEC : opts.padSec) * 1000;
+
+    const list = (files || [])
+        .filter(f => f && isFinite(f.recordStartMs))
+        .map(f => ({
+            filePath: f.filePath, startMs: f.recordStartMs,
+            endMs: f.recordStartMs + Math.max(0, f.durationSec || 0) * 1000,
+            embedded: EMBEDDED.has(f.timingSource)
+        }))
+        .sort((a, b) => (a.startMs - b.startMs) || String(a.filePath).localeCompare(String(b.filePath)));
+
+    const sessions = [];
+    let cur = null;
+    for (const f of list) {
+        if (cur && f.startMs - cur.endMs <= gapMs) {
+            cur.files.push(f.filePath);
+            if (f.endMs > cur.endMs) cur.endMs = f.endMs;
+            if (f.embedded) cur.embedded = true;
+        } else {
+            cur = { index: sessions.length, startMs: f.startMs, endMs: f.endMs, files: [f.filePath], embedded: f.embedded, shiftMs: 0 };
+            sessions.push(cur);
+        }
+    }
+
+    let shift = 0;
+    for (let i = 1; i < sessions.length; i += 1) {
+        const gap = sessions[i].startMs - sessions[i - 1].endMs;
+        shift += Math.max(0, gap - padMs);
+        sessions[i].shiftMs = shift;
+    }
+
+    const shiftByPath = {};
+    for (const s of sessions) for (const p of s.files) shiftByPath[p] = s.shiftMs;
+    return { sessions, shiftByPath, closedSec: shift / 1000 };
+}
+
+// The payload with each file's recordStartMs moved by its session's shift.
+// The clock reading is kept as rawRecordStartMs for display.
+function closeGaps(files, plan) {
+    return (files || []).map(f => {
+        const shift = plan.shiftByPath[f.filePath] || 0;
+        return Object.assign({}, f, {
+            rawRecordStartMs: f.rawRecordStartMs !== undefined ? f.rawRecordStartMs : f.recordStartMs,
+            recordStartMs: isFinite(f.recordStartMs) ? f.recordStartMs - shift : f.recordStartMs
+        });
+    });
+}
+
+// Does the footage span more than one day? Only embedded clocks are asked: a
+// file date is when the file was copied or processed, and a recorder whose
+// files were downloaded two days later is not a two-day shoot.
+function spansDays(files, opts) {
+    opts = opts || {};
+    const limit = (opts.maxSpanSec === undefined ? MAX_SPAN_SEC : opts.maxSpanSec) * 1000;
+    const timed = (files || []).filter(f => f && isFinite(f.recordStartMs) && EMBEDDED.has(f.timingSource));
+    if (timed.length < 2) return false;
+    let lo = Infinity, hi = -Infinity;
+    for (const f of timed) {
+        lo = Math.min(lo, f.recordStartMs);
+        hi = Math.max(hi, f.recordStartMs + Math.max(0, f.durationSec || 0) * 1000);
+    }
+    return hi - lo > limit && planSessions(timed, opts).sessions.length > 1;
+}
+
+// Marker names: "Day 1", "Day 2", … counted by calendar date (local time); a
+// second session on the same date becomes "Day 2 (2)". `dateLabel(ms)` formats
+// the start for the marker comment.
+function sessionLabels(plan, dateLabel) {
+    const dayOf = (ms) => { const d = new Date(ms); return d.getFullYear() + "-" + d.getMonth() + "-" + d.getDate(); };
+    const out = [];
+    let day = 0, lastKey = null, within = 0;
+    for (const s of plan.sessions) {
+        const comment = dateLabel ? dateLabel(s.startMs) : "";
+        if (s.embedded === false) {
+            // Only file dates: when files were copied or processed, which is
+            // no recording day at all.
+            out.push({ index: s.index, name: "File dates only", comment, fileDated: true });
+            continue;
+        }
+        const key = dayOf(s.startMs);
+        if (key !== lastKey) { day += 1; within = 1; lastKey = key; } else { within += 1; }
+        out.push({ index: s.index, name: "Day " + day + (within > 1 ? " (" + within + ")" : ""), comment });
+    }
+    return out;
+}
+
+// Where each session starts on the finished timeline: the earliest clip of a
+// file recorded in it. Only files with an embedded clock count — a file dated
+// by its copy time may belong to another session entirely, and the audio pass
+// will have moved it there. For the same reason a session that now starts
+// well inside the previous one (a camera whose wrong clock made a "session" of
+// its own, which the audio pass then put where it belongs) gets no marker.
+// clips: scan clips [{ filePath, startSec, endSec }]; embeddedPaths: Set.
+const MARKER_OVERLAP_TOL_SEC = 600;
+
+function sessionStarts(plan, clips, embeddedPaths) {
+    const span = {};
+    for (const c of clips || []) {
+        const e = span[c.filePath] || (span[c.filePath] = { start: Infinity, end: -Infinity });
+        e.start = Math.min(e.start, c.startSec);
+        e.end = Math.max(e.end, c.endSec === undefined ? c.startSec : c.endSec);
+    }
+    const out = [];
+    let prevEnd = -Infinity;
+    for (const s of plan.sessions) {
+        let start = Infinity, end = -Infinity;
+        for (const p of s.files) {
+            if (embeddedPaths && !embeddedPaths.has(p)) continue;
+            if (!span[p]) continue;
+            start = Math.min(start, span[p].start);
+            end = Math.max(end, span[p].end);
+        }
+        if (!isFinite(start)) continue;
+        if (start < prevEnd - MARKER_OVERLAP_TOL_SEC) continue;
+        out.push({ index: s.index, startSec: start });
+        prevEnd = Math.max(prevEnd, end);
+    }
+    return out;
+}
+
+module.exports = {
+    SESSION_GAP_SEC,
+    SESSION_PAD_SEC,
+    planSessions,
+    closeGaps,
+    spansDays,
+    sessionLabels,
+    sessionStarts
+};

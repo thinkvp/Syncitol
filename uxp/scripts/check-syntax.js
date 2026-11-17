@@ -17,8 +17,10 @@ const FILES = [
     "js/premiere.js",
     "js/main.js",
     "js/sources.js",
+    "js/sessions.js",
     "tests/dsp.test.js",
     "tests/sources.test.js",
+    "tests/sessions.test.js",
     "scripts/check-syntax.js",
 ];
 

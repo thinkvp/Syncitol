@@ -26,6 +26,23 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   onto its device's own block of tracks, at its recording time, before the
   audio pass runs as usual. Sequence settings carry over from the original.
   Trims, effects and titles do not, and the log says so.
+- **Shoots over several days.** The build lays clips out by their
+  recording clock, so a two-day shoot put day 2 a full night after day 1.
+  That timeline ran past Premiere's 24-hour timecode, and the build refused
+  it ("process one recording day at a time"). Syncitol now finds the
+  recording sessions: runs of footage across every device with no break
+  over two hours. It closes the gaps between them to five minutes. Within a
+  session nothing moves, so each device keeps its offset from the others,
+  and its clock error is the same on every day. With the gaps closed, every
+  clock-dated track shares one anchor, so day 2's cameras land after day 1's
+  instead of starting at 0:00. A sequence marker names each day ("Day 2",
+  with the recording date). Only embedded clocks decide what counts as a day:
+  files dated by a later copy or processing pass get no marker. A shoot that
+  is still over 24 hours with the gaps closed now builds anyway. Premiere
+  accepts it; only its timecode display rolls over.
+- **Recording days dropdown.** **Auto-detect** (default) closes the gaps only
+  when the clock-dated footage spans more than 24 hours. **Single day** keeps
+  the old layout. **Multiple days** always closes gaps over two hours.
 - **Track layout dropdown.** **Auto-detect** (default) rebuilds only when a
   track mixes devices. **Keep my tracks** always clones the timeline as it is,
   the old behaviour. **Rebuild by device** always rebuilds. The choice is
