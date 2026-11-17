@@ -401,13 +401,40 @@ function stopClock() {
     if (busyTime) busyTime.textContent = "";
     return took;
 }
+// Auto Sync's steps, for "Step 2 of 4" in the busy row and the timing
+// breakdown in the log. null outside Auto Sync.
+const AUTO_STEPS = ["reading clips", "building", "coarse align", "fine align"];
+let autoStep = null;    // { n, startedAt: [ms per step], endedAt }
+let busyLabel = "";
+
 function setBusy(text) {
     if (text) {
-        busyText.textContent = text;
+        busyLabel = text;
+        busyText.textContent = autoStep && autoStep.n
+            ? `Step ${autoStep.n} of ${AUTO_STEPS.length} · ${text}` : text;
         busyRow.style.display = "flex";
     } else {
         busyRow.style.display = "none";
     }
+}
+function enterStep(n) {
+    if (!autoStep) return;
+    autoStep.n = n;
+    autoStep.startedAt[n - 1] = Date.now();
+    if (busyLabel) setBusy(busyLabel);
+}
+function stepBreakdown() {
+    if (!autoStep) return "";
+    const end = Date.now();
+    const parts = [];
+    for (let i = 0; i < AUTO_STEPS.length; i += 1) {
+        const t0 = autoStep.startedAt[i];
+        if (!t0) continue;
+        let t1 = end;
+        for (let j = i + 1; j < AUTO_STEPS.length; j += 1) if (autoStep.startedAt[j]) { t1 = autoStep.startedAt[j]; break; }
+        parts.push(`${AUTO_STEPS[i]} ${formatDuration(Math.max(0, t1 - t0))}`);
+    }
+    return parts.join(" · ");
 }
 function beginOp(text) {
     if (opDepth === 0) {
@@ -1294,7 +1321,7 @@ async function analyzeCoarseAlign(anchors, onProgress) {
 
         // Hand the job its relay candidates and re-run confirmation on them.
         job.cands = cands;
-        job.relayScanned = scanned;
+        job.relayScanned = scannedTotal;
         job.verified = false;
         job.verifyOk = null;
         job.verifyRejected = null;
@@ -2665,10 +2692,17 @@ function applyRecordingDays(files, opts) {
 }
 
 // path → recording-session index, when the days were closed up; else null.
+// Only files with an EMBEDDED clock get a day. A file dated by when it was
+// copied or processed could belong to any day — DBTX-1 _001.wav, dated two
+// days after the shoot, was made the reference of a "day" of its own and never
+// aligned — so those are left out: no own reference, searched against every
+// day's reference recordings.
 function sessionIndexByPath() {
     if (!lastDays || !lastDays.closed || lastDays.plan.sessions.length < 2) return null;
     const out = {};
-    for (const sess of lastDays.plan.sessions) for (const p of sess.files) out[p] = sess.index;
+    for (const sess of lastDays.plan.sessions) {
+        for (const p of sess.files) if (lastDays.embeddedPaths.has(p)) out[p] = sess.index;
+    }
     return out;
 }
 
@@ -3069,6 +3103,7 @@ async function fineTuneAudio() {
         // Phase 1 — coarse auto-align (whole-track).
         const syncRows = [];
         const coarseDeltaByKey = new Map();
+        enterStep(3);
         setBusy("Fine tuning — coarse align…");
         log("Coarse align: scanning audio to find each track's offset — this can take a minute on long clips…");
         const coarse = await analyzeCoarseAlign(anchors, (done, total) => {
@@ -3079,6 +3114,7 @@ async function fineTuneAudio() {
         syncRows.push(...coarse.results);
 
         // Phase 2 — fine residual via per-clip waveform correlation.
+        enterStep(4);
         setBusy("Fine tuning — per-clip pass…");
         const fine = await analyzeFineTune(anchors, (done, total) => {
             setProgress(35 + Math.round((done / total) * 50));
@@ -3176,6 +3212,7 @@ async function autoSync() {
     setDisabled(btnAuto, true);
     log("Auto Sync: starting (scan → build → fine tune)…");
     const startedAt = Date.now();
+    autoStep = { n: 0, startedAt: [] };
 
     try {
         // Refuse to run on an already-built -SYNC sequence: the pipeline would
@@ -3186,6 +3223,7 @@ async function autoSync() {
             return;
         }
 
+        enterStep(1);
         const ready = await refreshSequence();
         if (!ready || cancelRequested) {
             log(cancelRequested
@@ -3194,6 +3232,7 @@ async function autoSync() {
             return;
         }
 
+        enterStep(2);
         const built = await buildSync();
         if (!built) {
             log("Auto Sync stopped: building the sync sequence failed (see above).", "warn");
@@ -3206,7 +3245,8 @@ async function autoSync() {
 
         await fineTuneAudio();
         if (!cancelRequested) await markRecordingDays();
-        log(cancelRequested ? "Auto Sync cancelled." : "Auto Sync complete.", cancelRequested ? "warn" : "success");
+        log(cancelRequested ? "Auto Sync cancelled." : `Auto Sync complete in ${formatDuration(Date.now() - startedAt)} (${stepBreakdown()}).`,
+            cancelRequested ? "warn" : "success");
         if (!cancelRequested) {
             const clipCount = (clipPayload || []).length;
             const footageMs = (clipPayload || []).reduce((sum, f) => sum + (f.durationSec || 0) * 1000, 0);
@@ -3219,6 +3259,7 @@ async function autoSync() {
         if (e && e.cancelled) log("Auto Sync cancelled.", "warn");
         else log(`✗ Auto Sync: ${e.message}`, "error");
     } finally {
+        autoStep = null;
         setDisabled(btnAuto, false);
         endOp();
     }

@@ -48,8 +48,22 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   which made a sync that took a minute per day run for 20 minutes or more.
   With the days closed up, each day now picks its own reference, and the
   coarse pass only compares clips from the same day.
-- **Elapsed time while syncing**, with an estimate of the time left in the
-  current step once it has run long enough to tell.
+  Recordings dated only by when they were copied or processed (no embedded
+  clock) belong to no day. They are searched against every day's
+  references, and never become a reference themselves. In a field test,
+  DBTX-1 _001.wav was dated two days after the shoot, so it was made the
+  reference of a "day" of its own, never aligned, and left sitting with
+  the wrong day's footage.
+- **Elapsed time while syncing**, with "Step 2 of 4" and an estimate of the
+  time left in the current step once it has run long enough to tell. The
+  log's last line now breaks the run down by step (reading clips, building,
+  coarse align, fine align).
+
+### Fixed
+- **The coarse pass's relay retry crashed after its search** ("relay
+  unavailable: scanned is not defined"). It read a variable that only
+  existed inside a loop, so the confirmation of a relay match never ran.
+  This had been there since the relay pass was written.
 - **Recording days dropdown.** **Auto-detect** (default) closes the gaps only
   when the clock-dated footage spans more than 24 hours. **Single day** keeps
   the old layout. **Multiple days** always closes gaps over two hours.
