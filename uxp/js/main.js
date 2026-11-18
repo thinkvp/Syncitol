@@ -2577,7 +2577,10 @@ function reportApplyIntegrity(result, rows) {
 // when the timeline is cloned as it is.
 const SIDECAR_EXTS = new Set(["mxf", "mp4", "mov", "mts", "m2ts"]);
 
-async function planTrackLayout(scan, enriched) {
+// Reads bins and camera sidecars and detects the recording devices. Runs
+// BEFORE the recording-days decision, which needs to know whether any device
+// recorded in more than one session.
+async function detectDevices(scan, enriched) {
     const instByPath = new Map();
     for (const c of scan.clips) {
         let e = instByPath.get(c.filePath);
@@ -2626,6 +2629,23 @@ async function planTrackLayout(scan, enriched) {
     }
     if (check.mixed.length > 6) log(`Track layout: ${check.mixed.length - 6} more mixed track(s).`, "warn");
 
+    // One key per physical device for the days decision: the camera serial
+    // when a sidecar names one (the same body across day folders), else the
+    // detected source.
+    const deviceOf = {};
+    for (const f of detectInput) {
+        deviceOf[f.filePath] = (f.device && f.device.serial)
+            ? `${f.device.model || "?"}#${f.device.serial}` : detection.sourceOf[f.filePath];
+    }
+    const labelByDevice = {};
+    for (const f of detectInput) {
+        if (!(deviceOf[f.filePath] in labelByDevice)) labelByDevice[deviceOf[f.filePath]] = labelOf[detection.sourceOf[f.filePath]];
+    }
+    return { detection, detectInput, check, deviceOf, labelByDevice };
+}
+
+function planTrackLayout(scan, enriched, det) {
+    const { detection, check } = det;
     const layoutMode = layoutPicker.mode;
     const rebuild = layoutMode === "rebuild" || (layoutMode === "auto" && !check.ok);
     if (!rebuild) {
@@ -2668,14 +2688,30 @@ async function planTrackLayout(scan, enriched) {
 // returns the payload with every recordStartMs moved by its session's shift
 // (the clock reading stays in rawRecordStartMs). The re-scan of a freshly
 // built -SYNC sequence repeats the decision the build was planned with.
-function applyRecordingDays(files, opts) {
+function applyRecordingDays(files, opts, det) {
     const plan = sessions.planSessions(files);
     const multi = plan.sessions.length > 1;
     let close;
+    let evidence = null;
     if (opts.planLayout === false && lastDays) close = lastDays.closed && multi;
-    else if (daysPicker.mode === "multi") close = multi;
+    else if (daysPicker.mode === "multi") {
+        close = multi;
+        const ev = multi ? sessions.dayEvidence(files, { deviceOf: det ? det.deviceOf : null }) : null;
+        if (ev && det && ev.sharedDevice === null) {
+            log("⚠ Recording days: Multiple days is selected, but no device recorded on more than one of the days — if one " +
+                "device simply has the wrong date, each day will only be aligned within itself. Auto-detect would treat this as one day.", "warn");
+        }
+    }
     else if (daysPicker.mode === "single") close = false;
-    else close = multi && sessions.spansDays(files);
+    else {
+        // Clocks a day or more apart are a multi-day shoot only if some device
+        // recorded in more than one of the sessions. Otherwise each "day" is
+        // one set of devices on its own, which is what a camera with the WRONG
+        // DATE looks like — and treating that as two days gives each camera a
+        // day (and a reference) of its own, so nothing is ever aligned.
+        evidence = sessions.dayEvidence(files, { deviceOf: det ? det.deviceOf : null });
+        close = multi && evidence.overDay && evidence.sharedDevice !== null;
+    }
 
     if (opts.planLayout === false) return close ? sessions.closeGaps(files, plan) : files;
 
@@ -2684,7 +2720,15 @@ function applyRecordingDays(files, opts) {
         embeddedPaths: new Set(files.filter(f => isEmbeddedSource(f.timingSource)).map(f => f.filePath))
     };
     if (!close) {
-        if (multi && daysPicker.mode === "single") {
+        if (evidence && evidence.overDay && evidence.sharedDevice === null) {
+            const who = evidence.sessions.map(sess => {
+                const names = [...new Set(sess.devices.map(d => (det && det.labelByDevice[d]) || d))].join(", ");
+                return `${names} on ${dsp.formatDate(sess.startMs)}`;
+            }).join("; ");
+            log(`ℹ Recording days: the recording clocks put ${who}. No device recorded on more than one of those dates, ` +
+                `so this looks like one device with a wrong date rather than separate shoot days — laid out as one day, ` +
+                `and the audio pass will line the devices up. If they really are separate days, choose Multiple days.`, "info");
+        } else if (multi && daysPicker.mode === "single") {
             log(`ℹ Recording days: ${plan.sessions.length} recording sessions with breaks of over 2 h between them, ` +
                 `built as one day because Single day is selected. If they are separate days, choose Multiple days so ` +
                 `each day follows the last instead of starting at 0:00.`, "info");
@@ -2865,7 +2909,8 @@ async function refreshSequence(opts) {
         // Recording days: close the overnight gaps when the shoot spans more
         // than one recording session. Every plan below works on the
         // closed-up times.
-        enriched = applyRecordingDays(enriched, opts);
+        const det = opts.planLayout !== false ? await detectDevices(scan, enriched) : null;
+        enriched = applyRecordingDays(enriched, opts, det);
         const daysClosed = enriched.some(f => f.rawRecordStartMs !== undefined);
         // Closed-up days: every clock-dated track shares one anchor, and the
         // timeline may run past 24 hours (only the timecode display wraps).
@@ -2873,7 +2918,7 @@ async function refreshSequence(opts) {
 
         let pendingPlan = null;
         if (opts.planLayout !== false) {
-            const tl = await planTrackLayout(scan, enriched);
+            const tl = planTrackLayout(scan, enriched, det);
             enriched = tl.payload;
             pendingPlan = tl.plan;
         }

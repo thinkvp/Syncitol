@@ -108,6 +108,35 @@ function spansDays(files, opts) {
     return hi - lo > limit && planSessions(timed, opts).sessions.length > 1;
 }
 
+// The evidence for a multi-day shoot, from the embedded clocks:
+//   overDay       — they span more than 24 h across more than one session
+//   sharedDevice  — a device (opts.deviceOf: path → device key) with files in
+//                   more than one session, or null. Without one, every
+//                   "day" is a separate set of devices — exactly what a camera
+//                   with the wrong date produces — so it proves nothing.
+//   sessions      — [{ startMs, devices:[key] }] for the log
+function dayEvidence(files, opts) {
+    opts = opts || {};
+    const deviceOf = opts.deviceOf || null;
+    const timed = (files || []).filter(f => f && isFinite(f.recordStartMs) && EMBEDDED.has(f.timingSource));
+    const out = { overDay: spansDays(files, opts), sharedDevice: null, sessions: [] };
+    if (timed.length < 2) return out;
+    const plan = planSessions(timed, opts);
+    const seenIn = {};
+    for (const s of plan.sessions) {
+        const devices = [];
+        for (const p of s.files) {
+            const d = deviceOf ? deviceOf[p] : null;
+            if (d === null || d === undefined) continue;
+            if (devices.indexOf(d) < 0) devices.push(d);
+            if (seenIn[d] !== undefined && seenIn[d] !== s.index && out.sharedDevice === null) out.sharedDevice = d;
+            if (seenIn[d] === undefined) seenIn[d] = s.index;
+        }
+        out.sessions.push({ startMs: s.startMs, devices });
+    }
+    return out;
+}
+
 // Marker names: "Day 1", "Day 2", … counted by calendar date (local time); a
 // second session on the same date becomes "Day 2 (2)". `dateLabel(ms)` formats
 // the start for the marker comment.
@@ -170,6 +199,7 @@ module.exports = {
     planSessions,
     closeGaps,
     spansDays,
+    dayEvidence,
     sessionLabels,
     sessionStarts
 };

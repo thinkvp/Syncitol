@@ -131,3 +131,28 @@ test("sessionStarts skips a session the audio pass moved inside another one", ()
     ];
     assert.deepStrictEqual(sessions.sessionStarts(plan, clips, null).map(s => s.index), [0, 2]);
 });
+
+test("dayEvidence: a device recording on both days makes it a multi-day shoot", () => {
+    const files = twoDays();
+    const deviceOf = Object.fromEntries(files.map(f => [f.filePath, f.filePath.split("_")[0]])); // A, B, R
+    const ev = sessions.dayEvidence(files, { deviceOf });
+    assert.strictEqual(ev.overDay, true);
+    assert.strictEqual(ev.sharedDevice, "R"); // the first device seen on both days
+    assert.deepStrictEqual(ev.sessions.map(s => s.devices), [["R", "A", "B"], ["R", "A", "B"]]);
+});
+
+test("dayEvidence: one camera with the wrong date is not a second day", () => {
+    // Same interview, FX6 clock set to February, A7S3 right in October.
+    const fx = new Date(2026, 1, 24, 16, 44, 27).getTime();
+    const a7 = new Date(2026, 9, 23, 16, 45, 27).getTime();
+    const files = [];
+    for (let i = 0; i < 3; i += 1) {
+        files.push({ filePath: `fx_${i}.mxf`, recordStartMs: fx + i * 900000, durationSec: 600, timingSource: "modification_date" });
+        files.push({ filePath: `a7_${i}.mp4`, recordStartMs: a7 + i * 900000, durationSec: 600, timingSource: "creation_time" });
+    }
+    const deviceOf = Object.fromEntries(files.map(f => [f.filePath, f.filePath.split("_")[0]]));
+    const ev = sessions.dayEvidence(files, { deviceOf });
+    assert.strictEqual(ev.overDay, true);
+    assert.strictEqual(ev.sharedDevice, null);
+    assert.deepStrictEqual(ev.sessions.map(s => s.devices), [["fx"], ["a7"]]);
+});

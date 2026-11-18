@@ -74,7 +74,14 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   existed inside a loop, so the confirmation of a relay match never ran.
   This had been there since the relay pass was written.
 - **Recording days dropdown.** **Auto-detect** (default) closes the gaps only
-  when the clock-dated footage spans more than 24 hours. **Single day** keeps
+  when the clock-dated footage spans more than 24 hours, and at least one
+  device (the same camera serial, or the same detected source) recorded in
+  more than one session. Without that, every "day" is a separate set of
+  devices, which is exactly what a camera with the wrong date produces. In a
+  field test, an FX6 dated February and an A7S3 dated October, filming the
+  same interviews, were split into two days, each camera its own day's
+  reference, and nothing was aligned. That is now laid out as one day, and
+  the log explains why. **Single day** keeps
   the old layout. **Multiple days** always closes gaps over two hours.
 - **Track layout dropdown.** **Auto-detect** (default) rebuilds only when a
   track mixes devices. **Keep my tracks** always clones the timeline as it is,
