@@ -2230,12 +2230,15 @@ async function analyzeFineTune(anchors, onProgress) {
                         delete row.deltaSec;
                         row.detail = `rejected: the two ends of the overlap disagree by ${two.agreement.disagreeSec.toFixed(2)}s`;
                     } else if (two && two.driftSec !== null) {
-                        row.driftSec = two.driftSec;
-                        row.driftPpm = two.ppm;
-                        // Only report drift across 10+ minutes: each end is measured to
-                        // ~±10 ms, so over a few minutes the difference is mostly noise
-                        // (0.05 s across 4 min reads as an implausible 185 ppm).
+                        // Only report drift of at least a frame (DRIFT_MIN_REPORT_SEC,
+                        // 40 ms) across 10+ minutes. Under a frame it is invisible, and
+                        // each end is measured to ~±10 ms, so smaller differences — and
+                        // anything over a few minutes (0.05 s across 4 min reads as an
+                        // implausible 185 ppm) — are mostly measurement noise. The
+                        // results-table badge follows the same rule.
                         if (Math.abs(two.driftSec) >= dsp.DRIFT_MIN_REPORT_SEC && two.spanSec >= dsp.DRIFT_MIN_OVERLAP_SEC) {
+                            row.driftSec = two.driftSec;
+                            row.driftPpm = two.ppm;
                             lines.push([`⚠ ${target.clipName}: clock drift ${formatSignedSeconds(two.driftSec)} across ${formatDuration(two.spanSec * 1000)} (~${two.ppm} ppm) vs ${describeMatch(bestPair)} — the tail may be audibly off; consider splitting long clips before syncing.`, "warn"]);
                         }
                     } else if (two && two.agreement.verdict === "inconclusive" && bestPair.overlapWindowSec >= dsp.FINE_TUNE_AGREE_MIN_OVERLAP_SEC) {

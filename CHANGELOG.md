@@ -92,8 +92,11 @@ The earlier internal history is a **separate 1.x line** that ran to its own
 - **Clock-drift warnings on short clips were noise.** The help said drift is
   checked on overlaps over 10 minutes, but warnings appeared from 2 minutes.
   At ±10 ms per measurement, that produced "164–515 ppm" on 3–7 minute
-  clips, several times what real clocks drift. Drift is now only reported
-  on overlaps of 10 minutes or more.
+  clips, several times what real clocks drift. Drift is now only reported,
+  in the log and as the results table's "drift" badge, when it reaches a
+  frame (40 ms) across an overlap of 10 minutes or more. Under a frame it is
+  invisible, and within the measurement noise. The badge had appeared for
+  any measured drift, down to 10 ms.
 - **A first sync spent minutes decoding audio it did not need.** The coarse
   pass matches a track from Premiere's peak files in a moment, but then
   confirmed that match by decoding real audio: two more points in the clip,
