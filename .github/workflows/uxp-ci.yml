@@ -65,3 +65,5 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build native/build
           lipo -info native/build/syncitol.uxpaddon
+          # Must load on Apple silicon and Intel Macs alike.
+          lipo native/build/syncitol.uxpaddon -verify_arch arm64 x86_64

@@ -18,6 +18,15 @@
 #   # Output: native/build/syncitol.uxpaddon
 
 cmake_minimum_required(VERSION 3.20)
+
+# Universal binary: one addon for Apple silicon AND Intel Macs. Without this
+# CMake builds for the host only — GitHub's macOS runners are arm64, so every
+# release up to 1.8.0 shipped an arm64-only addon (in mac/x64 too) and the
+# decoder could not load on Intel Macs. Must be set before project().
+if(NOT CMAKE_OSX_ARCHITECTURES)
+  set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS architectures to build" FORCE)
+endif()
+
 project(syncitol_addon_mac LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)

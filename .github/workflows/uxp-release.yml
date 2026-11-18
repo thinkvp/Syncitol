@@ -51,6 +51,8 @@ jobs:
             -DFFMPEG_ROOT="$PWD/ffmpeg-out/universal" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build native/build
+          # Must load on Apple silicon and Intel Macs alike.
+          lipo native/build/syncitol.uxpaddon -verify_arch arm64 x86_64
           mkdir -p mac/x64 mac/arm64
           # The universal binary works for both x64 and arm64; place in both
           # dirs so build-ccx.js finds them.

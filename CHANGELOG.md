@@ -51,6 +51,11 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   Results.
 
 ### Fixed
+- **The decoder now loads on Intel Macs.** The macOS addon was built for
+  the build machine's architecture only, and GitHub's macOS runners are
+  Apple silicon, so earlier releases shipped an arm64-only addon (in the
+  `mac/x64` folder too). It is now a universal binary, and the release
+  build fails if it is not.
 - A Premiere crash while packing tracks after a sync, seen once with drone
   footage sharing a camera's track, has not recurred. Drone footage no longer
   shares tracks, and the packing steps now leave a trail in Premiere's UXP
