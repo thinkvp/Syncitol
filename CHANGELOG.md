@@ -9,6 +9,53 @@ The earlier internal history is a **separate 1.x line** that ran to its own
 1.4.0 before that reset — unrelated to the 1.4.0 below — and is preserved in
 [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
+## [1.9.0] - 2026-11-18
+
+### Added
+- **Much faster first syncs.** Decoding audio used to read the whole of a
+  camera file's interleaved video along with it, and re-probe the file on
+  every slice. It now skips every stream but the audio, and skips the probe
+  when the file header already describes the audio. On footage over a
+  network share, a 10-second slice went from about 1.3 s to 50 ms (A7S3
+  MP4), and from 0.73 s to 0.21 s (FX6 MXF), with identical samples. Slices
+  also decode in the background, several at once, so the panel stays
+  responsive. How many depends on the machine: about half its CPU threads,
+  less two left for Premiere, between one and six. In a field test a cold
+  41-clip, two-day sync went from about two minutes to 29 seconds.
+- **Peak-file status before you sync.** The Active Sequence card shows how
+  many of the sequence's audio files Premiere has built peak files for, and
+  keeps checking while it builds the rest. A sync matches from peak files in
+  milliseconds; files without them have to be decoded.
+- **A result card after every sync**: how many clips synced, how many are
+  worth checking, and, in red, any clips that could not be synced and any
+  items left out, by name.
+
+### Changed
+- **Clips with no audio (drone footage) are placed by their clock and left
+  out of the audio passes.** There is nothing to match, and leaving them in
+  did harm. A drone track with the most footage could become the Auto
+  reference, so nothing could align to it. Each drone clip was also
+  flagged, its track called suspect, and the audio search ran into decode
+  failures. They now keep their own video track, above the cameras with
+  sound, and the result card lists them.
+- **Stills, titles, graphics and motion graphics templates are left out of
+  the `-SYNC` sequence.** They are not recordings: a still's only date is
+  when it was exported, so it was laid out at that date, counted as a
+  device (forcing a rebuild), and could trip the 24-hour check. Stills,
+  `.aegraphic`/`.prgraphic`/`.mogrt` templates and items with no media file
+  (titles, mattes, adjustment layers, nested sequences) are set aside at
+  scan time in both layouts. The original sequence keeps them. An item
+  linked to a clip that is synced, such as a merged clip's audio, stays.
+- **No more "Check sync" markers on the timeline.** Clips worth checking are
+  listed in the log with the reason, and carry a **check** flag in Sync
+  Results.
+
+### Fixed
+- A Premiere crash while packing tracks after a sync, seen once with drone
+  footage sharing a camera's track, has not recurred. Drone footage no longer
+  shares tracks, and the packing steps now leave a trail in Premiere's UXP
+  log, so a crash there can be traced.
+
 ## [1.8.0] - 2026-11-18
 
 ### Added

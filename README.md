@@ -39,6 +39,15 @@ If Syncitol saves you a re-sync session, consider tipping on
   offset within its day, and a sequence marker names each day. **Single day**
   keeps the old layout; **Multiple days** always closes gaps longer than two
   hours.
+- **Fast, even from a network share.** Whole tracks are matched from
+  Premiere's peak files when it has built them — the Active Sequence card
+  shows how many are ready before you click. What has to be decoded reads
+  only the audio and decodes several slices at once in the background,
+  scaled to your machine's CPU threads.
+- **Knows what it can't sync.** Clips with no audio (drone footage) are
+  placed by their recording clock on a track of their own. Stills, titles,
+  graphics and motion graphics templates are left out of the `-SYNC`
+  sequence. The result card after each sync lists both by name.
 
 ## Requirements
 
