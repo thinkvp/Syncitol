@@ -3620,5 +3620,33 @@ btnAuto.addEventListener("click", autoSync);
 
 if (btnExportLog) btnExportLog.addEventListener("click", exportLog);
 
+// ─── Clear cache ──────────────────────────────────────────────────────────────
+// Makes the next sync behave like a first run, for timing it: forgets the
+// decoded-audio envelopes on disk and in memory, the probed file metadata, and
+// the index of Premiere's peak files. Premiere's own peak files (.pek) are
+// Premiere's — clear those under Preferences › Media Cache if a run without
+// any peaks is what you want to time.
+const btnClearCache = $("btn-clear-cache");
+async function clearCaches() {
+    if (opDepth > 0 || isDisabled(btnClearCache)) return;
+    setDisabled(btnClearCache, true);
+    try {
+        audio.clearCache();
+        audio.clearProbeCache();
+        pek.resetAll();
+        const disk = await audio.clearDiskCache();
+        const mb = disk.bytes / (1024 * 1024);
+        log(`Cache cleared: ${disk.files} cached audio envelope${disk.files !== 1 ? "s" : ""} ` +
+            `(${mb >= 1 ? mb.toFixed(0) + " MB" : Math.round(disk.bytes / 1024) + " KB"}) removed, peak-file index and file metadata forgotten. ` +
+            `The next sync runs as a first run would — except that Windows and network drives keep recently read files in memory ` +
+            `for a while, and Premiere's own peak files stay (Preferences › Media Cache).`, "success");
+    } catch (e) {
+        log(`✗ Could not clear the cache: ${e.message}`, "error");
+    } finally {
+        setDisabled(btnClearCache, false);
+    }
+}
+if (btnClearCache) btnClearCache.addEventListener("click", clearCaches);
+
 refreshTrackOptions();
 log("Syncitol UXP ready.");

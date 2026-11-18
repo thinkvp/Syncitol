@@ -186,9 +186,19 @@ function clearRunCache() {
     bytesCache.clear();
 }
 
+// Forget everything, including the .mcdb index and which media resolved to
+// which peak file, so the next run reads Premiere's media cache afresh (the
+// panel's Clear cache button). Premiere's own .pek files are not touched.
+function resetAll() {
+    clearRunCache();
+    pekCache.clear();
+    pekIndexPromise = null;
+}
+
 module.exports = {
     resolvePek,
     getPekEnvelope,
     clearRunCache,
+    resetAll,
     onDiag: null
 };

@@ -622,3 +622,6 @@ body {
     flex-shrink: 0;
     margin-right: 10px; /* UXP ignores the row's flex gap */
 }
+
+/* Action row inside a help section (Clear cache). */
+.ins-actions { display: flex; flex-shrink: 0; margin-top: 6px; }

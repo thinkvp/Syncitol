@@ -106,6 +106,26 @@ async function pruneEnvelopeCacheDir(dir) {
     } catch (e) { /* no cache dir yet */ }
 }
 
+// Delete every cached envelope on disk (the panel's Clear cache button).
+// Returns { files, bytes } removed.
+async function clearDiskCache() {
+    const out = { files: 0, bytes: 0 };
+    const dir = await envCacheDir();
+    if (!dir) return out;
+    let names = [];
+    try { names = await fs.readdir(dir); } catch (e) { return out; }
+    for (const name of names) {
+        const p = dir + "/" + name;
+        try {
+            const st = await fs.lstat(p);
+            await fs.unlink(p);
+            out.files += 1;
+            out.bytes += (st && st.size) || 0;
+        } catch (e) { /* in use or gone — skip */ }
+    }
+    return out;
+}
+
 // FNV-1a over the key string, twice with different seeds → 16 hex chars.
 // (UXP has no crypto module; collisions at this keyspace are negligible.)
 function hashKey(s) {
@@ -252,6 +272,7 @@ module.exports = {
     clearCache,
     resetDecodeStats,
     getDecodeStats,
+    clearDiskCache,
     probeRecordStart,
     clearProbeCache,
     baseName
