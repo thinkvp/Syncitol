@@ -1805,7 +1805,7 @@
             if (!Object.prototype.hasOwnProperty.call(byKey, key)) {
                 byKey[key] = {
                     trackKey: key, startMs: f.recordStartMs, endMs: endMs,
-                    embedded: true, count: 0
+                    embedded: true, count: 0, intervals: []
                 };
                 order.push(key);
             }
@@ -1814,6 +1814,7 @@
             if (endMs > t.endMs) t.endMs = endMs;
             if (!isEmbeddedTimingSource(f.timingSource)) t.embedded = false;
             t.count += 1;
+            t.intervals.push({ startMs: f.recordStartMs, endMs: endMs });
         }
         for (var o = 0; o < order.length; o += 1) out.tracks.push(byKey[order[o]]);
         if (!out.tracks.length) return out;
@@ -1912,7 +1913,140 @@
             out.groups.push({ trackKeys: keys, anchorMs: runs[k].startMs, spanSec: spanSec, shared: !!runs[k].shared });
         }
 
+        if (!opts.shareAnchor && opts.wholeHour !== false) attachWholeHourTracks(out, implausible);
         return out;
+    }
+
+    // ─── Clocks off by whole hours or days ────────────────────────────────────
+    // The commonest clock faults are a camera on the wrong time zone, a missed
+    // daylight-saving change, or a date reset after a flat battery — all errors
+    // of a WHOLE number of hours, with the minutes still right. Such a track
+    // overlaps nobody, so it was anchored to itself at 0:00 and the audio pass
+    // had to find a multi-hour offset blind. Instead: if shifting a track's
+    // clock by some whole number of hours makes its recordings line up with
+    // the main group's — and no other whole-hour shift comes close — lay it out
+    // there. The audio pass then only has to confirm, from the Build position.
+    // Recurring shoots (the same session every day) are ambiguous by design and
+    // left alone: k and k ± 24 h fit equally well.
+    var HOUR_MS = 3600000;
+    var WHOLE_HOUR_MIN_OVERLAP_SEC = 60;
+    var WHOLE_HOUR_MIN_FRACTION = 0.2;   // of the track's own footage
+    var WHOLE_HOUR_CLEAR_RATIO = 1.5;    // best fit vs the runner-up
+    var WHOLE_HOUR_MAX_PAIRS = 40000;
+    // Overlap alone is weak evidence — one long recording overlaps almost any
+    // clip at SOME whole hour. Multicam clips start together (everyone rolls
+    // when the interview starts), so at the right shift several of this
+    // track's clips must also START near one of the base's clips.
+    var WHOLE_HOUR_START_TOL_SEC = 120;
+    var WHOLE_HOUR_MIN_STARTS = 2;
+
+    function unionIntervals(list) {
+        var sorted = list.slice().sort(function (a, b) { return a.startMs - b.startMs; });
+        var out = [];
+        for (var i = 0; i < sorted.length; i += 1) {
+            var last = out[out.length - 1];
+            if (last && sorted[i].startMs <= last.endMs) { if (sorted[i].endMs > last.endMs) last.endMs = sorted[i].endMs; }
+            else out.push({ startMs: sorted[i].startMs, endMs: sorted[i].endMs });
+        }
+        return out;
+    }
+    function overlapWithUnion(intervals, shiftMs, union) {
+        var total = 0;
+        for (var i = 0; i < intervals.length; i += 1) {
+            var s = intervals[i].startMs - shiftMs, e = intervals[i].endMs - shiftMs;
+            for (var j = 0; j < union.length; j += 1) {
+                if (union[j].startMs >= e) break;
+                var lo = Math.max(s, union[j].startMs), hi = Math.min(e, union[j].endMs);
+                if (hi > lo) total += hi - lo;
+            }
+        }
+        return total;
+    }
+
+    // The whole-hour shift (in hours, ≠ 0) that lines `intervals` up with
+    // `baseIntervals`, or null. Returns { hours, overlapSec }.
+    function bestWholeHourShift(intervals, baseIntervals) {
+        if (!intervals.length || !baseIntervals.length) return null;
+        var union = unionIntervals(baseIntervals);
+        var footage = 0;
+        for (var f = 0; f < intervals.length; f += 1) footage += intervals[f].endMs - intervals[f].startMs;
+        var stepT = Math.max(1, Math.ceil(intervals.length * baseIntervals.length / WHOLE_HOUR_MAX_PAIRS));
+        var seen = {}, cands = [];
+        for (var i = 0; i < intervals.length; i += stepT) {
+            for (var j = 0; j < baseIntervals.length; j += 1) {
+                var k = Math.round((intervals[i].startMs - baseIntervals[j].startMs) / HOUR_MS);
+                if (k === 0 || seen[k]) continue;
+                seen[k] = true;
+                cands.push(k);
+            }
+        }
+        var best = null, second = 0;
+        for (var c = 0; c < cands.length; c += 1) {
+            var ov = overlapWithUnion(intervals, cands[c] * HOUR_MS, union);
+            if (!best || ov > best.ov) { if (best) second = Math.max(second, best.ov); best = { k: cands[c], ov: ov }; }
+            else if (ov > second) second = ov;
+        }
+        if (!best) return null;
+        if (best.ov < Math.max(WHOLE_HOUR_MIN_OVERLAP_SEC * 1000, WHOLE_HOUR_MIN_FRACTION * footage)) return null;
+        if (second > 0 && best.ov < WHOLE_HOUR_CLEAR_RATIO * second) return null;
+        var starts = 0;
+        for (var t = 0; t < intervals.length; t += 1) {
+            var st = intervals[t].startMs - best.k * HOUR_MS;
+            for (var b = 0; b < baseIntervals.length; b += 1) {
+                if (Math.abs(baseIntervals[b].startMs - st) <= WHOLE_HOUR_START_TOL_SEC * 1000) { starts += 1; break; }
+            }
+        }
+        if (starts < WHOLE_HOUR_MIN_STARTS) return null;
+        return { hours: best.k, overlapSec: best.ov / 1000, matchedStarts: starts };
+    }
+
+    function attachWholeHourTracks(out, implausible) {
+        out.hourShifted = [];
+        var grouped = {};
+        for (var g = 0; g < out.groups.length; g += 1) {
+            for (var m = 0; m < out.groups[g].trackKeys.length; m += 1) grouped[out.groups[g].trackKeys[m]] = g;
+        }
+        var footageOf = function (t) {
+            var sum = 0;
+            for (var i = 0; i < t.intervals.length; i += 1) sum += t.intervals[i].endMs - t.intervals[i].startMs;
+            return sum;
+        };
+        var loners = [];
+        for (var i = 0; i < out.tracks.length; i += 1) {
+            var t = out.tracks[i];
+            if (!t.embedded || Object.prototype.hasOwnProperty.call(implausible, t.trackKey)) continue;
+            if (Object.prototype.hasOwnProperty.call(grouped, t.trackKey)) continue;
+            loners.push(t);
+        }
+        if (!loners.length) return;
+
+        // The base: the group with the most footage, else the biggest loner.
+        var base = null;
+        for (var b = 0; b < out.groups.length; b += 1) {
+            var members = out.tracks.filter(function (x) { return out.groups[b].trackKeys.indexOf(x.trackKey) >= 0; });
+            var foot = members.reduce(function (s2, x) { return s2 + footageOf(x); }, 0);
+            if (!base || foot > base.footage) {
+                base = { keys: out.groups[b].trackKeys.slice(), anchorMs: out.groups[b].anchorMs, footage: foot,
+                    intervals: [].concat.apply([], members.map(function (x) { return x.intervals; })) };
+            }
+        }
+        loners.sort(function (a, c) { return footageOf(c) - footageOf(a); });
+        if (!base) {
+            var first = loners.shift();
+            base = { keys: [first.trackKey], anchorMs: first.startMs, footage: footageOf(first), intervals: first.intervals.slice() };
+        }
+        for (var l = 0; l < loners.length; l += 1) {
+            var shift = bestWholeHourShift(loners[l].intervals, base.intervals);
+            if (!shift) continue;
+            var key = loners[l].trackKey;
+            out.anchorMsByTrack[key] = base.anchorMs + shift.hours * HOUR_MS;
+            out.hourShifted.push({ trackKey: key, hours: shift.hours, overlapSec: shift.overlapSec, toTrackKeys: base.keys.slice() });
+            out.ungrouped = out.ungrouped.filter(function (u) { return u.trackKey !== key; });
+            for (var n = 0; n < loners[l].intervals.length; n += 1) {
+                base.intervals.push({ startMs: loners[l].intervals[n].startMs - shift.hours * HOUR_MS, endMs: loners[l].intervals[n].endMs - shift.hours * HOUR_MS });
+            }
+            base.keys.push(key);
+        }
     }
 
     // A start time read out of the media itself, as opposed to derived from the
@@ -2134,6 +2268,53 @@
         return { members: members, centre: Math.round(centre * 1000) / 1000, spreadSec: bestSpread };
     }
 
+    // ─── Fine-pass outliers ───────────────────────────────────────────────────
+    // Every clip on a track came from ONE device carrying ONE clock error, so
+    // after the coarse pass their fine corrections cluster: a few tenths of a
+    // second either way (second-resolution timestamps, per-clip start latency).
+    // A clip that wants seconds more than all its track-mates is far more often
+    // a match on the wrong stretch of audio than a genuine anomaly — in the
+    // field, C9370 asked for −4.12 s at score 0.52 while 30 clips from the same
+    // camera sat within ±0.8 s. Such a shift only stands when its score is
+    // strong; otherwise the clip takes the track's typical correction and is
+    // flagged for the editor to check.
+    //
+    // rows: [{ status, deltaSec, score }] for ONE track ("aligned" counts as 0).
+    // Returns { centreSec, outliers: [{ index, deltaSec, score, keep }] } —
+    // keep: strong enough to stand (still worth a look).
+    var FINE_OUTLIER_SEC = 1.5;          // this far from the track's centre is an outlier
+    var FINE_OUTLIER_TRUST_SCORE = 0.75; // an outlier this strong keeps its own shift
+    var FINE_OUTLIER_MIN_PEERS = 3;      // track-mates that must agree before anyone is an outlier
+    var FINE_LOW_CONFIDENCE_SCORE = 0.5; // an applied shift below this gets flagged
+
+    function guardTrackOutliers(rows) {
+        var out = { centreSec: null, outliers: [] };
+        var vals = [];
+        var i;
+        for (i = 0; i < (rows || []).length; i += 1) {
+            var r = rows[i];
+            if (r.status !== "shifted" && r.status !== "aligned") continue;
+            var d = r.status === "aligned" ? 0 : r.deltaSec;
+            if (isFinite(d)) vals.push({ index: i, d: d, score: r.score });
+        }
+        if (vals.length < FINE_OUTLIER_MIN_PEERS + 1) return out;
+        var sorted = vals.map(function (v) { return v.d; }).sort(function (a, b) { return a - b; });
+        var mid = Math.floor(sorted.length / 2);
+        var centre = (sorted.length % 2) ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+        out.centreSec = Math.round(centre * 1000) / 1000;
+        var peers = 0;
+        for (i = 0; i < vals.length; i += 1) if (Math.abs(vals[i].d - centre) <= FINE_OUTLIER_SEC) peers += 1;
+        if (peers < FINE_OUTLIER_MIN_PEERS) return out;
+        for (i = 0; i < vals.length; i += 1) {
+            if (Math.abs(vals[i].d - centre) <= FINE_OUTLIER_SEC) continue;
+            out.outliers.push({
+                index: vals[i].index, deltaSec: vals[i].d, score: vals[i].score,
+                keep: isFinite(vals[i].score) && vals[i].score >= FINE_OUTLIER_TRUST_SCORE
+            });
+        }
+        return out;
+    }
+
     // ─── Fine-pass feedback ───────────────────────────────────────────────────
     // What the fine pass has to say about a track the coarse pass moved. Coarse
     // commits a whole track on one clip's evidence; the fine pass then looks at
@@ -2292,6 +2473,10 @@
         judgeTwoPointAgreement: judgeTwoPointAgreement,
         judgeCorroboration: judgeCorroboration,
         largestCluster: largestCluster,
-        summarizeTrackResiduals: summarizeTrackResiduals
+        summarizeTrackResiduals: summarizeTrackResiduals,
+        guardTrackOutliers: guardTrackOutliers,
+        bestWholeHourShift: bestWholeHourShift,
+        FINE_OUTLIER_SEC: FINE_OUTLIER_SEC,
+        FINE_LOW_CONFIDENCE_SCORE: FINE_LOW_CONFIDENCE_SCORE
     };
 });

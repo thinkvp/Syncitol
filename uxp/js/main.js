@@ -74,6 +74,8 @@ let lastFineTuneRevert = null; // inverse shift list that undoes the last applie
 let rebuildPlan = null;        // set by refreshSequence when Build must lay the sequence out by source
 let lastDays = null;           // { closed, plan, embeddedPaths } from the last planning scan
 let clipLayoutOpts;            // dsp.planBuildAnchors options clipPayload was planned with
+let lastSyncResult = null;     // { rows, clips, references } from the last fine tune, for the summary
+let lastLayoutRebuilt = false; // the last build laid the sequence out by device
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -540,6 +542,7 @@ setInterval(pollActiveSequence, 3000);
 let forcedRefTrackKey = null;  // null = Auto
 let refTrackOptions = [];      // [{ key, short, meta, trigger }]
 let refMenuOpen = false;
+let refAutoNote = "";          // which track(s) Auto picked on the last run
 let refOptionsGen = 0;         // discards the result of a superseded refresh
 
 function shortTrackLabel(track) {
@@ -568,7 +571,7 @@ function isInside(node, root) {
 
 function updateRefTrigger() {
     if (!forcedRefTrackKey) {
-        refTriggerText.textContent = "Auto";
+        refTriggerText.textContent = refAutoNote ? `Auto · ${refAutoNote}` : "Auto";
         return;
     }
     const opt = refTrackOptions.find(o => o.key === forcedRefTrackKey);
@@ -703,15 +706,21 @@ function makeModePicker(cfg) {
             pick.close();
             if (key === pick.mode || !cfg.modes.some(m => m.key === key)) return;
             pick.mode = key;
+            pick.note = "";
             lsSet(cfg.storageKey, key);
             update();
             const m = cfg.modes.find(x => x.key === key);
             log(`${cfg.title}: ${m.short} — ${m.meta}.`);
         },
-        contains(node) { return isInside(node, cfg.menu) || isInside(node, cfg.trigger); }
+        contains(node) { return isInside(node, cfg.menu) || isInside(node, cfg.trigger); },
+        // What Auto decided on the last run ("rebuilt by device", "2 days"),
+        // shown after the mode while it is the Auto one.
+        note: "",
+        setNote(text) { pick.note = text || ""; update(); }
     };
     function update() {
-        cfg.text.textContent = (cfg.modes.find(x => x.key === pick.mode) || cfg.modes[0]).short;
+        const m = cfg.modes.find(x => x.key === pick.mode) || cfg.modes[0];
+        cfg.text.textContent = (pick.note && m.key === "auto") ? `${m.short} · ${pick.note}` : m.short;
     }
     cfg.trigger.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -2223,7 +2232,10 @@ async function analyzeFineTune(anchors, onProgress) {
                     } else if (two && two.driftSec !== null) {
                         row.driftSec = two.driftSec;
                         row.driftPpm = two.ppm;
-                        if (Math.abs(two.driftSec) >= dsp.DRIFT_MIN_REPORT_SEC) {
+                        // Only report drift across 10+ minutes: each end is measured to
+                        // ~±10 ms, so over a few minutes the difference is mostly noise
+                        // (0.05 s across 4 min reads as an implausible 185 ppm).
+                        if (Math.abs(two.driftSec) >= dsp.DRIFT_MIN_REPORT_SEC && two.spanSec >= dsp.DRIFT_MIN_OVERLAP_SEC) {
                             lines.push([`⚠ ${target.clipName}: clock drift ${formatSignedSeconds(two.driftSec)} across ${formatDuration(two.spanSec * 1000)} (~${two.ppm} ppm) vs ${describeMatch(bestPair)} — the tail may be audibly off; consider splitting long clips before syncing.`, "warn"]);
                         }
                     } else if (two && two.agreement.verdict === "inconclusive" && bestPair.overlapWindowSec >= dsp.FINE_TUNE_AGREE_MIN_OVERLAP_SEC) {
@@ -2252,9 +2264,63 @@ async function analyzeFineTune(anchors, onProgress) {
         return { adjustment, row };
     });
 
+    // ── Outliers within a track ──────────────────────────────────────────
+    // A clip asking for seconds more than its track-mates is usually a match
+    // on the wrong stretch of audio. Unless the match is strong, it takes the
+    // track's typical correction instead. Either way it is flagged.
+    {
+        const byTrackIdx = new Map();
+        outcomes.forEach((o, i) => {
+            const key = o.row.trackKey;
+            if (!key) return;
+            if (!byTrackIdx.has(key)) byTrackIdx.set(key, []);
+            byTrackIdx.get(key).push(i);
+        });
+        for (const [key, idxs] of byTrackIdx) {
+            const guard = dsp.guardTrackOutliers(idxs.map(i => outcomes[i].row));
+            for (const o of guard.outliers) {
+                const outcome = outcomes[idxs[o.index]];
+                const row = outcome.row;
+                const off = formatSignedSeconds(o.deltaSec - guard.centreSec);
+                row.check = true;
+                if (o.keep) {
+                    row.checkReason = `its shift is ${off} from the rest of ${dsp.trackKeyLabel(key)}, kept on a strong match`;
+                    notes.push(`ℹ ${row.label}: shift ${formatSignedSeconds(o.deltaSec)} is ${off} away from the other clips on ` +
+                        `${dsp.trackKeyLabel(key)} (typically ${formatSignedSeconds(guard.centreSec)}), but the match scored ` +
+                        `${o.score.toFixed(2)}, so it stands — worth a look.`);
+                    continue;
+                }
+                const centre = guard.centreSec;
+                outcome.adjustment = Math.abs(centre) >= dsp.FINE_TUNE_MIN_APPLY_SEC ? {
+                    clipName: row.label, filePath: row.filePath, deltaSec: centre,
+                    referenceName: `${dsp.trackKeyLabel(key)} typical`, score: null
+                } : null;
+                notes.push(`⚠ ${row.label}: the fine pass wanted ${formatSignedSeconds(o.deltaSec)} (score ` +
+                    `${isFinite(o.score) ? o.score.toFixed(2) : "?"}), ${off} away from every other clip on ` +
+                    `${dsp.trackKeyLabel(key)} — most likely a match on the wrong stretch of audio. It was given the ` +
+                    `track's typical ${formatSignedSeconds(centre)} instead; check it.`);
+                row.status = Math.abs(centre) >= dsp.FINE_TUNE_MIN_APPLY_SEC ? "shifted" : "aligned";
+                row.deltaSec = centre;
+                row.method = `${dsp.trackKeyLabel(key)} typical`;
+                row.detail = `outlier ${formatSignedSeconds(o.deltaSec)} rejected — took the track's typical shift`;
+                row.checkReason = `the fine pass wanted ${formatSignedSeconds(o.deltaSec)}, far from the rest of the track`;
+            }
+        }
+    }
+
     for (const outcome of outcomes) {
+        const row = outcome.row;
+        if (!row.check) {
+            if ((row.status === "shifted" || row.status === "aligned") && isFinite(row.score) && row.score < dsp.FINE_LOW_CONFIDENCE_SCORE) {
+                row.check = true;
+                row.checkReason = `low-confidence match (score ${row.score.toFixed(2)})`;
+            } else if ((row.status === "unmatched" && !row.outOfRange) || row.status === "weak" || row.status === "kept") {
+                row.check = true;
+                row.checkReason = "the fine pass could not confirm it";
+            }
+        }
         if (outcome.adjustment) adjustments.push(outcome.adjustment);
-        results.push(outcome.row);
+        results.push(row);
     }
 
     // ── What the fine pass says about the coarse pass ────────────────────
@@ -2313,6 +2379,7 @@ async function analyzeFineTune(anchors, onProgress) {
             r.deltaSec = delta;
             r.method = `${summary.consensusCount} clips on ${label}`;
             r.detail = "unmatched — took the shift its track-mates agreed on";
+            if (!r.outOfRange) { r.check = true; r.checkReason = "could not be matched — took its track-mates' shift"; }
         }
     }
 
@@ -2648,6 +2715,7 @@ function planTrackLayout(scan, enriched, det) {
     const { detection, check } = det;
     const layoutMode = layoutPicker.mode;
     const rebuild = layoutMode === "rebuild" || (layoutMode === "auto" && !check.ok);
+    layoutPicker.setNote(rebuild ? "rebuilt by device" : "tracks kept");
     if (!rebuild) {
         if (check.ok) {
             log("Track layout: each track holds one device — the sequence will be cloned as it is.");
@@ -2715,6 +2783,10 @@ function applyRecordingDays(files, opts, det) {
 
     if (opts.planLayout === false) return close ? sessions.closeGaps(files, plan) : files;
 
+    {
+        const days = sessions.sessionLabels(plan).filter(l => !l.fileDated).length;
+        daysPicker.setNote(close ? `${days} days` : (evidence && evidence.overDay ? "one day (clock dates differ)" : "one day"));
+    }
     lastDays = {
         closed: close, plan,
         embeddedPaths: new Set(files.filter(f => isEmbeddedSource(f.timingSource)).map(f => f.filePath))
@@ -2762,6 +2834,55 @@ function logDecodeStats(phase) {
     log(`${phase}: ${parts.join("; ")}.`);
 }
 
+// Clips the fine pass could not vouch for, as sequence markers at each clip's
+// start, so the editor finds them on the timeline rather than in the log.
+const CHECK_MARKER_LIMIT = 60;
+async function markClipsToCheck() {
+    if (!lastSyncResult) return;
+    const flagged = lastSyncResult.rows.filter(r => r.check && r.filePath);
+    if (!flagged.length) return;
+    try {
+        const scan = await premiere.scanActiveSequence();
+        const startByPath = {};
+        for (const c of scan.clips) {
+            if (!(c.filePath in startByPath) || c.startSec < startByPath[c.filePath]) startByPath[c.filePath] = c.startSec;
+        }
+        const markers = flagged
+            .filter(r => r.filePath in startByPath)
+            .slice(0, CHECK_MARKER_LIMIT)
+            .map(r => ({ name: "Check sync", comment: `${r.label}: ${r.checkReason || "worth a look"}`, startSec: startByPath[r.filePath] }));
+        const added = await premiere.addMarkers(markers);
+        if (added) {
+            log(`Marked ${added} clip${added !== 1 ? "s" : ""} to check on the timeline ("Check sync" markers)` +
+                (flagged.length > markers.length ? ` — the first ${markers.length} of ${flagged.length}.` : "."), "warn");
+        }
+    } catch (e) {
+        log(`⚠ Could not add the "Check sync" markers: ${e.message}`, "warn");
+    }
+}
+
+// One line that says how the sync went, before the detail.
+function logSyncSummary() {
+    if (!lastSyncResult) return;
+    const rows = lastSyncResult.rows;
+    const check = rows.filter(r => r.check).length;
+    const noRef = rows.filter(r => !r.check && r.outOfRange).length;
+    const matched = rows.filter(r => !r.check && !r.outOfRange && (r.status === "shifted" || r.status === "aligned")).length;
+    const other = rows.length - check - noRef - matched;
+    const parts = [`${lastSyncResult.references} reference`, `${matched} matched`];
+    if (check) parts.push(`${check} to check (marked on the timeline)`);
+    if (noRef) parts.push(`${noRef} outside every reference recording (placed by clock)`);
+    if (other) parts.push(`${other} not matched`);
+    const context = [];
+    if (lastDays && lastDays.closed && lastDays.plan.sessions.length > 1) {
+        const days = sessions.sessionLabels(lastDays.plan).filter(l => !l.fileDated).length;
+        context.push(`${days} recording days`);
+    }
+    if (lastLayoutRebuilt) context.push("rebuilt by device");
+    log(`Result: ${lastSyncResult.clips} clips — ${parts.join(", ")}` + (context.length ? ` · ${context.join(" · ")}` : "") + ".",
+        check || other ? "warn" : "success");
+}
+
 // path → recording-session index, when the days were closed up; else null.
 // Only files with an EMBEDDED clock get a day. A file dated by when it was
 // copied or processed could belong to any day — DBTX-1 _001.wav, dated two
@@ -2805,6 +2926,7 @@ async function markRecordingDays() {
 async function refreshSequence(opts) {
     opts = opts || {};
     beginOp("Scanning sequence…");
+    if (opts.planLayout !== false) { layoutPicker.setNote(""); daysPicker.setNote(""); refAutoNote = ""; updateRefTrigger(); }
     if (opts.planLayout !== false) clearLog();
     clearSyncSummary();
     clipPayload = null;
@@ -2943,6 +3065,13 @@ async function refreshSequence(opts) {
             log(`Build layout: ${names} were recording at the same time, so their clocks agree — ` +
                 `they will be laid out at their real offsets from each other ` +
                 `(${formatDuration(group.spanSec * 1000)} of shoot). The audio pass only has to fine-tune.`, "success");
+        }
+        for (const hs of (layout.hourShifted || [])) {
+            const h = Math.abs(hs.hours);
+            const size = h >= 48 ? `${Math.round(h / 24)} days` : `${h} hour${h !== 1 ? "s" : ""}`;
+            log(`Build layout: ${dsp.trackKeyLabel(hs.trackKey)}'s clock reads ${size} ${hs.hours > 0 ? "ahead of" : "behind"} ` +
+                `${hs.toTrackKeys.map(dsp.trackKeyLabel).join(", ")}, but shifted by exactly that its recordings line up ` +
+                `(${formatDuration(hs.overlapSec * 1000)} in common) — a wrong date or time zone. Laid out there; the audio pass confirms it.`, "success");
         }
         if (layout.tracks.length > 1) {
             for (const odd of layout.ungrouped) {
@@ -3101,6 +3230,7 @@ async function buildSync() {
         // A forced Audio reference names a TRACK of the original timeline; a
         // rebuild puts those recordings on different tracks, so follow them.
         const refFollow = (rebuildPlan && forcedRefTrackKey && rebuildPlan.refPaths) ? rebuildPlan.refPaths : null;
+        lastLayoutRebuilt = !!rebuildPlan;
         if (rebuildPlan) {
             reportRebuild(built, finalName);
         } else {
@@ -3152,6 +3282,26 @@ async function fineTuneAudio() {
 
         // Same pure decision the anchors were marked with — read back for the log.
         const refPlans = dsp.planReferenceLayers(anchors, scan.clips, forcedRefTrackKey, sessionOf);
+        if (!forcedRefTrackKey) {
+            refAutoNote = [...new Set(refPlans.map(r => r.plan.refTrackKey).filter(Boolean))]
+                .map(k => shortTrackLabel({ trackType: k.split("_")[0], trackIndex: parseInt(k.split("_")[1], 10) })).join(", ");
+            updateRefTrigger();
+        }
+
+        // Missing peak files are the main reason a first sync is slow: without
+        // them every comparison has to decode audio.
+        {
+            let missing = 0;
+            for (const a of anchors) {
+                try { if (!(await pek.resolvePek(a.filePath))) missing += 1; }
+                catch (e) { if (e && e.cancelled) throw e; missing += 1; }
+            }
+            if (missing) {
+                log(`ℹ Premiere has no peak files yet for ${missing} of ${anchors.length} clips, so their audio has to be decoded. ` +
+                    `Premiere builds peak files in the background after import (and when a project opens in a new version); ` +
+                    `a sync run once it has finished is much faster.`, "info");
+            }
+        }
         const dayNames = sessionOf ? sessions.sessionLabels(lastDays.plan) : null;
         for (const { session, plan: refPlan } of refPlans) {
             const where = session === null ? "" : `${dayNames[session].name}: `;
@@ -3197,6 +3347,11 @@ async function fineTuneAudio() {
         fine.notes.forEach(msg => log(msg));
         logDecodeStats("Fine pass");
         syncRows.push(...fine.results);
+        lastSyncResult = {
+            rows: fine.results,
+            clips: anchors.length,
+            references: anchors.filter(a => a.isReference).length
+        };
 
         // Merge coarse + fine deltas per FILE so each file moves exactly once.
         // (Anchor keys are file paths — one shift covers every timeline instance
@@ -3319,8 +3474,11 @@ async function autoSync() {
             return;
         }
 
+        lastSyncResult = null;
         await fineTuneAudio();
         if (!cancelRequested) await markRecordingDays();
+        if (!cancelRequested) await markClipsToCheck();
+        if (!cancelRequested) logSyncSummary();
         log(cancelRequested ? "Auto Sync cancelled." : `Auto Sync complete in ${formatDuration(Date.now() - startedAt)} (${stepBreakdown()}).`,
             cancelRequested ? "warn" : "success");
         if (!cancelRequested) {

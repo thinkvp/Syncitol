@@ -2099,3 +2099,77 @@ test("planReferenceLayers honours a forced track on its day and falls back on th
     assert.strictEqual(plans[1].plan.refTrackKey, "audio_5");
     assert.deepStrictEqual(anchors.filter(a => a.isReference).map(a => a.filePath).sort(), ["d1_main.mp4", "d2_rec.wav"]);
 });
+
+// ─── guardTrackOutliers ───────────────────────────────────────────────────────
+
+test("guardTrackOutliers rejects a weak shift seconds away from its track-mates", () => {
+    const rows = [
+        { status: "shifted", deltaSec: 0.13, score: 0.74 }, { status: "shifted", deltaSec: -0.22, score: 0.71 },
+        { status: "shifted", deltaSec: 0.54, score: 0.71 }, { status: "aligned", score: 0.76 },
+        { status: "shifted", deltaSec: 0.31, score: 0.80 }, { status: "shifted", deltaSec: -4.12, score: 0.52 }
+    ];
+    const g = dsp.guardTrackOutliers(rows);
+    assert.strictEqual(g.outliers.length, 1);
+    assert.strictEqual(g.outliers[0].index, 5);
+    assert.strictEqual(g.outliers[0].keep, false);
+    assert.ok(Math.abs(g.centreSec - 0.13) < 0.2);
+});
+
+test("guardTrackOutliers lets a strong outlier stand", () => {
+    const rows = [
+        { status: "shifted", deltaSec: 0.1, score: 0.8 }, { status: "shifted", deltaSec: 0.2, score: 0.8 },
+        { status: "shifted", deltaSec: -0.1, score: 0.8 }, { status: "shifted", deltaSec: 3.0, score: 0.9 }
+    ];
+    const g = dsp.guardTrackOutliers(rows);
+    assert.strictEqual(g.outliers.length, 1);
+    assert.strictEqual(g.outliers[0].keep, true);
+});
+
+test("guardTrackOutliers needs enough agreeing track-mates before calling anything an outlier", () => {
+    const spread = [
+        { status: "shifted", deltaSec: 0.1, score: 0.6 }, { status: "shifted", deltaSec: 2.5, score: 0.6 },
+        { status: "shifted", deltaSec: -2.4, score: 0.6 }, { status: "shifted", deltaSec: 5, score: 0.6 }
+    ];
+    assert.deepStrictEqual(dsp.guardTrackOutliers(spread).outliers, []);
+    assert.deepStrictEqual(dsp.guardTrackOutliers(spread.slice(0, 3)).outliers, []);
+});
+
+// ─── Whole-hour clock offsets ─────────────────────────────────────────────────
+
+test("planBuildAnchors lays a camera with the wrong date beside the camera it filmed with", () => {
+    // FX6 dated 24 Feb, A7S3 dated 23 Oct, same interviews ~1 min apart.
+    const fx = new Date(2026, 1, 24, 16, 44, 27).getTime();
+    const a7 = new Date(2026, 9, 23, 16, 45, 27).getTime();
+    const files = [];
+    for (let i = 0; i < 4; i += 1) {
+        files.push({ filePath: `fx${i}`, trackType: "video", trackIndex: 0, recordStartMs: fx + i * 900000, durationSec: 800, timingSource: "modification_date" });
+        files.push({ filePath: `a7${i}`, trackType: "video", trackIndex: 1, recordStartMs: a7 + i * 900000, durationSec: 800, timingSource: "creation_time" });
+    }
+    // Plus A7S3 B-roll earlier in the afternoon.
+    for (let i = 0; i < 10; i += 1) {
+        files.push({ filePath: `b${i}`, trackType: "video", trackIndex: 1, recordStartMs: a7 - 9000000 + i * 120000, durationSec: 30, timingSource: "creation_time" });
+    }
+    const layout = dsp.planBuildAnchors(files);
+    assert.strictEqual(layout.hourShifted.length, 1);
+    const hs = layout.hourShifted[0];
+    assert.strictEqual(hs.trackKey, "video_0");
+    const pos = (f) => (f.recordStartMs - layout.anchorMsByTrack[`${f.trackType}_${f.trackIndex}`]) / 1000;
+    // The FX6 interview now starts 60 s before the A7S3 one, as it really did.
+    assert.ok(Math.abs((pos(files[1]) - pos(files[0])) - 60) < 1);
+});
+
+test("bestWholeHourShift refuses an ambiguous recurring shoot", () => {
+    const day = 24 * 3600000;
+    const base = [0, 1, 2].map(d => ({ startMs: d * day, endMs: d * day + 3600000 }));
+    const cam = [{ startMs: 10 * day + 60000, endMs: 10 * day + 3000000 }];
+    assert.strictEqual(dsp.bestWholeHourShift(cam, base), null);
+});
+
+test("bestWholeHourShift finds a time-zone error", () => {
+    const base = [{ startMs: 0, endMs: 1800000 }, { startMs: 2400000, endMs: 4200000 }];
+    // Same two takes, clock 3 h ahead and 30 s off.
+    const cam = base.map(b => ({ startMs: b.startMs + 3 * 3600000 + 30000, endMs: b.endMs + 3 * 3600000 + 30000 }));
+    assert.strictEqual(dsp.bestWholeHourShift(cam, base).hours, 3);
+    // One take alone is not evidence enough.
+    assert.strictEqual(dsp.bestWholeHourShift(cam.slice(0, 1), base), null);
+});

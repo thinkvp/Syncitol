@@ -54,12 +54,46 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   DBTX-1 _001.wav was dated two days after the shoot, so it was made the
   reference of a "day" of its own, never aligned, and left sitting with
   the wrong day's footage.
+- **"Check sync" markers and a one-line result.** Clips the fine pass could
+  not vouch for get a sequence marker at their start, with the reason in the
+  comment. Those are low-confidence matches (score under 0.5), clips it could
+  not match, clips given their track-mates' shift, and outliers. The log
+  opens its verdict with "Result: 140 clips — 10 reference, 118 matched, 6 to
+  check (marked on the timeline), 6 outside every reference recording ·
+  2 recording days · rebuilt by device".
+- **A camera's clock off by whole hours or days is laid out where it
+  belongs.** A wrong time zone, a missed daylight-saving change and a date
+  reset after a flat battery all leave the minutes right. If shifting a
+  track's clock by a whole number of hours lines its clips up with the main
+  group's (at least two clips starting within 2 minutes of one there, and no
+  other whole-hour shift coming close), the build lays it out there, and the
+  audio pass only has to confirm. Before, such a track started at 0:00 and
+  the audio pass searched for the multi-hour offset blind. Recurring
+  same-time-every-day shoots are ambiguous, so they are left alone.
+- **The dropdowns show what Auto decided** after a run, e.g. "Auto · V3, V4",
+  "Auto-detect · rebuilt by device", "Auto-detect · 2 days".
+- **A note when Premiere has no peak files yet** for some clips. That happens
+  right after import, or when a project opens in a new Premiere version, and
+  it is the main reason a first sync is slow.
 - **Elapsed time while syncing**, with "Step 2 of 4" and an estimate of the
   time left in the current step once it has run long enough to tell. The
   log's last line now breaks the run down by step (reading clips, building,
   coarse align, fine align).
 
 ### Fixed
+- **A clip could be shifted seconds away from the rest of its camera on a
+  weak match.** The fine pass applied any shift scoring 0.2 or more. One
+  camera's clips share one clock error, so their corrections cluster within a
+  second. A clip asking for more than 1.5 s away from its track-mates'
+  typical shift now keeps its own shift only on a strong match (0.75 or
+  more). Otherwise it takes the typical shift. Either way it is marked to
+  check. In a field log, C9370 had been moved −4.12 s at score 0.52 while 30
+  clips from the same A7S3 sat within ±0.8 s.
+- **Clock-drift warnings on short clips were noise.** The help said drift is
+  checked on overlaps over 10 minutes, but warnings appeared from 2 minutes.
+  At ±10 ms per measurement, that produced "164–515 ppm" on 3–7 minute
+  clips, several times what real clocks drift. Drift is now only reported
+  on overlaps of 10 minutes or more.
 - **A first sync spent minutes decoding audio it did not need.** The coarse
   pass matches a track from Premiere's peak files in a moment, but then
   confirmed that match by decoding real audio: two more points in the clip,
