@@ -318,6 +318,99 @@
     // have nothing in common with day 1's recordings, so aligning them to a
     // day-1 reference sends the coarse pass through every expensive stage to
     // find nothing. Each anchor then carries `session`.
+    // The clips the audio passes may use: every instance of a file with no
+    // audio stream (drone footage) is dropped. Such a file can match nothing,
+    // and left in it does harm: its picture instance counts toward a track's
+    // coverage, so a drone track with the most footage became the Auto
+    // reference and nothing could align to it; it sent the coarse pass through
+    // every stage on decode failures; and the fine pass flagged each clip and
+    // called its track's coarse offset suspect. Dropped here, it is never an
+    // anchor, so it gets no shift and stays where its clock put it.
+    // `noAudioPaths`: a Set of file paths.
+    function clipsWithAudio(clips, noAudioPaths) {
+        if (!noAudioPaths || !noAudioPaths.size) return clips;
+        var out = [];
+        for (var i = 0; i < clips.length; i += 1) {
+            if (!noAudioPaths.has(clips[i].filePath)) out.push(clips[i]);
+        }
+        return out;
+    }
+
+    // ─── Items a sync leaves out ──────────────────────────────────────────────
+    // Stills and graphics are not recordings: they carry no recording time (a
+    // still's only date is when it was exported or downloaded) and no sound,
+    // so there is nothing to sync them by. Left in, a still was laid out at its
+    // file date, counted as a "device" that forced a rebuild, and could trip
+    // the 24-hour guard. So they are set aside before anything is planned and
+    // kept out of the -SYNC sequence; the original sequence still has them.
+    var STILL_EXTS = {
+        jpg: 1, jpeg: 1, jfif: 1, png: 1, tif: 1, tiff: 1, psd: 1, psb: 1, ai: 1, eps: 1,
+        svg: 1, gif: 1, bmp: 1, webp: 1, heic: 1, heif: 1, tga: 1, dpx: 1, exr: 1
+    };
+    // Motion graphics templates: Premiere imports a .mogrt as an .aegraphic
+    // (After Effects-made) or .prgraphic (Premiere-made) file with a real media
+    // path, so unlike a plain title it is not caught by having no path.
+    var GRAPHIC_FILE_EXTS = { mogrt: 1, aegraphic: 1, prgraphic: 1 };
+    function extOf(filePath) {
+        var m = /\.([a-z0-9]+)$/i.exec(String(filePath || ""));
+        return m ? m[1].toLowerCase() : "";
+    }
+    function isGraphicFilePath(filePath) {
+        return Object.prototype.hasOwnProperty.call(GRAPHIC_FILE_EXTS, extOf(filePath));
+    }
+    // True for every file a sync leaves out: stills AND graphics templates.
+    function isStillPath(filePath) {
+        return Object.prototype.hasOwnProperty.call(STILL_EXTS, extOf(filePath)) || isGraphicFilePath(filePath);
+    }
+
+    // The timeline items to take out of a cloned sequence: every instance of a
+    // still, and every item with no media file (title, graphic, matte,
+    // adjustment layer, nested sequence) — EXCEPT one linked to a clip that
+    // stays, such as the audio of a merged clip: removing it would leave its
+    // partner behind. Linked is inferred as planLinkGroups does: another media
+    // type, another track, the same start and end within `tolSec`.
+    //
+    //   clips  — scan clips { filePath, trackType, trackIndex, itemIndex, startSec, endSec, clipName }
+    //   opaque — items with no media path, same shape minus filePath
+    // Returns { items: [{ trackType, trackIndex, itemIndex, label, kind }],
+    //           stills: [filePath], graphics: [label], keptLinked: n }
+    // where kind is "still" or "graphic", and stills/graphics are unique.
+    function planLeftOutItems(clips, opaque, tolSec) {
+        var tol = (tolSec === undefined || tolSec === null) ? 0.002 : tolSec;
+        var out = { items: [], stills: [], graphics: [], keptLinked: 0 };
+        var kept = [];
+        var seenStill = {}, seenGraphic = {};
+        var i, j;
+        for (i = 0; i < (clips || []).length; i += 1) {
+            var c = clips[i];
+            if (!isStillPath(c.filePath)) { kept.push(c); continue; }
+            if (isGraphicFilePath(c.filePath)) {
+                // Listed by its clip name, like a title: the .aegraphic file name
+                // is an internal one the editor never chose.
+                var gl = c.clipName || "motion graphic";
+                out.items.push({ trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, label: gl, kind: "graphic" });
+                if (!seenGraphic[gl]) { seenGraphic[gl] = true; out.graphics.push(gl); }
+                continue;
+            }
+            out.items.push({ trackType: c.trackType, trackIndex: c.trackIndex, itemIndex: c.itemIndex, label: c.clipName, kind: "still" });
+            if (!seenStill[c.filePath]) { seenStill[c.filePath] = true; out.stills.push(c.filePath); }
+        }
+        for (i = 0; i < (opaque || []).length; i += 1) {
+            var o = opaque[i];
+            var linked = false;
+            for (j = 0; j < kept.length && !linked; j += 1) {
+                var k = kept[j];
+                linked = k.trackType !== o.trackType &&
+                    Math.abs(k.startSec - o.startSec) <= tol && Math.abs(k.endSec - o.endSec) <= tol;
+            }
+            if (linked) { out.keptLinked += 1; continue; }
+            var label = o.clipName || "untitled item";
+            out.items.push({ trackType: o.trackType, trackIndex: o.trackIndex, itemIndex: o.itemIndex, label: label, kind: "graphic" });
+            if (!seenGraphic[label]) { seenGraphic[label] = true; out.graphics.push(label); }
+        }
+        return out;
+    }
+
     function buildFineTuneAnchors(clips, forcedRefTrackKey, sessionOf) {
         var byKey = {};
         var order = [];
@@ -2435,6 +2528,9 @@
         findBestLag: findBestLag,
         slideMatch: slideMatch,
         buildFineTuneAnchors: buildFineTuneAnchors,
+        clipsWithAudio: clipsWithAudio,
+        isStillPath: isStillPath,
+        planLeftOutItems: planLeftOutItems,
         diffInstanceMovement: diffInstanceMovement,
         planTearRepair: planTearRepair,
         auditLinkAlignment: auditLinkAlignment,

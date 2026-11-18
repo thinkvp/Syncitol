@@ -4,12 +4,15 @@
  * for the DSP: decodePcm() decodes audio slices, probe() reads container and
  * stream metadata. No external ffmpeg/ffprobe install is involved.
  *
- * The addon's decode is synchronous on UXP's scripting thread, so:
+ * Decoding runs on the addon's background pool (decodePcmAsync) when it has
+ * one: several slices decode at once, sized to the machine's CPU threads, and
+ * the panel stays responsive. An older addon, or the "syncitol-decode" =
+ * "sync" localStorage switch, falls back to the synchronous decodePcm on the
+ * scripting thread, one slice at a time. Either way:
  *  - a cancel check (installed by main.js via setCancelCheck) runs before each
  *    decode, giving between-decode cancel granularity;
  *  - a setTimeout(0) yield before each decode lets the panel repaint and the
- *    Cancel click be processed. A future async/threaded addon would slot in
- *    below this API without callers changing.
+ *    Cancel click be processed.
  *
  * Envelopes are ALSO cached on disk (plugin data folder), keyed by the media
  * file's identity (path + mtime + size) plus the exact slice/resolution: a
@@ -60,6 +63,24 @@ function addon() {
 }
 
 async function ensureAddon() { await addon(); } // throws a clear error if unavailable
+
+// Background decoding: available in this addon, and not switched off.
+function useAsyncDecode(a) {
+    if (!a || typeof a.decodePcmAsync !== "function") return false;
+    try { if (localStorage.getItem("syncitol-decode") === "sync") return false; } catch (e) { /* no storage: default on */ }
+    return true;
+}
+
+// How many slices decode at once — the addon sizes its pool from the CPU
+// thread count — and that count, for the log. Before the addon loads, or
+// when decoding is synchronous: one.
+function decodeConcurrency() {
+    if (!useAsyncDecode(_addon)) return 1;
+    try { return Math.max(1, Number(_addon.decodeThreads()) || 1); } catch (e) { return 1; }
+}
+function cpuCount() {
+    try { return _addon && typeof _addon.cpuCount === "function" ? Number(_addon.cpuCount()) || null : null; } catch (e) { return null; }
+}
 
 // ─── Cancellation + UI yields ─────────────────────────────────────────────────
 // main.js installs its throwIfCancelled here so decode loops unwind cleanly.
@@ -173,9 +194,18 @@ function writeEnvelopeToDisk(diskPath, envelope) {
 // ─── Envelope extraction (cached per file|offset|dur|rate|window) ─────────────
 const envelopeCache = new Map();
 // What getEnvelope actually did, for the log: decodes are the expensive part.
+// decodeMs is WALL time with at least one decode running, not the sum of the
+// decodes: with several at once, the sum would overstate how long it took.
 let decodeStats = { decodes: 0, audioSec: 0, decodeMs: 0, diskHits: 0 };
+let inFlight = 0, busySince = 0;
 function resetDecodeStats() { decodeStats = { decodes: 0, audioSec: 0, decodeMs: 0, diskHits: 0 }; }
-function getDecodeStats() { return Object.assign({}, decodeStats); }
+function getDecodeStats() {
+    const out = Object.assign({}, decodeStats);
+    if (inFlight > 0) out.decodeMs += Date.now() - busySince;
+    return out;
+}
+function decodeStarted() { if (inFlight++ === 0) busySince = Date.now(); }
+function decodeEnded() { if (--inFlight === 0) decodeStats.decodeMs += Date.now() - busySince; }
 
 function getEnvelope(filePath, sourceOffsetSec, durationSec, opts) {
     opts = opts || {};
@@ -196,11 +226,17 @@ function getEnvelope(filePath, sourceOffsetSec, durationSec, opts) {
         throwIfCancelled();
 
         const a = await addon();
-        const t0 = Date.now();
-        const buf = a.decodePcm(filePath, sourceOffsetSec, durationSec, sampleRate);
+        let buf;
+        decodeStarted();
+        try {
+            buf = useAsyncDecode(a)
+                ? await a.decodePcmAsync(filePath, sourceOffsetSec, durationSec, sampleRate)
+                : a.decodePcm(filePath, sourceOffsetSec, durationSec, sampleRate);
+        } finally {
+            decodeEnded();
+        }
         decodeStats.decodes += 1;
         decodeStats.audioSec += durationSec;
-        decodeStats.decodeMs += Date.now() - t0;
         const samples = new Int16Array(buf); // little-endian int16 mono
         if (!samples.length) throw new Error(`No audio samples: ${baseName(filePath)}`);
         const envelope = dsp.buildEnvelope(samples, windowSamples);
@@ -219,8 +255,10 @@ function clearCache() { envelopeCache.clear(); }
 // ─── Metadata probe (cached per file) ─────────────────────────────────────────
 const probeCache = new Map();
 
-// Returns { recordStartMs, durationSec, timingSource, timecodeSec, frameRate }
-// or throws. Sourced from the addon's container/stream metadata.
+// Returns { recordStartMs, durationSec, timingSource, timecodeSec, frameRate,
+// hasAudio } or throws. Sourced from the addon's container/stream metadata.
+// hasAudio is false only when the container holds no audio stream at all
+// (drone footage, screen recordings) — anything else counts as audio.
 async function probeRecordStart(filePath) {
     if (probeCache.has(filePath)) return probeCache.get(filePath);
     const p = (async () => {
@@ -251,7 +289,8 @@ async function probeRecordStart(filePath) {
             durationSec: r.durationSec || 0,
             timingSource,
             timecodeSec,
-            frameRate
+            frameRate,
+            hasAudio: r.hasAudio !== false
         };
     })();
     probeCache.set(filePath, p);
@@ -267,6 +306,8 @@ function baseName(p) {
 
 module.exports = {
     ensureAddon,
+    decodeConcurrency,
+    cpuCount,
     setCancelCheck,
     getEnvelope,
     clearCache,

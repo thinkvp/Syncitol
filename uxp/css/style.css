@@ -153,6 +153,9 @@ body {
 .seq-name { color: var(--accent); font-weight: 600; display: block; margin-bottom: 2px; }
 .seq-meta { color: var(--text-lo); font-size: 10px; }
 .seq-stale { color: var(--yellow); }
+.pek-status { font-size: 10px; line-height: 1.5; margin-top: 4px; color: var(--text-lo); }
+.pek-status.pek-waiting { color: var(--yellow); }
+.pek-status.pek-ready { color: var(--green); }
 
 /* ── Reference-track picker ─────────────────────────────────────────────────── */
 /* A div-built dropdown, like the buttons: UXP renders native <select> widgets
@@ -319,6 +322,42 @@ body {
 .tips-card-text a:hover { color: #7dffbd; }
 #tips-card-close { flex-shrink: 0; }
 
+/* Result card: after every Auto Sync. Green head; a red section below it
+   only when clips were left unsynced, so it cannot be missed. */
+.result-card {
+    border: 1px solid rgba(74, 247, 154, 0.35);
+    border-radius: var(--radius);
+    margin-top: 10px;
+    overflow: hidden;
+}
+.result-card.has-unsynced { border-color: rgba(247, 90, 90, 0.55); }
+.result-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background-color: rgba(74, 247, 154, 0.06);
+    padding: 9px 12px;
+}
+.result-card-icon { color: var(--green); font-weight: 600; flex-shrink: 0; }
+.result-card-text { flex: 1; font-size: 11px; line-height: 1.5; color: var(--text-hi); }
+.result-card-meta { color: var(--text-lo); }
+#result-card-close { flex-shrink: 0; }
+.result-card-unsynced {
+    background-color: rgba(247, 90, 90, 0.10);
+    border-top: 1px solid rgba(247, 90, 90, 0.35);
+    padding: 9px 12px;
+}
+.result-card-unsynced-title { font-size: 11px; font-weight: 600; color: var(--red); margin-bottom: 4px; }
+.result-card-unsynced-note { font-size: 11px; line-height: 1.5; color: var(--text-hi); margin-bottom: 6px; }
+.result-card-unsynced-files {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    line-height: 1.6;
+    color: var(--text-mid);
+    white-space: pre-line;      /* one file per line */
+    overflow-wrap: anywhere;    /* only a name too long for the panel breaks */
+}
+
 /* Update banner. Accent-purple so it reads as the panel talking about itself,
    distinct from the green tips card. */
 .update-card {
@@ -458,7 +497,8 @@ body {
 .score-low  { color: var(--red);    border-color: var(--red);    background-color: #3a1f1f; }
 .score-none { color: var(--text-lo); }
 
-.drift-flag {
+/* "check": a clip the fine pass could not vouch for; the reason is its tooltip. */
+.drift-flag, .check-flag {
     display: inline-block;
     font-size: 8px;
     font-weight: 600;

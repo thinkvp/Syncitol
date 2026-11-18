@@ -47,6 +47,9 @@
         <div class="card">
             <div class="card-label">Active Sequence</div>
             <div id="seq-info">Click "Auto Sync" to begin.</div>
+            <!-- Premiere peak files for the active sequence's audio: a sync runs
+                 much faster once Premiere has built them. -->
+            <div id="pek-status" class="pek-status" style="display:none;"></div>
             <div id="busy-row" class="busy-row" style="display:none;">
                 <span class="busy-spinner"></span>
                 <span id="busy-text">Working…</span>
@@ -101,9 +104,29 @@
             <div id="btn-auto" class="btn btn-primary">⚡ Auto Sync</div>
         </div>
 
+        <!-- Result card: shown after every completed Auto Sync. The lower part
+             appears only when some clips could not be synced (no audio). -->
+        <div id="result-card" class="result-card" style="display:none;">
+            <div class="result-card-head">
+                <span class="result-card-icon">✓</span>
+                <span class="result-card-text"><span id="result-card-stats">Synced</span> <span id="result-card-meta" class="result-card-meta"></span></span>
+                <div id="result-card-close" class="btn btn-mini" title="Dismiss">✕</div>
+            </div>
+            <div id="result-card-unsynced" class="result-card-unsynced" style="display:none;">
+                <div id="result-card-unsynced-title" class="result-card-unsynced-title"></div>
+                <div id="result-card-unsynced-note" class="result-card-unsynced-note"></div>
+                <div id="result-card-unsynced-files" class="result-card-unsynced-files"></div>
+            </div>
+            <div id="result-card-leftout" class="result-card-unsynced" style="display:none;">
+                <div id="result-card-leftout-title" class="result-card-unsynced-title"></div>
+                <div id="result-card-leftout-note" class="result-card-unsynced-note"></div>
+                <div id="result-card-leftout-files" class="result-card-unsynced-files"></div>
+            </div>
+        </div>
+
         <!-- Tips card: shown once per install after a successful Auto Sync -->
         <div id="tips-card" class="tips-card" style="display:none;">
-            <span class="tips-card-text">🎉 <span id="tips-card-stats">Synced!</span> Syncitol is free — if it saved you time, consider <a id="tips-card-link" href="https://ko-fi.com/thinkvp">tipping on Ko-fi</a>.</span>
+            <span class="tips-card-text">🎉 Syncitol is free — if it saved you time, consider <a id="tips-card-link" href="https://ko-fi.com/thinkvp">tipping on Ko-fi</a>.</span>
             <div id="tips-card-close" class="btn btn-mini" title="Dismiss">✕</div>
         </div>
 
@@ -177,7 +200,7 @@
             <div class="ins-section">
                 <div class="ins-heading">⚡ Running a sync</div>
                 <p class="ins-text">Make your <strong>original</strong> sequence active (not an already-built <code>-SYNC</code> — Auto Sync refuses those) and click <strong>Auto Sync</strong>. It runs four steps — <em>reading clips, building, coarse align, fine align</em> — and the busy row shows which one, the elapsed time, and once a step has run long enough to tell, about how long that step has left (the audio search is uneven, so treat it as a guide). <strong>✕ Cancel</strong> stops it at any point.</p>
-                <p class="ins-text">When it finishes, the log’s <strong>Result</strong> line says how it went: how many clips matched, how many are worth checking, and how many sat outside every reference recording. Clips worth checking get a <strong>“Check sync”</strong> marker on the timeline at their start, with the reason in the marker’s comment. The <strong>Sync Results</strong> table lists each track and clip’s shift, what it matched against, and a confidence score.</p>
+                <p class="ins-text">When it finishes, the log’s <strong>Result</strong> line says how it went: how many clips matched, how many are worth checking, and how many sat outside every reference recording. Clips worth checking are listed in the log with the reason, and carry a <strong>check</strong> flag in the <strong>Sync Results</strong> table (hover it for the reason). The table lists each track and clip’s shift, what it matched against, and a confidence score.</p>
                 <p class="ins-text ins-note"><strong>↩ Revert</strong> (in Sync Results) undoes the shifts the sync applied. It is not available when the tracks were packed afterwards (see Track layout) — run Auto Sync again from the original sequence instead.</p>
             </div>
 
@@ -190,7 +213,8 @@
 
                 <div class="ins-subheading">Track layout</div>
                 <p class="ins-text">Everything after the build treats <strong>one track as one recording device</strong>. If a track holds two — every clip dumped on V1, a recorder sharing a camera’s audio track — the <code>-SYNC</code> sequence is built fresh with one block of tracks per camera and recorder. <strong>Auto-detect</strong> does this only when a track provably mixes devices; <strong>Keep my tracks</strong> never does; <strong>Rebuild by device</strong> always does.</p>
-                <p class="ins-text ins-note">Only things one device cannot do prove a mix-up: different containers (<code>.MXF</code> and <code>.MP4</code>), camera clips beside sound-only recordings, two camera serials (from Sony <code>M01.XML</code> sidecars), or two files recorded at the same moment. Folder, bin and file name keep files apart but never trigger a rebuild on their own — one camera’s two cards on V1 is fine. A rebuild places every file <em>whole</em>, so trims, effects and titles from the original timeline are not carried over.</p>
+                <p class="ins-text ins-note">Only things one device cannot do prove a mix-up: different containers (<code>.MXF</code> and <code>.MP4</code>), camera clips beside sound-only recordings, two camera serials (from Sony <code>M01.XML</code> sidecars), or two files recorded at the same moment. Folder, bin and file name keep files apart but never trigger a rebuild on their own — one camera’s two cards on V1 is fine. A rebuild places every file <em>whole</em>, so trims and effects from the original timeline are not carried over.</p>
+                <p class="ins-text ins-note">Stills, titles, graphics, mattes, adjustment layers and nested sequences are not recordings, so there is nothing to sync them by: they are left out of the <code>-SYNC</code> sequence in either layout, and the result card lists them. The original sequence keeps them. Music and other audio files are still synced like any recording.</p>
                 <p class="ins-text ins-note">After a rebuild, once the sync is done, device blocks that never overlap in time are <strong>packed onto shared tracks</strong> — the same camera on two days, or two devices that never rolled together. That means placing them again in a fresh copy, which only replaces the first one if every clip lands exactly. A forced Audio reference follows its recordings through a rebuild.</p>
 
                 <div class="ins-subheading">Recording days</div>
@@ -209,7 +233,7 @@
                 <div class="ins-heading">How the alignment works</div>
                 <p class="ins-text">The <strong>coarse</strong> pass moves each whole track to fix minute-scale clock offsets. A clip over <code>90s</code> is probed at points across its whole length and the offset must hold at more than one; it is then re-tested on the track’s other clips, and if they agree on something else, theirs wins.</p>
                 <p class="ins-text">The <strong>fine</strong> pass then places every clip against the reference within <code>±5s</code>, re-searching <code>±30s</code> for clips it cannot match there; only corrections over <code>20&nbsp;ms</code> are applied. Overlaps over <code>2 min</code> are matched at both ends, and the two must agree.</p>
-                <p class="ins-text ins-note">One camera carries one clock error, so its clips’ corrections cluster. A clip asking for more than <code>1.5s</code> away from the rest of its track keeps that only on a strong match; otherwise it gets the track’s typical shift and a Check sync marker. Clips the fine pass could not match get their track-mates’ shared correction when they agree closely.</p>
+                <p class="ins-text ins-note">One camera carries one clock error, so its clips’ corrections cluster. A clip asking for more than <code>1.5s</code> away from the rest of its track keeps that only on a strong match; otherwise it gets the track’s typical shift and is flagged to check. Clips the fine pass could not match get their track-mates’ shared correction when they agree closely.</p>
                 <p class="ins-text ins-note"><strong>Clock drift</strong> — two devices whose clocks run at slightly different rates — is flagged only when it reaches a frame (<code>40&nbsp;ms</code>) across an overlap of 10 minutes or more; anything smaller is invisible and within measurement error. One offset can’t fix both ends of a drifting clip; split long recordings if it matters.</p>
                 <p class="ins-text ins-note">Every clip of one file moves as one piece, so a camera’s picture and sound never come apart. Audio linked from a different file (merged clips, <em>Synchronize</em>, <em>Clip &gt; Link</em>) moves with its picture. After every move the timeline is read back; anything that landed unevenly is put right, or back where it started.</p>
                 <div class="ins-subheading">Fine pass</div>
@@ -223,7 +247,7 @@
 
             <div class="ins-section">
                 <div class="ins-heading">Speed and the cache</div>
-                <p class="ins-text">When Premiere’s own peak files (<code>.pek</code>) cover your media, whole tracks are matched from them in milliseconds without decoding any audio. Right after an import, or when a project opens in a new Premiere version, Premiere is still building them, so the first sync is slower — the log says when that is the case. Audio Syncitol does decode is cached on disk, so a re-run on the same footage takes seconds. The log reports what each step actually decoded.</p>
+                <p class="ins-text">When Premiere’s own peak files (<code>.pek</code>) cover your media, whole tracks are matched from them in milliseconds without decoding any audio. Right after an import, or when a project opens in a new Premiere version, Premiere is still building them, so the first sync is slower. Before you click Auto Sync, the Active Sequence card shows how many of the sequence’s audio files have peak files yet, and updates while Premiere builds the rest. Audio Syncitol does decode is cached on disk, so a re-run on the same footage takes seconds. The log reports what each step actually decoded.</p>
                 <p class="ins-text ins-note">To time a sync as a first run, clear Syncitol’s cache: the audio it has decoded and the file metadata it has read. Premiere’s peak files are left alone. Windows and network drives also keep recently read files in memory for a while, so a second run straight away can still be a little quicker.</p>
                 <div class="ins-actions"><div id="btn-clear-cache" class="btn btn-mini" title="Forget the audio Syncitol has decoded and the file metadata it has read, so the next sync decodes afresh">🗑 Clear cache</div></div>
             </div>

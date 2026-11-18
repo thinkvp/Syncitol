@@ -21,6 +21,10 @@ const sessions = require("./js/sessions");
 // synchronous on the scripting thread, so this mostly overlaps cache/disk reads
 // and keeps the pool structure ready for a future async addon.
 const SYNC_CONCURRENCY = 4;
+// The audio passes keep at least as many jobs in flight as the addon's decode
+// pool has threads (sized from the CPU — see audio.decodeConcurrency), so a
+// big machine is kept busy and a small one is never asked for more.
+function syncConcurrency() { return Math.max(SYNC_CONCURRENCY, audio.decodeConcurrency()); }
 
 // ─── Coarse auto-align tuning ─────────────────────────────────────────────────
 const COARSE_SAMPLE_RATE = 2000;       // Hz of extracted PCM — low rate for speed
@@ -78,6 +82,9 @@ let lastSyncResult = null;     // { rows, clips, references } from the last fine
 let lastLayoutRebuilt = false; // the last build laid the sequence out by device
 let lastRebuildBlocks = null;  // that build's device blocks, for packing tracks after the sync
 let originalSeqName = null;    // the sequence Auto Sync started from
+let noAudioPaths = new Set();  // files with no audio stream (drone footage): placed by clock, never audio-matched
+let leftOutPlan = null;        // dsp.planLeftOutItems of the scanned sequence: stills and graphics kept out of -SYNC
+let lastLeftOut = null;        // what the last build actually left out: { stills:[path], graphics:[label], notRemoved }
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -130,7 +137,6 @@ if (footerTips) {
 // ─── Tips card (shown once per install after a successful Auto Sync) ─────────
 const TIPS_DISMISSED_KEY = "syncitol-tips-dismissed";
 const tipsCard = $("tips-card");
-const tipsCardStats = $("tips-card-stats");
 const tipsCardClose = $("tips-card-close");
 const tipsCardLink = $("tips-card-link");
 
@@ -142,12 +148,84 @@ function dismissTipsCard() {
     try { localStorage.setItem(TIPS_DISMISSED_KEY, "1"); } catch (_) {}
     if (tipsCard) tipsCard.style.display = "none";
 }
-function maybeShowTipsCard(statsText) {
+function maybeShowTipsCard() {
     if (!tipsCard || tipsDismissed()) return;
-    if (tipsCardStats) tipsCardStats.textContent = statsText || "Synced!";
     tipsCard.style.display = "flex";
 }
 if (tipsCardClose) tipsCardClose.addEventListener("click", dismissTipsCard);
+
+// ─── Result card (after every completed Auto Sync) ───────────────────────────
+// How the sync went in one line, and — in red, so it is not missed — any clips
+// it could not sync because they have no audio. Unlike the tips card it comes
+// back after every sync: the warning is about THIS sequence.
+const resultCard = $("result-card");
+const resultCardStats = $("result-card-stats");
+const resultCardMeta = $("result-card-meta");
+const resultCardUnsynced = $("result-card-unsynced");
+const resultCardUnsyncedTitle = $("result-card-unsynced-title");
+const resultCardUnsyncedNote = $("result-card-unsynced-note");
+const resultCardUnsyncedFiles = $("result-card-unsynced-files");
+const resultCardClose = $("result-card-close");
+const resultCardLeftOut = $("result-card-leftout");
+const resultCardLeftOutTitle = $("result-card-leftout-title");
+const resultCardLeftOutNote = $("result-card-leftout-note");
+const resultCardLeftOutFiles = $("result-card-leftout-files");
+
+function hideResultCard() {
+    if (resultCard) resultCard.style.display = "none";
+}
+if (resultCardClose) resultCardClose.addEventListener("click", hideResultCard);
+
+const RESULT_CARD_MAX_FILES = 6;
+
+function cardList(names) {
+    return names.length > RESULT_CARD_MAX_FILES
+        ? `${names.slice(0, RESULT_CARD_MAX_FILES).join("\n")}\n…and ${names.length - RESULT_CARD_MAX_FILES} more`
+        : names.join("\n");
+}
+
+// summary: { synced, toCheck, elapsedMs, unsynced: [path], tracks: ["V4"],
+//            leftOut: { stills: [path], graphics: [label], notRemoved } | null }
+function showResultCard(summary) {
+    if (!resultCard) return;
+    const n = summary.synced;
+    resultCardStats.textContent = `Synced ${n} clip${n !== 1 ? "s" : ""} in ${formatDuration(summary.elapsedMs)}`;
+    resultCardMeta.textContent = summary.toCheck ? `· ${summary.toCheck} to check (flagged in Sync Results)` : "";
+
+    const un = summary.unsynced || [];
+    if (un.length) {
+        const one = un.length === 1;
+        resultCardUnsyncedTitle.textContent = `⚠ ${un.length} clip${one ? "" : "s"} not synced: no audio`;
+        const where = summary.tracks && summary.tracks.length ? ` on ${summary.tracks.join(", ")}` : "";
+        resultCardUnsyncedNote.textContent =
+            `${one ? "It has" : "They have"} no audio to match, so ${one ? "it was" : "they were"} placed by ` +
+            `${one ? "its" : "their"} recording clock${where}. Check ${one ? "it" : "them"} by eye.`;
+        resultCardUnsyncedFiles.textContent = cardList(un.map(audio.baseName));
+        resultCardUnsynced.style.display = "block";
+    } else {
+        resultCardUnsynced.style.display = "none";
+    }
+
+    const lo = summary.leftOut;
+    const loNames = lo ? lo.stills.map(audio.baseName).concat(lo.graphics) : [];
+    if (loNames.length) {
+        const one = loNames.length === 1;
+        resultCardLeftOutTitle.textContent = `⚠ ${loNames.length} item${one ? "" : "s"} left out: stills and graphics`;
+        resultCardLeftOutNote.textContent = lo.notRemoved
+            ? `${one ? "It isn't a recording" : "They aren't recordings"}, so there was nothing to sync by. ` +
+              `${lo.notRemoved} could not be taken out and stayed where ${lo.notRemoved !== 1 ? "they were" : "it was"}, unsynced. The original sequence still has all of them.`
+            : `${one ? "It isn't a recording" : "They aren't recordings"}, so there was nothing to sync by. ` +
+              `${one ? "It's" : "They're"} still in the original sequence.`;
+        resultCardLeftOutFiles.textContent = cardList(loNames);
+        resultCardLeftOut.style.display = "block";
+    } else {
+        resultCardLeftOut.style.display = "none";
+    }
+
+    if (un.length || loNames.length) resultCard.classList.add("has-unsynced");
+    else resultCard.classList.remove("has-unsynced");
+    resultCard.style.display = "block";
+}
 if (tipsCardLink) {
     tipsCardLink.addEventListener("click", (e) => {
         e.preventDefault();
@@ -513,9 +591,19 @@ async function mapPool(items, limit, worker) {
 async function pollActiveSequence() {
     if (opDepth > 0) return;                  // never poll mid-operation
     const liveName = await premiere.getActiveSequenceName();
-    if (liveName === lastLiveSeqName) return; // nothing changed since the last tick
+    if (liveName === lastLiveSeqName) {
+        // Same sequence, but clips added or removed: the peak-file status is
+        // about its files, so look again. (Not after an Auto Sync: the -SYNC
+        // sequence has no status until the user moves on.)
+        if (liveName && pekCheckSeq === liveName) {
+            const n = await premiere.countActiveAudioClips();
+            if (n >= 0 && n !== pekCheckClipCount) startPekCheck(liveName);
+        }
+        return;
+    }
     lastLiveSeqName = liveName;
     refreshTrackOptions();                    // the reference dropdown follows the sequence
+    startPekCheck(liveName);                  // and so does the peak-file status
 
     if (!liveName) {
         seqInfo.textContent = "Open a sequence, then click \"Auto Sync\".";
@@ -527,6 +615,75 @@ async function pollActiveSequence() {
     // When liveName === scannedSeqName, leave the rich scanned info in place.
 }
 setInterval(pollActiveSequence, 3000);
+
+// ─── Peak-file status (before Auto Sync) ──────────────────────────────────────
+// A sync matches whole tracks from Premiere's peak files in milliseconds; a
+// file without one has to be decoded, which is most of a slow first run. So
+// the panel says, before the user clicks, how many of the active sequence's
+// audio files Premiere has built peaks for — and keeps re-checking while it is
+// still building them, until they are all there.
+const pekStatus = $("pek-status");
+const PEK_RECHECK_MS = 15000;
+let pekCheckGen = 0;
+let pekCheckTimer = null;
+let pekCheckSeq = null;        // the sequence the status describes
+let pekCheckClipCount = -1;    // its audio clip count when last read
+
+// Goes to Premiere's UXP log only (see trace), so a status that never showed
+// can be explained afterwards.
+function pekTrace(m) { try { console.log("[pek-status] " + m); } catch (e) { /* never fail over a trace */ } }
+
+function stopPekCheck() {
+    pekCheckGen += 1;
+    pekCheckSeq = null;
+    if (pekCheckTimer) { clearTimeout(pekCheckTimer); pekCheckTimer = null; }
+    if (pekStatus) pekStatus.style.display = "none";
+}
+
+function startPekCheck(seqName) {
+    stopPekCheck();
+    if (!pekStatus || !seqName) return;
+    pekCheckSeq = seqName;
+    const gen = pekCheckGen;
+    const again = (ms, paths) => {
+        pekCheckTimer = setTimeout(() => { if (gen === pekCheckGen) runPekCheck(gen, seqName, paths, again); }, ms);
+    };
+    runPekCheck(gen, seqName, null, again);
+}
+
+async function runPekCheck(gen, seqName, paths, again) {
+    // Never compete with a running sync for the host; look again shortly.
+    if (opDepth > 0) { again(5000, paths); return; }
+    try {
+        if (!paths) {
+            pekCheckClipCount = await premiere.countActiveAudioClips();
+            const read = await premiere.listActiveAudioMediaPaths();
+            if (gen !== pekCheckGen || read.name !== seqName) return;
+            paths = read.paths.filter(p => !dsp.isStillPath(p));
+        }
+        if (!paths.length) { pekTrace(`"${seqName}": no audio files`); pekStatus.style.display = "none"; return; }
+        await pek.refreshPekIndex();
+        const have = await mapPool(paths, 8, (p) => pek.hasPek(p));
+        if (gen !== pekCheckGen) return;
+        const ready = have.filter(Boolean).length;
+        const n = paths.length;
+        pekTrace(`"${seqName}": ${ready}/${n} audio files have peak files` +
+            (ready < n ? ` — e.g. missing ${audio.baseName(paths[have.indexOf(false)])}` : ""));
+        if (ready === n) {
+            pekStatus.className = "pek-status pek-ready";
+            pekStatus.textContent = `✓ Premiere's peak files are ready for ${n === 1 ? "the" : `all ${n}`} audio file${n !== 1 ? "s" : ""} — Auto Sync will be quick.`;
+        } else {
+            pekStatus.className = "pek-status pek-waiting";
+            pekStatus.textContent = `Peak files: ${ready} of ${n} audio file${n !== 1 ? "s" : ""} ready. Premiere builds them in the ` +
+                `background after an import; Auto Sync runs much faster once it has finished.`;
+            again(PEK_RECHECK_MS, paths);
+        }
+        pekStatus.style.display = "block";
+    } catch (e) {
+        pekTrace(`"${seqName}": check failed — ${(e && e.message) || e}`);
+        if (gen === pekCheckGen) pekStatus.style.display = "none"; // a hint only: say nothing rather than guess
+    }
+}
 
 // ─── Audio reference picker ───────────────────────────────────────────────────
 // "Auto" leaves the reference to the analysis (the track with the most recorded
@@ -818,12 +975,14 @@ async function resolveRecordStart(file) {
         if (e && e.cancelled) throw e; // metadata probe is otherwise optional
     }
     const durationSec = (probe && probe.durationSec) || file.durationSec || 0;
+    // Unknown (probe failed) counts as audio: the audio passes then try it, as before.
+    const hasAudio = !probe || probe.hasAudio !== false;
     if (probe && probe.recordStartMs !== null) {
-        return { recordStartMs: probe.recordStartMs, durationSec, timingSource: probe.timingSource, mtimeMs: null };
+        return { recordStartMs: probe.recordStartMs, durationSec, timingSource: probe.timingSource, mtimeMs: null, hasAudio };
     }
     const mtimeMs = await premiere.statMtimeMs(file.filePath);
     if (mtimeMs === null) throw new Error("no embedded record time and the file's date is unreadable");
-    return { recordStartMs: mtimeMs - (durationSec * 1000), durationSec, timingSource: "mtime", mtimeMs };
+    return { recordStartMs: mtimeMs - (durationSec * 1000), durationSec, timingSource: "mtime", mtimeMs, hasAudio };
 }
 
 async function probeStartTimecode(filePath) {
@@ -1647,7 +1806,7 @@ async function analyzeCoarseAlign(anchors, onProgress) {
     }
 
     // ── Stage 0 — Premiere peak files ─────────────────────────────────────────
-    await mapPool(jobs, SYNC_CONCURRENCY, async (job) => {
+    await mapPool(jobs, syncConcurrency(), async (job) => {
         try {
             if (await tryPekCoarse(job)) job.done = true;
         } catch (e) {
@@ -1656,7 +1815,7 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         }
     });
     const pekDone = jobs.filter(j => j.done && !j.finalized);
-    await mapPool(pekDone, SYNC_CONCURRENCY, confirmJob);
+    await mapPool(pekDone, syncConcurrency(), confirmJob);
     let pekMatched = 0;
     for (const job of pekDone) {
         finalizeJob(job);
@@ -1709,7 +1868,7 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         if (onProgress) onProgress(units, totalUnits);
         if (!pending.length) continue;
 
-        await mapPool(pending, SYNC_CONCURRENCY, async (job) => {
+        await mapPool(pending, syncConcurrency(), async (job) => {
             await runStage(job, stageLabels);
             units += 1;
             if (onProgress) onProgress(units, totalUnits);
@@ -1718,13 +1877,13 @@ async function analyzeCoarseAlign(anchors, onProgress) {
         // Confirm, then publish freshly-confident offsets before the next (blind)
         // stage — an unconfirmed offset must not become a hint for other tracks.
         const settled = jobs.filter(j => (j.done || j.failed) && !j.finalized);
-        await mapPool(settled, SYNC_CONCURRENCY, confirmJob);
+        await mapPool(settled, syncConcurrency(), confirmJob);
         for (const job of settled) finalizeJob(job);
     }
 
     // Tracks that exhausted every stage: accept a near-prediction match or give up.
     const remaining = jobs.filter(j => !j.finalized);
-    await mapPool(remaining, SYNC_CONCURRENCY, confirmJob);
+    await mapPool(remaining, syncConcurrency(), confirmJob);
 
     // ── Another clip from the same track ─────────────────────────────────
     // Everything above rests on ONE clip standing in for its whole track, and a
@@ -2132,9 +2291,9 @@ async function analyzeFineTune(anchors, onProgress) {
     const nonBaseTotal = targets.length;
     let doneCount = 0;
 
-    notes.push(`Fine tune compare window: up to ${dsp.FINE_TUNE_MAX_COMPARE_SEC}s per pair, max shift ±${dsp.FINE_TUNE_MAX_SHIFT_SEC}s, retries on an alternate window when first-window score is below ${dsp.FINE_TUNE_DECENT_SCORE.toFixed(2)}; ${SYNC_CONCURRENCY} clips at a time.`);
+    notes.push(`Fine tune compare window: up to ${dsp.FINE_TUNE_MAX_COMPARE_SEC}s per pair, max shift ±${dsp.FINE_TUNE_MAX_SHIFT_SEC}s, retries on an alternate window when first-window score is below ${dsp.FINE_TUNE_DECENT_SCORE.toFixed(2)}; ${syncConcurrency()} clips at a time.`);
 
-    const outcomes = await mapPool(targets, SYNC_CONCURRENCY, async ({ target, targetIndex }) => {
+    const outcomes = await mapPool(targets, syncConcurrency(), async ({ target, targetIndex }) => {
         // One full fine-pass attempt from wherever the clip sits right now. It
         // runs again, once, after the wide re-search below moves the clip.
         const attempt = async () => {
@@ -2422,9 +2581,12 @@ function renderSyncSummary(rows) {
         const driftFlag = (row.driftSec !== undefined)
             ? ` <span class="drift-flag" title="Clock drift ${escapeHtml(formatSignedSeconds(row.driftSec))} (~${row.driftPpm} ppm) between the devices — one offset can't fix both ends; consider splitting long clips.">drift</span>`
             : "";
+        const checkFlag = row.check
+            ? ` <span class="check-flag" title="${escapeHtml(row.checkReason || "worth a look")}">check</span>`
+            : "";
         tr.innerHTML = `
             <td class="cell-name" title="${escapeHtml(row.detail || "")}">${row.scope === "track" ? "⇉ " : ""}${escapeHtml(row.label)}</td>
-            <td class="${statusClass[row.status] || ""}">${escapeHtml(result)}${driftFlag}</td>
+            <td class="${statusClass[row.status] || ""}">${escapeHtml(result)}${driftFlag}${checkFlag}</td>
             <td class="cell-via" title="${escapeHtml(row.method || "")}">${escapeHtml(row.method || "—")}</td>
             <td>${scoreBadge(row.score)}</td>
         `;
@@ -2856,12 +3018,20 @@ function logDecodeStats(phase) {
 //    overlap in time can share tracks (sources.packBlocks). Premiere can only
 //    slide clips along their own track, so that means placing them again, in a
 //    fresh copy, which replaces this one only if every clip lands exactly.
+// Breadcrumbs for the steps after the sync that drive Premiere hardest
+// (cloning, placing, deleting and renaming sequences, adding markers). They go
+// to console.log only, which Premiere writes to its UXP log on disk
+// (%APPDATA%\Adobe\Premiere Pro\Logs\UXPLogs_*.log) — so when Premiere itself
+// crashes, the last line names the call it was in.
+function trace(m) { try { console.log("[layout] " + m); } catch (e) { /* never fail over a trace */ } }
+
 async function finishLayout() {
     const closedDays = !!(lastDays && lastDays.closed && lastDays.plan.sessions.length > 1);
     const canPack = !!(lastLayoutRebuilt && lastRebuildBlocks && lastRebuildBlocks.length > 1);
     if (!closedDays && !canPack) return;
     try {
         setBusy("Tidying the layout…");
+        trace(`tidy: days ${closedDays ? "closed" : "-"} · pack ${canPack ? "yes" : "no"}`);
         const scan = await premiere.scanActiveSequence();
         const spans = {};
         for (const c of scan.clips) {
@@ -2897,6 +3067,7 @@ async function finishLayout() {
 
         const shifts = Object.keys(deltaByPath).map(p => ({ filePath: p, deltaSec: deltaByPath[p] }));
         if (shifts.length) {
+            trace(`tidy: sliding ${shifts.length} file(s) to tighten the days`);
             const r = await premiere.applyShifts(shifts, {});
             reportApplyIntegrity(r, null);
             if (lastFineTuneRevert) {
@@ -2924,21 +3095,29 @@ async function repackSequence(slots, scanBefore) {
         ? [...new Set(scanBefore.clips.filter(c => `${c.trackType}_${c.trackIndex}` === forcedRefTrackKey).map(c => c.filePath))]
         : null;
     setBusy("Packing tracks…");
+    trace(`pack: ${slots.length} slot(s) from ${lastRebuildBlocks.length} block(s), cloning "${originalSeqName}"`);
     const built = await premiere.buildSourceSequence(
         slots.map(sl => ({ label: sl.label, hasVideo: sl.hasVideo, files: sl.files })),
         { cloneFrom: originalSeqName });
+    trace(`pack: placed ${built.placed}/${built.total} · failed ${built.failed.length} · misplaced ${built.misplaced.length}`);
     if (built.failed.length || built.misplaced.length || built.placed !== built.total) {
+        trace("pack: discarding the packed copy");
         await premiere.discardActiveSequence(oldName);
+        trace("pack: discarded");
         log(`⚠ Could not pack the tracks cleanly (${built.failed.length + built.misplaced.length} clip(s) would not land exactly), ` +
             `so the sequence keeps one track block per device.`, "warn");
         return false;
     }
+    trace(`pack: deleting the unpacked "${oldName}"`);
     await premiere.deleteSequencesNamed(oldName);
+    trace("pack: renaming the packed copy");
     try {
         const project = await premiere.getActiveProject();
         await premiere.renameSequence(project, built.sequence, oldName);
     } catch (e) { /* keep the copy's name */ }
+    trace("pack: re-reading the sequence");
     const after = tracksOf((await premiere.scanActiveSequence()).clips);
+    trace("pack: done");
     const shared = slots.filter(sl => sl.labels.length > 1).map(sl => sl.labels.join(" + "));
     log(`✓ Packed onto ${after.video} video and ${after.audio} audio tracks (was ${was.video} and ${was.audio}): ` +
         `blocks that never overlap in time now share tracks — ${shared.join("; ")}.`, "success");
@@ -2954,31 +3133,40 @@ async function repackSequence(slots, scanBefore) {
     return true;
 }
 
-// Clips the fine pass could not vouch for, as sequence markers at each clip's
-// start, so the editor finds them on the timeline rather than in the log.
-const CHECK_MARKER_LIMIT = 60;
-async function markClipsToCheck() {
+// Clips the fine pass could not vouch for, listed in the log with the reason.
+// (They are also flagged in the Sync Results table; nothing goes on the
+// timeline.)
+const CHECK_LOG_LIMIT = 20;
+function logClipsToCheck() {
     if (!lastSyncResult) return;
-    const flagged = lastSyncResult.rows.filter(r => r.check && r.filePath);
+    const flagged = lastSyncResult.rows.filter(r => r.check);
     if (!flagged.length) return;
+    log(`${flagged.length} clip${flagged.length !== 1 ? "s" : ""} worth checking:`, "warn");
+    for (const r of flagged.slice(0, CHECK_LOG_LIMIT)) log(`⚠ ${r.label}: ${r.checkReason || "worth a look"}`, "warn");
+    if (flagged.length > CHECK_LOG_LIMIT) log(`⚠ …and ${flagged.length - CHECK_LOG_LIMIT} more — see Sync Results.`, "warn");
+}
+
+// What the result card shows: read off the finished sequence, so the tracks it
+// names for the unsynced clips are where they ended up after packing.
+async function resultCardSummary(elapsedMs) {
+    const rows = lastSyncResult.rows;
+    const summary = {
+        synced: lastSyncResult.clips,
+        toCheck: rows.filter(r => r.check).length,
+        elapsedMs, unsynced: [], tracks: [],
+        leftOut: lastLeftOut
+    };
+    if (!noAudioPaths.size) return summary;
     try {
         const scan = await premiere.scanActiveSequence();
-        const startByPath = {};
-        for (const c of scan.clips) {
-            if (!(c.filePath in startByPath) || c.startSec < startByPath[c.filePath]) startByPath[c.filePath] = c.startSec;
-        }
-        const markers = flagged
-            .filter(r => r.filePath in startByPath)
-            .slice(0, CHECK_MARKER_LIMIT)
-            .map(r => ({ name: "Check sync", comment: `${r.label}: ${r.checkReason || "worth a look"}`, startSec: startByPath[r.filePath] }));
-        const added = await premiere.addMarkers(markers);
-        if (added) {
-            log(`Marked ${added} clip${added !== 1 ? "s" : ""} to check on the timeline ("Check sync" markers)` +
-                (flagged.length > markers.length ? ` — the first ${markers.length} of ${flagged.length}.` : "."), "warn");
-        }
+        const onTimeline = scan.clips.filter(c => noAudioPaths.has(c.filePath));
+        summary.unsynced = [...new Set(onTimeline.map(c => c.filePath))];
+        summary.tracks = [...new Set(onTimeline.filter(c => c.trackType === "video").map(c => c.trackIndex))]
+            .sort((a, b) => a - b).map(i => `V${i + 1}`);
     } catch (e) {
-        log(`⚠ Could not add the "Check sync" markers: ${e.message}`, "warn");
+        summary.unsynced = [...noAudioPaths];
     }
+    return summary;
 }
 
 // One line that says how the sync went, before the detail.
@@ -2990,9 +3178,10 @@ function logSyncSummary() {
     const matched = rows.filter(r => !r.check && !r.outOfRange && (r.status === "shifted" || r.status === "aligned")).length;
     const other = rows.length - check - noRef - matched;
     const parts = [`${lastSyncResult.references} reference`, `${matched} matched`];
-    if (check) parts.push(`${check} to check (marked on the timeline)`);
+    if (check) parts.push(`${check} to check (listed above)`);
     if (noRef) parts.push(`${noRef} outside every reference recording (placed by clock)`);
     if (other) parts.push(`${other} not matched`);
+    if (lastSyncResult.noAudio) parts.push(`plus ${lastSyncResult.noAudio} with no audio (placed by clock)`);
     const context = [];
     if (lastDays && lastDays.closed && lastDays.plan.sessions.length > 1) {
         const days = sessions.sessionLabels(lastDays.plan).filter(l => !l.fileDated).length;
@@ -3031,7 +3220,9 @@ async function markRecordingDays() {
             comment: `Recorded ${labels[st.index].comment}`,
             startSec: st.startSec
         }));
+        trace(`markers: adding ${markers.length} day marker(s)`);
         const added = await premiere.addMarkers(markers);
+        trace(`markers: ${added} added`);
         if (added) log(`Marked ${added} recording day${added !== 1 ? "s" : ""} on the timeline (${markers.map(m => m.name).join(", ")}).`, "success");
         else if (markers.length) log("⚠ Could not add the recording-day markers to the timeline.", "warn");
     } catch (e) {
@@ -3057,6 +3248,20 @@ async function refreshSequence(opts) {
 
     try {
         const scan = await premiere.scanActiveSequence();
+        // Stills and graphics are set aside before anything is planned (see
+        // dsp.planLeftOutItems): no device detection, no layout, no audio pass.
+        if (opts.planLayout !== false) {
+            leftOutPlan = dsp.planLeftOutItems(scan.clips, scan.opaque);
+            const nStill = leftOutPlan.stills.length, nGfx = leftOutPlan.graphics.length;
+            if (nStill || nGfx) {
+                const what = [];
+                if (nStill) what.push(`${nStill} still${nStill !== 1 ? "s" : ""}`);
+                if (nGfx) what.push(`${nGfx} title${nGfx !== 1 ? "s" : ""}, graphic${nGfx !== 1 ? "s" : ""} or nested sequence${nGfx !== 1 ? "s" : ""}`);
+                log(`ℹ ${what.join(" and ")} on the timeline — not recordings, so there is nothing to sync them by. ` +
+                    `They are left out of the -SYNC sequence; the original sequence keeps them.`, "info");
+            }
+        }
+        scan.clips = scan.clips.filter(c => !dsp.isStillPath(c.filePath));
         const videoClips = scan.clips.filter(c => c.trackType === "video").length;
         const audioClips = scan.clips.length - videoClips;
 
@@ -3114,11 +3319,13 @@ async function refreshSequence(opts) {
 
         let enriched = [];
         const sourceCounts = {};
+        noAudioPaths = new Set();
         for (const { file, r, errorMessage } of outcomes) {
             if (errorMessage !== undefined) {
                 log(`⚠ Could not read "${file.filePath}": ${errorMessage}`, "warn");
                 continue;
             }
+            if (r.hasAudio === false) noAudioPaths.add(file.filePath);
             enriched.push({ ...file, recordStartMs: r.recordStartMs, durationSec: r.durationSec, timingSource: r.timingSource });
             sourceCounts[r.timingSource] = (sourceCounts[r.timingSource] || 0) + 1;
             const srcLabel = isEmbeddedSource(r.timingSource) ? `embedded ${r.timingSource}` : "file mtime";
@@ -3126,6 +3333,14 @@ async function refreshSequence(opts) {
         }
 
         if (!enriched.length) throw new Error("Could not read timestamps for any clips.");
+
+        if (noAudioPaths.size && opts.planLayout !== false) {
+            const names = [...noAudioPaths].map(audio.baseName);
+            const shown = names.length <= 6 ? names.join(", ") : `${names.slice(0, 6).join(", ")} and ${names.length - 6} more`;
+            log(`ℹ ${names.length} file${names.length !== 1 ? "s have" : " has"} no audio (${shown}). ` +
+                `With nothing to match, ${names.length !== 1 ? "they are" : "it is"} placed by ${names.length !== 1 ? "their" : "its"} ` +
+                `recording clock and left out of the audio passes — check ${names.length !== 1 ? "them" : "it"} by eye.`, "info");
+        }
 
         // Mixed timing sources have different semantics (embedded record-start vs.
         // mtime-derived), so clips from different sources may not agree on the
@@ -3355,6 +3570,16 @@ async function buildSync() {
         const refFollow = (rebuildPlan && forcedRefTrackKey && rebuildPlan.refPaths) ? rebuildPlan.refPaths : null;
         lastLayoutRebuilt = !!rebuildPlan;
         lastRebuildBlocks = rebuildPlan ? rebuildPlan.blocks : null;
+        // A rebuild places recordings only, so everything the scan set aside is
+        // out; a clone had them removed, and says how many would not go.
+        const lo = rebuildPlan ? leftOutPlan : built.leftOut;
+        lastLeftOut = lo && (lo.stills.length || lo.graphics.length)
+            ? { stills: lo.stills, graphics: lo.graphics, notRemoved: lo.notRemoved || 0 }
+            : null;
+        if (lastLeftOut && lastLeftOut.notRemoved) {
+            log(`⚠ ${lastLeftOut.notRemoved} still(s) or graphic(s) could not be taken out of the -SYNC sequence; ` +
+                `they stay where they were and are not synced.`, "warn");
+        }
         if (rebuildPlan) {
             reportRebuild(built, finalName);
         } else {
@@ -3399,13 +3624,18 @@ async function fineTuneAudio() {
         // Days closed up → one reference per recording session, and the audio
         // search never compares two different days.
         const sessionOf = sessionIndexByPath();
-        const anchors = dsp.buildFineTuneAnchors(scan.clips, forcedRefTrackKey, sessionOf);
+        // Files with no audio stream sit out the audio passes entirely (see
+        // dsp.clipsWithAudio): no anchor, no shift, no check marker.
+        const audible = dsp.clipsWithAudio(scan.clips.filter(c => !dsp.isStillPath(c.filePath)), noAudioPaths);
+        const silentPaths = [...new Set(scan.clips.filter(c => noAudioPaths.has(c.filePath)).map(c => c.filePath))];
+        const anchors = dsp.buildFineTuneAnchors(audible, forcedRefTrackKey, sessionOf);
         if (anchors.length < 2) {
-            throw new Error("Need at least two clips with accessible audio for fine tune.");
+            throw new Error("Need at least two clips with audio for fine tune" +
+                (silentPaths.length ? ` (${silentPaths.length} file${silentPaths.length !== 1 ? "s have" : " has"} no audio and ${silentPaths.length !== 1 ? "were" : "was"} placed by clock).` : "."));
         }
 
         // Same pure decision the anchors were marked with — read back for the log.
-        const refPlans = dsp.planReferenceLayers(anchors, scan.clips, forcedRefTrackKey, sessionOf);
+        const refPlans = dsp.planReferenceLayers(anchors, audible, forcedRefTrackKey, sessionOf);
         if (!forcedRefTrackKey) {
             refAutoNote = [...new Set(refPlans.map(r => r.plan.refTrackKey).filter(Boolean))]
                 .map(k => shortTrackLabel({ trackType: k.split("_")[0], trackIndex: parseInt(k.split("_")[1], 10) })).join(", ");
@@ -3443,6 +3673,12 @@ async function fineTuneAudio() {
             }
         }
 
+        {
+            const n = audio.decodeConcurrency(), cpus = audio.cpuCount();
+            log(n > 1
+                ? `Audio decoding: ${n} at a time in the background${cpus ? ` (sized to this machine's ${cpus} CPU threads)` : ""}.`
+                : `Audio decoding: one at a time${cpus ? ` (this machine has ${cpus} CPU threads, too few to spare more)` : ""}.`);
+        }
         log(`Fine tune: evaluating ${anchors.length} clips.`);
         setProgress(10);
 
@@ -3471,10 +3707,14 @@ async function fineTuneAudio() {
         fine.notes.forEach(msg => log(msg));
         logDecodeStats("Fine pass");
         syncRows.push(...fine.results);
+        for (const p of silentPaths) {
+            syncRows.push({ scope: "clip", label: audio.baseName(p), status: "skipped", detail: "no audio — placed by its recording clock" });
+        }
         lastSyncResult = {
             rows: fine.results,
             clips: anchors.length,
-            references: anchors.filter(a => a.isReference).length
+            references: anchors.filter(a => a.isReference).length,
+            noAudio: silentPaths.length
         };
 
         // Merge coarse + fine deltas per FILE so each file moves exactly once.
@@ -3566,6 +3806,9 @@ async function autoSync() {
     beginOp("Auto Sync…");
     setDisabled(btnAuto, true);
     log("Auto Sync: starting (scan → build → fine tune)…");
+    hideResultCard();
+    stopPekCheck();   // it described the sequence before the sync; the poll restarts it on the next sequence change
+    lastLeftOut = null;
     const startedAt = Date.now();
     autoStep = { n: 0, startedAt: [] };
 
@@ -3603,17 +3846,13 @@ async function autoSync() {
         await fineTuneAudio();
         if (!cancelRequested) await finishLayout();
         if (!cancelRequested) await markRecordingDays();
-        if (!cancelRequested) await markClipsToCheck();
+        if (!cancelRequested) logClipsToCheck();
         if (!cancelRequested) logSyncSummary();
         log(cancelRequested ? "Auto Sync cancelled." : `Auto Sync complete in ${formatDuration(Date.now() - startedAt)} (${stepBreakdown()}).`,
             cancelRequested ? "warn" : "success");
-        if (!cancelRequested) {
-            const clipCount = (clipPayload || []).length;
-            const footageMs = (clipPayload || []).reduce((sum, f) => sum + (f.durationSec || 0) * 1000, 0);
-            const elapsedMs = Date.now() - startedAt;
-            maybeShowTipsCard(footageMs > 0
-                ? `Synced ${formatDuration(footageMs)} of footage across ${clipCount} clip${clipCount !== 1 ? "s" : ""} in ${formatDuration(elapsedMs)}!`
-                : "Synced!");
+        if (!cancelRequested && lastSyncResult) {
+            showResultCard(await resultCardSummary(Date.now() - startedAt));
+            maybeShowTipsCard();
         }
     } catch (e) {
         if (e && e.cancelled) log("Auto Sync cancelled.", "warn");

@@ -330,6 +330,55 @@ test("packBlocks puts the same camera's two days on one set of tracks, keeps ove
     assert.deepStrictEqual(slots[0].files, [{ filePath: "f1", startSec: 0 }, { filePath: "f2", startSec: 6060 }]);
 });
 
+test("packBlocks gives drone footage (picture, no audio) its own track above the cameras", () => {
+    // The field case: the drone never overlaps the A7S3 b-roll, so it used to
+    // share its video track.
+    const span = (a, b) => ({ startSec: a, endSec: b });
+    const blocks = [
+        { sourceId: "fx6", label: "ILME-FX6V", hasVideo: true, audioWidth: 4, files: [{ filePath: "fx6" }] },
+        { sourceId: "air3", label: "AIR3", hasVideo: true, audioWidth: 0, files: [{ filePath: "d1" }, { filePath: "d2" }] },
+        { sourceId: "wide", label: "WIDE", hasVideo: true, audioWidth: 1, files: [{ filePath: "wide" }] },
+        { sourceId: "a7", label: "ILCE-7SM3", hasVideo: true, audioWidth: 1, files: [{ filePath: "a1" }, { filePath: "a2" }] }
+    ];
+    const spans = { fx6: span(0, 6700), d1: span(0, 27), d2: span(40, 80), wide: span(0, 6800), a1: span(1500, 1700), a2: span(2000, 2100) };
+    const slots = sources.packBlocks(blocks, spans);
+    assert.deepStrictEqual(slots.map(s => s.labels), [["ILME-FX6V"], ["WIDE"], ["ILCE-7SM3"], ["AIR3"]]);
+});
+
+test("packBlocks still lets picture-only devices share with each other", () => {
+    const span = (a, b) => ({ startSec: a, endSec: b });
+    const blocks = [
+        { sourceId: "cam", label: "Camera", hasVideo: true, audioWidth: 2, files: [{ filePath: "c" }] },
+        { sourceId: "d1", label: "Drone 1", hasVideo: true, audioWidth: 0, files: [{ filePath: "d1" }] },
+        { sourceId: "d2", label: "Drone 2", hasVideo: true, audioWidth: 0, files: [{ filePath: "d2" }] }
+    ];
+    const slots = sources.packBlocks(blocks, { c: span(0, 1000), d1: span(0, 100), d2: span(200, 300) });
+    assert.deepStrictEqual(slots.map(s => s.labels), [["Camera"], ["Drone 1", "Drone 2"]]);
+});
+
+test("planSourceLayout puts a picture-only source after the cameras with sound", () => {
+    const files = [
+        { filePath: "fx6.mxf", recordStartMs: 1000, durationSec: 600, timingSource: "modification_date" },
+        { filePath: "dji.mp4", recordStartMs: 2000, durationSec: 30, timingSource: "creation_time" },
+        { filePath: "a7.mp4", recordStartMs: 3000, durationSec: 60, timingSource: "creation_time" }
+    ];
+    const det = { sources: [
+        { id: "fx6", label: "FX6", hasVideo: true, files: ["fx6.mxf"] },
+        { id: "dji", label: "AIR3", hasVideo: true, files: ["dji.mp4"] },
+        { id: "a7", label: "A7S3", hasVideo: true, files: ["a7.mp4"] }
+    ] };
+    // The editor had the drone on V1 next to the FX6, the A7S3 on V2.
+    const clips = [
+        { filePath: "fx6.mxf", trackType: "video", trackIndex: 0 },
+        { filePath: "fx6.mxf", trackType: "audio", trackIndex: 0 },
+        { filePath: "dji.mp4", trackType: "video", trackIndex: 0 },
+        { filePath: "a7.mp4", trackType: "video", trackIndex: 1 },
+        { filePath: "a7.mp4", trackType: "audio", trackIndex: 1 }
+    ];
+    const plan = sources.planSourceLayout(files, det, clips);
+    assert.deepStrictEqual(plan.blocks.map(b => [b.label, b.videoTrack]), [["FX6", 0], ["A7S3", 1], ["AIR3", 2]]);
+});
+
 test("packBlocks never shares a slot between blocks closer than the margin", () => {
     const blocks = [
         { sourceId: "a", label: "A", hasVideo: true, audioWidth: 2, files: [{ filePath: "a" }] },

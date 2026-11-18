@@ -482,9 +482,14 @@ function planSourceLayout(files, detection, clips, opts) {
 
     const minOf = (x, k) => Math.min.apply(null, x.files.map(f => (inst[f.filePath] || {})[k]).concat([Infinity]));
     const earliest = (x) => Math.min.apply(null, x.files.map(f => f.recordStartMs));
-    // Keep the editor's own track order where there is one.
+    // Picture with no audio anywhere (drone footage) goes above the cameras
+    // with sound, on the top video tracks — as packBlocks lays it out after
+    // the sync.
+    const pictureOnly = (x) => x.src.hasVideo && x.files.every(f => !((inst[f.filePath] || {}).audioTracks || new Set()).size);
+    for (const x of srcFiles) x.rank = placementRank({ hasVideo: x.src.hasVideo, pictureOnly: pictureOnly(x) });
+    // Otherwise keep the editor's own track order where there is one.
     srcFiles.sort((a, b) =>
-        ((b.src.hasVideo ? 1 : 0) - (a.src.hasVideo ? 1 : 0)) ||
+        (a.rank - b.rank) ||
         (a.src.hasVideo ? minOf(a, "minV") - minOf(b, "minV") : minOf(a, "minA") - minOf(b, "minA")) ||
         (earliest(a) - earliest(b)) ||
         a.src.id.localeCompare(b.src.id));
@@ -592,14 +597,27 @@ function placementTimes(plan, anchorMsByTrack) {
 //     spans overlap (preferring a slot with the same number of audio
 //     channels), else it opens a new one. So two devices that never rolled
 //     together still share, as asked.
-// Picture blocks share with picture blocks, sound with sound.
+// Picture blocks share with picture blocks, sound with sound — and picture
+// with no sound (drone footage) only with other picture-only blocks: it was
+// placed by its clock alone, never checked by the audio pass, so it keeps a
+// track of its own instead of hiding among a camera's synced b-roll.
 //
 // blocks:   [{ sourceId, packKey?, label, hasVideo, audioWidth, files: [{ filePath }] }]
 // spanOf:   path → { startSec, endSec } final timeline position
 // Returns slots: [{ hasVideo, labels:[...], label, files: [{ filePath, startSec }] }]
-// in placement order (picture first, then by first appearance). Two blocks
-// share a slot only if their spans are at least `marginSec` apart.
+// in placement order (picture with sound first, then picture-only — the top
+// video tracks — then sound, each by first appearance). Two blocks share a
+// slot only if their spans are at least `marginSec` apart.
 const PACK_MARGIN_SEC = 1;
+
+// Picture with no audio tracks: drone footage, screen recordings.
+function isPictureOnly(block) {
+    return !!block.hasVideo && !(block.audioWidth > 0);
+}
+// Placement rank: picture with sound, picture-only, sound.
+function placementRank(x) {
+    return x.hasVideo ? (x.pictureOnly ? 1 : 0) : 2;
+}
 
 function packBlocks(blocks, spanOf, marginSec) {
     const margin = marginSec === undefined ? PACK_MARGIN_SEC : marginSec;
@@ -626,8 +644,9 @@ function packBlocks(blocks, spanOf, marginSec) {
     for (const group of byKey.values()) {
         const local = [];
         for (const it of group.slice().sort((a, b) => a.lo - b.lo)) {
-            const fit = local.find(ch => ch.items.every(o => apart(o, it)));
-            const ch = fit || { items: [], hasVideo: !!it.block.hasVideo, audioWidth: 0, order: it.order };
+            const po = isPictureOnly(it.block);
+            const fit = local.find(ch => ch.pictureOnly === po && ch.items.every(o => apart(o, it)));
+            const ch = fit || { items: [], hasVideo: !!it.block.hasVideo, pictureOnly: po, audioWidth: 0, order: it.order };
             if (!fit) local.push(ch);
             ch.items.push(it);
             ch.audioWidth = Math.max(ch.audioWidth, it.block.audioWidth || 0);
@@ -640,15 +659,15 @@ function packBlocks(blocks, spanOf, marginSec) {
     // 2. Pack the chains into slots.
     const slots = [];
     for (const ch of chains) {
-        const fits = slots.filter(sl => sl.hasVideo === ch.hasVideo &&
+        const fits = slots.filter(sl => sl.hasVideo === ch.hasVideo && sl.pictureOnly === ch.pictureOnly &&
             ch.items.every(it => sl.items.every(o => apart(o, it))));
         const slot = fits.find(sl => sl.audioWidth === ch.audioWidth) || fits[0] ||
-            { hasVideo: ch.hasVideo, items: [], audioWidth: 0, order: ch.order };
+            { hasVideo: ch.hasVideo, pictureOnly: ch.pictureOnly, items: [], audioWidth: 0, order: ch.order };
         if (slots.indexOf(slot) < 0) slots.push(slot);
         slot.items.push(...ch.items);
         slot.audioWidth = Math.max(slot.audioWidth, ch.audioWidth);
     }
-    slots.sort((a, b) => ((b.hasVideo ? 1 : 0) - (a.hasVideo ? 1 : 0)) || (a.order - b.order));
+    slots.sort((a, b) => (placementRank(a) - placementRank(b)) || (a.order - b.order));
     return slots.map(sl => {
         const its = sl.items.slice().sort((a, b) => a.lo - b.lo);
         const labels = [];

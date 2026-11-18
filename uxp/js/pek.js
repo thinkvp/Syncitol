@@ -54,54 +54,88 @@ function normalizeMediaPath(p) {
 }
 
 // ─── .mcdb index ──────────────────────────────────────────────────────────────
-// Scan the records once per session into Map<normalized media path, pek path>.
+// Map<normalized media path, pek path>, read in full once per session and then
+// topped up by refreshPekIndex(): Premiere keeps writing records as it builds
+// peaks in the background, and a record already read never needs reading again.
+const pekIndex = new Map();
+const readRecords = new Set();   // .mcdb names already read into pekIndex
 let pekIndexPromise = null;
+
+async function mcdbNames(dir) {
+    try {
+        return (await fs.readdir(dir)).filter(n => String(n).endsWith(".mcdb"));
+    } catch (e) {
+        return null; // no media cache database — no pek fast path
+    }
+}
+
+async function readRecordsInto(dir, names) {
+    const BATCH = 64;
+    for (let i = 0; i < names.length; i += BATCH) {
+        await Promise.all(names.slice(i, i + BATCH).map(async (name) => {
+            readRecords.add(name);
+            await readRecord(dir, name);
+        }));
+    }
+}
+
 function getPekIndex() {
     if (pekIndexPromise) return pekIndexPromise;
     pekIndexPromise = (async () => {
-        const index = new Map();
         const dir = await mediaCacheDbDir();
-        if (!dir) return index;
-        let names;
-        try {
-            names = (await fs.readdir(dir)).filter(n => String(n).endsWith(".mcdb"));
-        } catch (e) {
-            return index; // no media cache database — no pek fast path
-        }
-        const BATCH = 64;
-        for (let i = 0; i < names.length; i += BATCH) {
-            await Promise.all(names.slice(i, i + BATCH).map(async (name) => {
-                let text;
-                try {
-                    text = String(await fs.readFile(dir + "/" + name, "utf-8"));
-                } catch (e) {
-                    return;
-                }
-                if (text.indexOf("pek") === -1) return;
-                const orig = /<OriginalWinPath>([^<]+)<\/OriginalWinPath>/.exec(text) ||
-                             /<OriginalPath>([^<]+)<\/OriginalPath>/.exec(text);
-                if (!orig) return;
-                // A record can hold several items (index, peaks, …) — Item.KeyN
-                // pairs with Item.WinPathN / Item.PathN by index.
-                const keyRe = /<Item\.Key(\d+)>pek\d+<\/Item\.Key\1>/g;
-                let m;
-                while ((m = keyRe.exec(text)) !== null) {
-                    const n = m[1];
-                    const win = new RegExp(`<Item\\.WinPath${n}>([^<]+)</Item\\.WinPath${n}>`).exec(text) ||
-                                new RegExp(`<Item\\.Path${n}>([^<]+)</Item\\.Path${n}>`).exec(text);
-                    if (win && /\.pek$/i.test(win[1])) {
-                        index.set(normalizeMediaPath(orig[1]), win[1]);
-                        break;
-                    }
-                }
-            }));
-        }
+        if (!dir) return pekIndex;
+        const names = await mcdbNames(dir);
+        if (!names) return pekIndex;
+        await readRecordsInto(dir, names);
         if (typeof module.exports.onDiag === "function") {
-            module.exports.onDiag(`pek index: ${index.size} media file(s) mapped from ${names.length} .mcdb record(s)`);
+            module.exports.onDiag(`pek index: ${pekIndex.size} media file(s) mapped from ${names.length} .mcdb record(s)`);
         }
-        return index;
+        return pekIndex;
     })();
     return pekIndexPromise;
+}
+
+// Read only the records Premiere has written since the last read. Cheap enough
+// to run every few seconds while a sequence is waiting on its peaks.
+let refreshing = null;
+function refreshPekIndex() {
+    if (refreshing) return refreshing;
+    refreshing = (async () => {
+        await getPekIndex();
+        const dir = await mediaCacheDbDir();
+        const names = dir ? await mcdbNames(dir) : null;
+        if (names) await readRecordsInto(dir, names.filter(n => !readRecords.has(n)));
+        return pekIndex;
+    })().finally(() => { refreshing = null; });
+    return refreshing;
+}
+
+// One .mcdb record: the media path it describes and, when it holds peaks,
+// the .pek path. A record can hold several items (index, peaks, …) — Item.KeyN
+// pairs with Item.WinPathN / Item.PathN by index.
+async function readRecord(dir, name) {
+    let text;
+    try {
+        text = String(await fs.readFile(dir + "/" + name, "utf-8"));
+    } catch (e) {
+        readRecords.delete(name); // try again next refresh
+        return;
+    }
+    if (text.indexOf("pek") === -1) return;
+    const orig = /<OriginalWinPath>([^<]+)<\/OriginalWinPath>/.exec(text) ||
+                 /<OriginalPath>([^<]+)<\/OriginalPath>/.exec(text);
+    if (!orig) return;
+    const keyRe = /<Item\.Key(\d+)>pek\d+<\/Item\.Key\1>/g;
+    let m;
+    while ((m = keyRe.exec(text)) !== null) {
+        const n = m[1];
+        const win = new RegExp(`<Item\\.WinPath${n}>([^<]+)</Item\\.WinPath${n}>`).exec(text) ||
+                    new RegExp(`<Item\\.Path${n}>([^<]+)</Item\\.Path${n}>`).exec(text);
+        if (win && /\.pek$/i.test(win[1])) {
+            pekIndex.set(normalizeMediaPath(orig[1]), win[1]);
+            break;
+        }
+    }
 }
 
 async function statMtimeMs(filePath) {
@@ -154,7 +188,25 @@ function resolvePek(mediaPath) {
         return { pekPath, info };
     })();
     pekCache.set(mediaPath, task);
+    // Only a found peak file is remembered: "none yet" can change while
+    // Premiere builds peaks in the background.
+    task.then(r => { if (!r && pekCache.get(mediaPath) === task) pekCache.delete(mediaPath); }, () => pekCache.delete(mediaPath));
     return task;
+}
+
+// Quick presence check for the panel's pre-sync status: mapped in the cache
+// DB and not older than the media. No parse and no probe, so it is cheap to
+// run over a whole sequence; resolvePek still makes the full check before a
+// sync uses the peaks.
+async function hasPek(mediaPath) {
+    const index = await getPekIndex();
+    const pekPath = index.get(normalizeMediaPath(mediaPath));
+    if (!pekPath) return false;
+    try {
+        return (await statMtimeMs(mediaPath)) <= (await statMtimeMs(pekPath));
+    } catch (e) {
+        return false;
+    }
 }
 
 // ─── Envelopes from resolved peaks ────────────────────────────────────────────
@@ -188,6 +240,8 @@ function clearRunCache() {
 
 module.exports = {
     resolvePek,
+    hasPek,
+    refreshPekIndex,
     getPekEnvelope,
     clearRunCache,
     onDiag: null

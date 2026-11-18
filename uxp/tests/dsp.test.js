@@ -616,6 +616,94 @@ test("buildFineTuneAnchors picks the reference by coverage, not track position",
     assert.strictEqual(br1.isReference, false);
 });
 
+// A drone track: picture only, and more footage than the camera that has sound.
+function droneAndCameraClips() {
+    return [
+        { filePath: "drone1", startTicks: "1", clipName: "DJI_0001.MP4", trackType: "video", trackIndex: 1, startSec: 0, endSec: 400, inPointSec: 0 },
+        { filePath: "drone2", startTicks: "2", clipName: "DJI_0002.MP4", trackType: "video", trackIndex: 1, startSec: 500, endSec: 900, inPointSec: 0 },
+        { filePath: "cam", startTicks: "3", clipName: "C0001.MP4", trackType: "video", trackIndex: 0, startSec: 0, endSec: 300, inPointSec: 0 },
+        { filePath: "cam", startTicks: "3", clipName: "C0001.MP4", trackType: "audio", trackIndex: 0, startSec: 0, endSec: 300, inPointSec: 0 },
+        { filePath: "wav", startTicks: "4", clipName: "REC.wav", trackType: "audio", trackIndex: 1, startSec: 10, endSec: 250, inPointSec: 0 },
+    ];
+}
+
+test("without its audio known, a picture-only drone track wins the Auto reference (the bug)", () => {
+    const anchors = dsp.buildFineTuneAnchors(droneAndCameraClips());
+    const refs = anchors.filter(a => a.isReference).map(a => a.filePath).sort();
+    assert.deepStrictEqual(refs, ["drone1", "drone2"]);
+});
+
+test("clipsWithAudio drops every instance of a no-audio file, so the camera becomes the reference", () => {
+    const clips = droneAndCameraClips();
+    const audible = dsp.clipsWithAudio(clips, new Set(["drone1", "drone2"]));
+    assert.strictEqual(audible.length, 3);
+    const anchors = dsp.buildFineTuneAnchors(audible);
+    assert.deepStrictEqual(anchors.map(a => a.filePath).sort(), ["cam", "wav"]);
+    assert.strictEqual(anchors.find(a => a.filePath === "cam").isReference, true);
+    assert.strictEqual(anchors.find(a => a.filePath === "wav").isReference, false);
+});
+
+test("clipsWithAudio returns the clips untouched when every file has audio", () => {
+    const clips = droneAndCameraClips();
+    assert.strictEqual(dsp.clipsWithAudio(clips, new Set()), clips);
+    assert.strictEqual(dsp.clipsWithAudio(clips, null), clips);
+});
+
+// ─── Stills and graphics left out ─────────────────────────────────────────────
+
+test("isStillPath recognises stills and graphics by extension, case-insensitively", () => {
+    for (const p of ["C:\\shoot\\logo.PNG", "/x/photo.jpeg", "a.tif", "b.PSD", "c.ai", "d.svg", "e.heic", "f.webp"]) {
+        assert.strictEqual(dsp.isStillPath(p), true, p);
+    }
+    for (const p of ["C0001.MP4", "111_3827.mxf", "REC.wav", "song.mp3", "DJI_0001.MOV", "noext", "", null]) {
+        assert.strictEqual(dsp.isStillPath(p), false, String(p));
+    }
+});
+
+test("planLeftOutItems takes every still instance and unlinked media-less items, keeps a merged clip's audio", () => {
+    const clips = [
+        { filePath: "cam.mp4", clipName: "cam", trackType: "video", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 60 },
+        { filePath: "cam.mp4", clipName: "cam", trackType: "audio", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 60 },
+        { filePath: "logo.png", clipName: "logo.png", trackType: "video", trackIndex: 1, itemIndex: 0, startSec: 5, endSec: 10 },
+        { filePath: "logo.png", clipName: "logo.png", trackType: "video", trackIndex: 1, itemIndex: 1, startSec: 50, endSec: 55 },
+        { filePath: "b.mp4", clipName: "b", trackType: "video", trackIndex: 2, itemIndex: 0, startSec: 100, endSec: 130 }
+    ];
+    const opaque = [
+        // A title over the camera: shares neither edge with a kept clip.
+        { clipName: "Lower third", trackType: "video", trackIndex: 3, itemIndex: 0, startSec: 2, endSec: 8 },
+        // A merged clip's audio: exactly under b.mp4's picture — linked, must stay.
+        { clipName: "b merged audio", trackType: "audio", trackIndex: 1, itemIndex: 0, startSec: 100, endSec: 130 },
+        // A colour matte starting with the camera but ending elsewhere: not a link.
+        { clipName: "Black Video", trackType: "video", trackIndex: 4, itemIndex: 0, startSec: 0, endSec: 45 }
+    ];
+    const plan = dsp.planLeftOutItems(clips, opaque);
+    assert.deepStrictEqual(plan.stills, ["logo.png"]);
+    assert.deepStrictEqual(plan.graphics, ["Lower third", "Black Video"]);
+    assert.strictEqual(plan.keptLinked, 1);
+    assert.deepStrictEqual(plan.items.map(i => `${i.kind}:${i.trackType}${i.trackIndex}#${i.itemIndex}`),
+        ["still:video1#0", "still:video1#1", "graphic:video3#0", "graphic:video4#0"]);
+});
+
+test("a motion graphics template counts as a graphic, listed by its clip name", () => {
+    for (const p of ["X\\Motion Graphics Template Media\\Lower Third 01.aegraphic", "t.prgraphic", "Lower Third.mogrt"]) {
+        assert.strictEqual(dsp.isStillPath(p), true, p);
+    }
+    const clips = [
+        { filePath: "cam.mp4", clipName: "cam", trackType: "video", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 60 },
+        { filePath: "C:\\cache\\Lower Third 01 (a1b2).aegraphic", clipName: "Lower Third 01", trackType: "video", trackIndex: 1, itemIndex: 0, startSec: 3, endSec: 9 }
+    ];
+    const plan = dsp.planLeftOutItems(clips, []);
+    assert.deepStrictEqual(plan.stills, []);
+    assert.deepStrictEqual(plan.graphics, ["Lower Third 01"]);
+    assert.deepStrictEqual(plan.items.map(i => i.kind), ["graphic"]);
+});
+
+test("planLeftOutItems leaves nothing out of a sequence of recordings", () => {
+    const clips = [{ filePath: "cam.mp4", clipName: "cam", trackType: "video", trackIndex: 0, itemIndex: 0, startSec: 0, endSec: 60 }];
+    const plan = dsp.planLeftOutItems(clips, []);
+    assert.deepStrictEqual(plan.items, []);
+});
+
 test("buildFineTuneAnchors prefers the video instance when a key has both", () => {
     const clips = [
         { filePath: "camB", startTicks: "300", clipName: "B-audio", trackType: "audio", trackIndex: 2, startSec: 0, endSec: 10, inPointSec: 0 },

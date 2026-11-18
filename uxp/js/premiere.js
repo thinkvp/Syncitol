@@ -249,6 +249,55 @@ async function listTracks(sequence) {
 
 async function listActiveSequenceTracks() { return listTracks(await getActiveSequence()); }
 
+// How many clips sit on the active sequence's audio tracks. No media-path
+// lookups, so cheap enough for the idle poll: a change means clips were added
+// or removed and the peak-file status needs a fresh look. -1 when unreadable.
+async function countActiveAudioClips() {
+    try {
+        const sequence = await getActiveSequence();
+        if (!sequence) return -1;
+        const aCount = await val(sequence.getAudioTrackCount());
+        let n = 0;
+        for (let a = 0; a < aCount; a++) {
+            const track = await val(sequence.getAudioTrack(a));
+            n += (track.getTrackItems(TRACK_ITEM_CLIP, false) || []).length;
+        }
+        return n;
+    } catch (e) {
+        return -1;
+    }
+}
+
+// The media files on the active sequence's AUDIO tracks, unique — the files
+// Premiere builds peak files for. Lighter than scanSequence (no video tracks,
+// no positions), but it does resolve media paths, so call it on a sequence
+// change, not on every poll. Same two passes as scanSequence: project items
+// first, then the path lookups that yield to the host.
+async function listActiveAudioMediaPaths() {
+    const sequence = await getActiveSequence();
+    if (!sequence) return { name: null, paths: [] };
+    const name = await val(sequence.name);
+    const aCount = await val(sequence.getAudioTrackCount());
+    const items = [];
+    for (let a = 0; a < aCount; a++) {
+        const track = await val(sequence.getAudioTrack(a));
+        for (const it of (track.getTrackItems(TRACK_ITEM_CLIP, false) || [])) {
+            try {
+                const pi = await val(it.getProjectItem());
+                if (pi) items.push((ppro.ClipProjectItem && ppro.ClipProjectItem.cast) ? ppro.ClipProjectItem.cast(pi) : pi);
+            } catch (e) { /* unreadable item: not counted */ }
+        }
+    }
+    const paths = new Set();
+    for (const pi of items) {
+        try {
+            const p = typeof pi.getMediaFilePath === "function" ? await val(pi.getMediaFilePath()) : null;
+            if (p) paths.add(p);
+        } catch (e) { /* no media path: a nested sequence or similar */ }
+    }
+    return { name, paths: [...paths] };
+}
+
 // ─── Apply per-clip time shifts (one undoable transaction) ────────────────────
 // `targets`: [{ filePath, trackType, trackIndex, itemIndex, deltaSec }]. We match
 // items by
@@ -663,8 +712,22 @@ async function buildSyncSequence(clipPayload, baseName, layoutOpts) {
     // audio together — anchoring each timeline track independently (v1.1.0)
     // skipped or misplaced camera audio on tracks the deduped payload never
     // mentioned, splitting A/V.
+    // Stills and graphics are not synced, so they do not belong in the copy
+    // (dsp.planLeftOutItems; items linked to a clip that stays are kept).
+    step("6b leave out stills and graphics");
+    let scan = await scanSequence(clone);
+    const leftOut = dsp.planLeftOutItems(scan.clips, scan.opaque);
+    leftOut.notRemoved = 0;
+    if (leftOut.items.length) {
+        const r = await removeTimelineItems(project, clone, leftOut.items);
+        step(`6b asked to remove ${r.removed}/${leftOut.items.length}${r.error ? " · " + r.error : ""}`);
+        // Count what is actually left rather than trusting the request.
+        scan = await scanSequence(clone);
+        leftOut.notRemoved = dsp.planLeftOutItems(scan.clips, scan.opaque).items.length;
+        step(`6b not removed: ${leftOut.notRemoved}`);
+    }
+
     step("7 scan clone");
-    const scan = await scanSequence(clone);
 
     // Primary instance per file: earliest instance on the payload entry's own
     // track; fallback to the earliest instance on any track.
@@ -701,8 +764,50 @@ async function buildSyncSequence(clipPayload, baseName, layoutOpts) {
         sequence: clone, name: await val(clone.name), placed: applied.applied, total: scan.clips.length,
         skipped: applied.skipped, partial: applied.partial,
         integrity: applied.integrity, repair: applied.repair, linkPlan: applied.linkPlan,
-        layout, scanDropped: applied.scanDropped
+        layout, scanDropped: applied.scanDropped, leftOut
     };
+}
+
+// Take timeline items out of `sequence` (no ripple), addressed by track +
+// index as a scan reported them. One transaction. Returns { removed, error }:
+// a build without the SequenceEditor API, or a refused action, removes
+// nothing and says why — the items then simply stay where they were.
+async function removeTimelineItems(project, sequence, refs) {
+    const editor = ppro.SequenceEditor && ppro.SequenceEditor.getEditor
+        ? ppro.SequenceEditor.getEditor(sequence) : null;
+    if (!editor || typeof editor.createRemoveItemsAction !== "function") {
+        return { removed: 0, error: "no SequenceEditor remove API" };
+    }
+    const MT = (ppro.Constants && ppro.Constants.MediaType) || {};
+    const mediaAny = MT.ANY !== undefined ? MT.ANY : 0;
+    try {
+        const tracks = {};
+        for (const ref of refs) {
+            const key = `${ref.trackType}:${ref.trackIndex}`;
+            if (!tracks[key]) {
+                tracks[key] = ref.trackType === "video"
+                    ? await val(sequence.getVideoTrack(ref.trackIndex))
+                    : await val(sequence.getAudioTrack(ref.trackIndex));
+            }
+        }
+        const selection = await val(sequence.getSelection());
+        if (!selection || typeof selection.addItem !== "function") return { removed: 0, error: "no selection" };
+        let added = 0;
+        await lockedTransaction(project, "Syncitol: leave out stills and graphics", (compound) => {
+            const itemsOf = {};
+            for (const ref of refs) {
+                const key = `${ref.trackType}:${ref.trackIndex}`;
+                if (!itemsOf[key]) itemsOf[key] = tracks[key].getTrackItems(TRACK_ITEM_CLIP, false) || [];
+                const it = itemsOf[key][ref.itemIndex];
+                if (it) { selection.addItem(it); added += 1; }
+            }
+            if (added) compound.addAction(editor.createRemoveItemsAction(selection, false, mediaAny, false));
+        });
+        try { await val(sequence.clearSelection()); } catch (e) {}
+        return { removed: added, error: null };
+    } catch (e) {
+        return { removed: 0, error: (e && e.message) || String(e) };
+    }
 }
 
 // ─── Build a sequence laid out by source ──────────────────────────────────────
@@ -825,7 +930,9 @@ async function buildSourceSequence(blocks, opts) {
     // ── Read back ───────────────────────────────────────────────────────────
     // Every file once, where it was asked to go, with its sound under its
     // picture. A frame of snapping is expected; anything more is reported.
+    step("read back");
     const scan = await scanSequence(clone);
+    step(`read back: ${scan.clips.length} item(s)`);
     const firstByPath = {};
     for (const c of scan.clips) {
         const cur = firstByPath[c.filePath];
@@ -956,7 +1063,7 @@ async function statMtimeMs(filePath) {
 
 module.exports = {
     getActiveProject, getActiveSequence, getActiveSequenceName, renameSequence,
-    scanSequence, scanActiveSequence, listTracks, listActiveSequenceTracks,
+    scanSequence, scanActiveSequence, listTracks, listActiveSequenceTracks, listActiveAudioMediaPaths, countActiveAudioClips,
     applyStarts, applyShifts, buildSyncSequence, verifyMovement, repairTornFiles,
     mendLinkAlignment, statMtimeMs, buildSourceSequence, getBinPath, readTextFile, addMarkers,
     deleteSequencesNamed, discardActiveSequence
