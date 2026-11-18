@@ -582,49 +582,81 @@ function placementTimes(plan, anchorMsByTrack) {
 // The rebuild gives every device (and every day's footage of it) its own block
 // of tracks, because every analysis step treats a track as one device. Once
 // the sync is done that no longer matters, and blocks that never overlap in
-// time — the same camera on two days, or two devices that never rolled
-// together — can share tracks. Picture blocks share with picture blocks, sound
-// with sound; a block prefers a slot already holding its own device, then one
-// with the same number of audio channels.
+// time can share tracks.
 //
-// blocks:   [{ sourceId, label, hasVideo, audioWidth, files: [{ filePath }] }]
+// Two passes, so the result reads like an editor would lay it out:
+//  1. CHAIN each camera's blocks — same `packKey` (camera serial, else model,
+//     else source) — onto as few slots as possible: the same FX6 on two days
+//     lands on the same tracks instead of whichever slot came free first.
+//  2. Pack the chains: a chain joins an existing slot only when none of its
+//     spans overlap (preferring a slot with the same number of audio
+//     channels), else it opens a new one. So two devices that never rolled
+//     together still share, as asked.
+// Picture blocks share with picture blocks, sound with sound.
+//
+// blocks:   [{ sourceId, packKey?, label, hasVideo, audioWidth, files: [{ filePath }] }]
 // spanOf:   path → { startSec, endSec } final timeline position
-// Returns slots: [{ hasVideo, labels:[...], files: [{ filePath, startSec }] }]
-// in placement order (picture first). Two blocks share a slot only if their
-// spans are at least `marginSec` apart.
+// Returns slots: [{ hasVideo, labels:[...], label, files: [{ filePath, startSec }] }]
+// in placement order (picture first, then by first appearance). Two blocks
+// share a slot only if their spans are at least `marginSec` apart.
 const PACK_MARGIN_SEC = 1;
 
 function packBlocks(blocks, spanOf, marginSec) {
     const margin = marginSec === undefined ? PACK_MARGIN_SEC : marginSec;
+    const apart = (a, b) => a.lo >= b.hi + margin || a.hi + margin <= b.lo;
     const items = [];
-    for (const b of blocks || []) {
+    (blocks || []).forEach((b, order) => {
         const files = b.files.filter(f => spanOf[f.filePath]);
-        if (!files.length) continue;
+        if (!files.length) return;
         let lo = Infinity, hi = -Infinity;
         for (const f of files) {
             lo = Math.min(lo, spanOf[f.filePath].startSec);
             hi = Math.max(hi, spanOf[f.filePath].endSec);
         }
-        items.push({ block: b, files, lo, hi });
-    }
-    const slots = [];
-    const fits = (slot, it) => slot.hasVideo === !!it.block.hasVideo &&
-        slot.spans.every(sp => it.lo >= sp.hi + margin || it.hi + margin <= sp.lo);
+        items.push({ block: b, files, lo, hi, order, key: (b.packKey || b.sourceId) + "|" + (b.hasVideo ? "v" : "a") });
+    });
+
+    // 1. Chains: one camera's blocks, as few as possible, in time order.
+    const byKey = new Map();
     for (const it of items) {
-        const candidates = slots.filter(sl => fits(sl, it));
-        const pick = candidates.find(sl => sl.sources.indexOf(it.block.sourceId) >= 0) ||
-            candidates.find(sl => sl.audioWidth === it.block.audioWidth) ||
-            candidates[0] || null;
-        const slot = pick || { hasVideo: !!it.block.hasVideo, spans: [], sources: [], labels: [], audioWidth: it.block.audioWidth, files: [] };
-        if (!pick) slots.push(slot);
-        slot.spans.push({ lo: it.lo, hi: it.hi });
-        if (slot.sources.indexOf(it.block.sourceId) < 0) slot.sources.push(it.block.sourceId);
-        if (slot.labels.indexOf(it.block.label) < 0) slot.labels.push(it.block.label);
-        slot.audioWidth = Math.max(slot.audioWidth || 0, it.block.audioWidth || 0);
-        for (const f of it.files) slot.files.push({ filePath: f.filePath, startSec: spanOf[f.filePath].startSec });
+        if (!byKey.has(it.key)) byKey.set(it.key, []);
+        byKey.get(it.key).push(it);
     }
-    slots.sort((a, b) => (b.hasVideo ? 1 : 0) - (a.hasVideo ? 1 : 0));
-    return slots.map(sl => ({ hasVideo: sl.hasVideo, labels: sl.labels, label: sl.labels.join(" + "), files: sl.files }));
+    const chains = [];
+    for (const group of byKey.values()) {
+        const local = [];
+        for (const it of group.slice().sort((a, b) => a.lo - b.lo)) {
+            const fit = local.find(ch => ch.items.every(o => apart(o, it)));
+            const ch = fit || { items: [], hasVideo: !!it.block.hasVideo, audioWidth: 0, order: it.order };
+            if (!fit) local.push(ch);
+            ch.items.push(it);
+            ch.audioWidth = Math.max(ch.audioWidth, it.block.audioWidth || 0);
+            ch.order = Math.min(ch.order, it.order);
+        }
+        chains.push(...local);
+    }
+    chains.sort((a, b) => a.order - b.order);
+
+    // 2. Pack the chains into slots.
+    const slots = [];
+    for (const ch of chains) {
+        const fits = slots.filter(sl => sl.hasVideo === ch.hasVideo &&
+            ch.items.every(it => sl.items.every(o => apart(o, it))));
+        const slot = fits.find(sl => sl.audioWidth === ch.audioWidth) || fits[0] ||
+            { hasVideo: ch.hasVideo, items: [], audioWidth: 0, order: ch.order };
+        if (slots.indexOf(slot) < 0) slots.push(slot);
+        slot.items.push(...ch.items);
+        slot.audioWidth = Math.max(slot.audioWidth, ch.audioWidth);
+    }
+    slots.sort((a, b) => ((b.hasVideo ? 1 : 0) - (a.hasVideo ? 1 : 0)) || (a.order - b.order));
+    return slots.map(sl => {
+        const its = sl.items.slice().sort((a, b) => a.lo - b.lo);
+        const labels = [];
+        for (const it of its) if (labels.indexOf(it.block.label) < 0) labels.push(it.block.label);
+        const files = [];
+        for (const it of its) for (const f of it.files) files.push({ filePath: f.filePath, startSec: spanOf[f.filePath].startSec });
+        return { hasVideo: sl.hasVideo, labels, label: labels.join(" + "), files };
+    });
 }
 
 // The track in a (rebuilt) sequence that best holds `paths`: most of them,

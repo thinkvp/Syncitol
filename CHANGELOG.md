@@ -87,6 +87,10 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   track, so the packed layout is placed afresh in a new copy of the original
   sequence. It replaces the first -SYNC only if every clip lands exactly;
   otherwise the unpacked one is kept. Revert is not available after packing.
+  Each camera's blocks are grouped first, by serial, else by model, so the
+  same FX6 on two days keeps the same tracks. Before, a first test packed
+  day 2's A7S3 beside day 1's FX6, which pushed day 2's FX6 audio four
+  tracks down.
 - **Clear cache** (in the help panel, under "Speed and the cache") forgets
   the audio Syncitol has decoded (on disk and in memory) and the file
   metadata it has read, so the next sync decodes afresh and can be timed.

@@ -338,3 +338,27 @@ test("packBlocks never shares a slot between blocks closer than the margin", () 
     const slots = sources.packBlocks(blocks, { a: { startSec: 0, endSec: 100 }, b: { startSec: 100.5, endSec: 200 } });
     assert.strictEqual(slots.length, 2);
 });
+
+test("packBlocks keeps one camera on the same tracks across days even when another block comes first", () => {
+    // Rebuild order as in the field log: day-1 FX6, day-2 A7S3, wide, day-2 FX6, day-1 A7S3.
+    const span = (a, b) => ({ startSec: a, endSec: b });
+    const blocks = [
+        { sourceId: "fx1", packKey: "FX6#7600111", label: "FX6 day 1", hasVideo: true, audioWidth: 4, files: [{ filePath: "fx1" }] },
+        { sourceId: "a7d2", packKey: "model:ILCE-7SM3", label: "A7S3 day 2", hasVideo: true, audioWidth: 1, files: [{ filePath: "a7d2" }] },
+        { sourceId: "wide", packKey: "wide", label: "WIDE", hasVideo: true, audioWidth: 2, files: [{ filePath: "wide" }] },
+        { sourceId: "fx2", packKey: "FX6#7600111", label: "FX6 day 2", hasVideo: true, audioWidth: 4, files: [{ filePath: "fx2" }] },
+        { sourceId: "a7d1", packKey: "model:ILCE-7SM3", label: "A7S3 day 1", hasVideo: true, audioWidth: 1, files: [{ filePath: "a7d1" }] }
+    ];
+    const spans = { fx1: span(0, 6700), wide: span(0, 6770), a7d1: span(1500, 4000), fx2: span(6800, 17000), a7d2: span(6795, 17100) };
+    const slots = sources.packBlocks(blocks, spans);
+    assert.deepStrictEqual(slots.map(s => s.labels), [["FX6 day 1", "FX6 day 2"], ["A7S3 day 1", "A7S3 day 2"], ["WIDE"]]);
+});
+
+test("packBlocks still lets two different devices that never rolled together share", () => {
+    const span = (a, b) => ({ startSec: a, endSec: b });
+    const blocks = [
+        { sourceId: "a", packKey: "A", label: "A", hasVideo: true, audioWidth: 2, files: [{ filePath: "a" }] },
+        { sourceId: "b", packKey: "B", label: "B", hasVideo: true, audioWidth: 2, files: [{ filePath: "b" }] }
+    ];
+    assert.strictEqual(sources.packBlocks(blocks, { a: span(0, 100), b: span(200, 300) }).length, 1);
+});

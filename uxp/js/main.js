@@ -2713,7 +2713,14 @@ async function detectDevices(scan, enriched) {
     for (const f of detectInput) {
         if (!(deviceOf[f.filePath] in labelByDevice)) labelByDevice[deviceOf[f.filePath]] = labelOf[detection.sourceOf[f.filePath]];
     }
-    return { detection, detectInput, check, deviceOf, labelByDevice };
+    // For packing tracks after the sync: the same camera body (serial), else
+    // the same model, keeps its blocks on the same tracks across days.
+    const packKeyOf = {};
+    for (const f of detectInput) {
+        packKeyOf[f.filePath] = (f.device && f.device.serial) ? `${f.device.model || "?"}#${f.device.serial}`
+            : (f.device && f.device.model) ? `model:${f.device.model}` : detection.sourceOf[f.filePath];
+    }
+    return { detection, detectInput, check, deviceOf, labelByDevice, packKeyOf };
 }
 
 function planTrackLayout(scan, enriched, det) {
@@ -3162,6 +3169,9 @@ async function refreshSequence(opts) {
         clipLayoutOpts = layoutOpts;
         if (pendingPlan) {
             rebuildPlan = { blocks: sources.placementTimes(pendingPlan, trackEarliestMs) };
+            if (det && det.packKeyOf) {
+                for (const b of rebuildPlan.blocks) b.packKey = det.packKeyOf[b.files[0].filePath];
+            }
             if (forcedRefTrackKey) {
                 rebuildPlan.refPaths = [...new Set(scan.clips
                     .filter(c => `${c.trackType}_${c.trackIndex}` === forcedRefTrackKey)
