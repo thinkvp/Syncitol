@@ -86,11 +86,31 @@ DecodeResult decodeMonoPcm(const std::string& path, double startSec,
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) {
         out.error = "open failed"; return out;
     }
-    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+
+    // Only the audio is wanted. Discarding every other stream lets the
+    // demuxer skip their data instead of reading it and throwing it away —
+    // for a camera file that is the video, nearly all of its bytes, and over
+    // a network share it was most of the time a decode took. (MP4/MOV skip a
+    // discarded stream's samples outright; MXF steps over them.)
+    int audioStream = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (audioStream >= 0) {
+        for (unsigned i = 0; i < fmt->nb_streams; i++) {
+            if ((int)i != audioStream) fmt->streams[i]->discard = AVDISCARD_ALL;
+        }
+    }
+    // Probing reads ahead to fill in stream details. When the header already
+    // describes the audio completely (MP4/MOV, MXF and WAV do) it is a second
+    // read of the file for nothing, on every slice — so only probe otherwise.
+    const AVCodecParameters* hp = audioStream >= 0 ? fmt->streams[audioStream]->codecpar : nullptr;
+    const bool headerComplete = hp && hp->codec_id != AV_CODEC_ID_NONE &&
+                                hp->sample_rate > 0 && hp->ch_layout.nb_channels > 0;
+    if (!headerComplete && avformat_find_stream_info(fmt, nullptr) < 0) {
         avformat_close_input(&fmt); out.error = "stream info failed"; return out;
     }
-
-    int audioStream = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (audioStream < 0) {
+        // Formats whose streams only appear once packets are read.
+        audioStream = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    }
     if (audioStream < 0) {
         avformat_close_input(&fmt); out.error = "no audio stream"; return out;
     }

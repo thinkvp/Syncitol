@@ -31,3 +31,37 @@ jobs:
         run: npm run lint
       - name: Unit tests
         run: npm test
+
+  # The macOS addon is otherwise only compiled when a release tag is pushed,
+  # so a change to the native code could first fail mid-release. Compile it
+  # on every push too (same steps as uxp-release.yml, nothing uploaded).
+  build-addon-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: brew install nasm pkg-config
+
+      - name: Cache FFmpeg build
+        id: cache-ffmpeg
+        uses: actions/cache@v6
+        with:
+          path: uxp/ffmpeg-out
+          key: ffmpeg-mac-static-${{ hashFiles('uxp/scripts/build-ffmpeg-mac.sh') }}
+
+      - name: Build FFmpeg (static, audio-only)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o ffmpeg.tar.xz https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+          tar xf ffmpeg.tar.xz
+          FFMPEG_SRC_DIR="$PWD/ffmpeg-8.1.2" PREFIX_BASE="$PWD/ffmpeg-out" \
+            bash scripts/build-ffmpeg-mac.sh universal
+
+      - name: Compile macOS addon
+        run: |
+          cmake -S native -B native/build \
+            -DFFMPEG_ROOT="$PWD/ffmpeg-out/universal" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build native/build
+          lipo -info native/build/syncitol.uxpaddon

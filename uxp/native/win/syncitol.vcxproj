@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Windows build of the Syncitol UXP hybrid addon (syncitol.uxpaddon), x64.
+  Same C++ sources as the macOS CMake build in ../CMakeLists.txt.
+
+  FFmpeg is linked statically from an audio-only build (see
+  ../../scripts/build-ffmpeg-win.sh), which keeps the plugin small. Point
+  FfmpegRoot at that build's install prefix (it holds include\ and lib\):
+
+    msbuild native\win\syncitol.vcxproj /p:Configuration=Release /p:Platform=x64 /p:FfmpegRoot=F:\ffbuild\out-static
+
+  or run ../../scripts/build-addon-win.bat. Output: native\build\win\syncitol.uxpaddon
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{b1c2d3e4-5f60-4a71-8b92-c0d1e2f3a4b5}</ProjectGuid>
+    <RootNamespace>syncitol</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <PropertyGroup>
+    <!-- Static, audio-only FFmpeg install prefix (include\ + lib\). -->
+    <FfmpegRoot Condition="'$(FfmpegRoot)'==''">F:\ffbuild\out-static</FfmpegRoot>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <LinkIncremental Condition="'$(Configuration)'=='Debug'">true</LinkIncremental>
+    <LinkIncremental Condition="'$(Configuration)'=='Release'">false</LinkIncremental>
+    <OutDir>$(MSBuildThisFileDirectory)..\build\win\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\build\win\obj\$(Configuration)\</IntDir>
+    <TargetName>syncitol</TargetName>
+    <TargetExt>.uxpaddon</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>_WINDOWS;_USRDLL;SYNCITOL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\uxp\src\api;..\uxp\src\utilities;..\uxp\src;..\src;$(FfmpegRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <AdditionalLibraryDirectories>$(FfmpegRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;swresample.lib;Bcrypt.lib;Mfplat.lib;Mfuuid.lib;Ole32.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <!-- Match the static FFmpeg libs' CRT (/MT). Also makes the addon
+           self-contained: no MSVCP140/VCRUNTIME140 DLL dependency. -->
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\uxp\src\utilities\UxpAddon.cpp" />
+    <ClCompile Include="..\uxp\src\utilities\UxpTask.cpp" />
+    <ClCompile Include="..\uxp\src\utilities\UxpValue.cpp" />
+    <ClCompile Include="..\uxp\src\module_syncitol.cpp" />
+    <ClCompile Include="..\src\syncitol_decode.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\uxp\src\api\UxpAddonShared.h" />
+    <ClInclude Include="..\uxp\src\api\UxpAddonTypes.h" />
+    <ClInclude Include="..\uxp\src\utilities\UxpAddon.h" />
+    <ClInclude Include="..\src\syncitol_decode.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

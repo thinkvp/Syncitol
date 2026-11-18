@@ -180,10 +180,16 @@ The addon source lives under `uxp/native/`. Build scripts:
 
 - **macOS:** `bash scripts/build-ffmpeg-mac.sh universal` then
   `cmake -S native -B native/build -DFFMPEG_ROOT=./ffmpeg-out/universal -DCMAKE_BUILD_TYPE=Release`
-- **Windows:** Visual Studio project at `native/uxp/win/syncitol.vcxproj`
+- **Windows:** build the static, audio-only FFmpeg once with
+  `scripts/build-ffmpeg-win.sh` (MSYS2 inside a VS 2022 x64 environment), then
+  `scripts\build-addon-win.bat <FFmpeg prefix>` builds
+  `native/win/syncitol.vcxproj` into `native/build/win/`. Add `install` as a
+  second argument to copy it over the committed `win/x64/syncitol.uxpaddon`.
+  Needs Visual Studio 2022 Build Tools with the C++ workload.
 
-CI builds both platforms on tag push (`v*`); the resulting `.ccx` bundles
-addons for Windows (x64) and macOS (universal arm64+x86_64).
+CI builds the macOS addon on tag push (`v*`); the Windows addon is committed
+pre-built, and the resulting `.ccx` bundles both (Windows x64, macOS universal
+arm64+x86_64).
 
 ---
 

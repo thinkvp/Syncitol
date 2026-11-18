@@ -4,7 +4,7 @@
 # self-contained addon — no ffmpeg-on-PATH required at runtime.
 #
 # Source files live alongside this CMakeLists.txt under src/ and uxp/src/.
-# These are the same C++ files used by the Windows .vcxproj build.
+# These are the same C++ files used by the Windows build (win/syncitol.vcxproj).
 #
 # Prereqs:
 #   1. FFmpeg static libs at FFMPEG_ROOT (build with scripts/build-ffmpeg-mac.sh)

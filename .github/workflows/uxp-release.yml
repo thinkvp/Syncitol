@@ -32,7 +32,9 @@ jobs:
         id: cache-ffmpeg
         uses: actions/cache@v6
         with:
-          path: ffmpeg-out
+          # Cache paths are relative to the workspace root, not the uxp/
+          # working directory the run steps use — FFmpeg is built in uxp/.
+          path: uxp/ffmpeg-out
           key: ffmpeg-mac-static-${{ hashFiles('uxp/scripts/build-ffmpeg-mac.sh') }}
 
       - name: Build FFmpeg (static, audio-only)
