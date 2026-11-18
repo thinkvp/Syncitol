@@ -3813,6 +3813,16 @@ async function autoSync() {
     autoStep = { n: 0, startedAt: [] };
 
     try {
+        // Without the decoder there is nothing to align by: stop before the
+        // scan and build, with the reason (on a Mac, usually macOS blocking
+        // the addon until it is allowed in Privacy & Security).
+        try {
+            await audio.ensureAddon();
+        } catch (e) {
+            log(`✗ Auto Sync can't run: ${e.message}`, "error");
+            return;
+        }
+
         // Refuse to run on an already-built -SYNC sequence: the pipeline would
         // clone it into X-SYNC-SYNC and re-shift already-aligned clips.
         const liveName = await premiere.getActiveSequenceName();

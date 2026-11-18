@@ -23,6 +23,16 @@
 const dsp = require("./dsp");
 const fs = require("fs");
 
+// ─── Platform ─────────────────────────────────────────────────────────────────
+// UXP's os module reports "darwin" on macOS; the user agent is the fallback.
+function isMac() {
+    try {
+        const p = require("os").platform();
+        if (p) return String(p).toLowerCase() === "darwin";
+    } catch (e) { /* no os module in this host */ }
+    try { return /mac/i.test((navigator && (navigator.platform || navigator.userAgent)) || ""); } catch (e) { return false; }
+}
+
 // ─── Native addon (lazy) ──────────────────────────────────────────────────────
 let _addon = null;
 let _addonError = null;
@@ -53,8 +63,14 @@ function addon() {
                     ].filter(Boolean).join(" | ");
                 } catch (_) { detail = "(uncapturable)"; }
                 try { console.error("[syncitol] addon load failed:", e); } catch (_) {}
-                _addonError = new Error(
-                    "Syncitol audio addon failed to load (syncitol.uxpaddon). " + detail);
+                // On a Mac the usual cause is Gatekeeper: the addon is not
+                // signed by a paid Apple Developer ID, so macOS blocks it until
+                // the user allows it once. Say so where the error is seen.
+                _addonError = new Error(isMac()
+                    ? "Syncitol's audio decoder (syncitol.uxpaddon) didn't load. On a Mac this is usually macOS " +
+                      "blocking it the first time: open System Settings → Privacy & Security, click Allow Anyway " +
+                      "next to the message about syncitol.uxpaddon, then restart Premiere Pro. (" + detail + ")"
+                    : "Syncitol audio addon failed to load (syncitol.uxpaddon). " + detail);
                 throw _addonError;
             }
         })();
