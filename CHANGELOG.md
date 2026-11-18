@@ -9,7 +9,7 @@ The earlier internal history is a **separate 1.x line** that ran to its own
 1.4.0 before that reset — unrelated to the 1.4.0 below — and is preserved in
 [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
-## [Unreleased]
+## [1.8.0] - 2026-11-18
 
 ### Added
 - **Timelines that aren't one device per track now sync.** Every stage of
@@ -26,6 +26,12 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   onto its device's own block of tracks, at its recording time, before the
   audio pass runs as usual. Sequence settings carry over from the original.
   Trims, effects and titles do not, and the log says so.
+- **Track layout dropdown.** **Auto-detect** (default) rebuilds only when a
+  track mixes devices. **Keep my tracks** always clones the timeline as it is,
+  the old behaviour. **Rebuild by device** always rebuilds. The choice is
+  remembered. A forced **Audio reference** follows its recordings into the
+  rebuilt sequence. It names a track of the original timeline, and a rebuild
+  puts those recordings on a different one.
 - **Shoots over several days.** The build lays clips out by their
   recording clock, so a two-day shoot put day 2 a full night after day 1.
   That timeline ran past Premiere's 24-hour timecode, and the build refused
@@ -40,6 +46,16 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   files dated by a later copy or processing pass get no marker. A shoot that
   is still over 24 hours with the gaps closed now builds anyway. Premiere
   accepts it; only its timecode display rolls over.
+- **Recording days dropdown.** **Auto-detect** (default) closes the gaps only
+  when the clock-dated footage spans more than 24 hours, and at least one
+  device (the same camera serial, or the same detected source) recorded in
+  more than one session. Without that, every "day" is a separate set of
+  devices, which is exactly what a camera with the wrong date produces. In a
+  field test, an FX6 dated February and an A7S3 dated October, filming the
+  same interviews, were split into two days, each camera its own day's
+  reference, and nothing was aligned. That is now laid out as one day, and
+  the log explains why. **Single day** keeps
+  the old layout. **Multiple days** always closes gaps over two hours.
 - **Each recording day gets its own audio reference.** The audio pass used
   one reference track for the whole sequence: the one with the most
   recorded time. In a two-day shoot that is one day's device, so every
@@ -140,22 +156,6 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   unavailable: scanned is not defined"). It read a variable that only
   existed inside a loop, so the confirmation of a relay match never ran.
   This had been there since the relay pass was written.
-- **Recording days dropdown.** **Auto-detect** (default) closes the gaps only
-  when the clock-dated footage spans more than 24 hours, and at least one
-  device (the same camera serial, or the same detected source) recorded in
-  more than one session. Without that, every "day" is a separate set of
-  devices, which is exactly what a camera with the wrong date produces. In a
-  field test, an FX6 dated February and an A7S3 dated October, filming the
-  same interviews, were split into two days, each camera its own day's
-  reference, and nothing was aligned. That is now laid out as one day, and
-  the log explains why. **Single day** keeps
-  the old layout. **Multiple days** always closes gaps over two hours.
-- **Track layout dropdown.** **Auto-detect** (default) rebuilds only when a
-  track mixes devices. **Keep my tracks** always clones the timeline as it is,
-  the old behaviour. **Rebuild by device** always rebuilds. The choice is
-  remembered. A forced **Audio reference** follows its recordings into the
-  rebuilt sequence. It names a track of the original timeline, and a rebuild
-  puts those recordings on a different one.
 
 ## [1.7.0] - 2026-10-30
 

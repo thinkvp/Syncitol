@@ -98,7 +98,7 @@ resolves from Premiere's `.pek` peak cache with no audio decoding.
 
 | Area | State |
 | --- | --- |
-| DSP / sync brain (`uxp/js/dsp.js`) | Envelope cross-correlation, coarse search policy, pek parsing, drift probes, learned-offset search, reference-layer selection, A/V integrity diff — `npm test` 78/78 |
+| DSP / sync brain (`uxp/js/dsp.js`) | Envelope cross-correlation, coarse search policy, pek parsing, drift probes, learned-offset search, reference-layer selection, A/V integrity diff, device detection (`sources.js`), recording days (`sessions.js`) — `npm test` 214/214 |
 | Native FFmpeg addon | Compiled for Windows (x64) and macOS (universal: arm64 + x86_64), self-contained, verified in-panel |
 | Host ops (`uxp/js/premiere.js`) | Verified live: scan, clone-based Build (**createMoveAction**, not createSetStartAction — see note), transactional shifts, undo = one step, per-file all-or-nothing moves + post-apply A/V integrity read-back |
 | Engine (`uxp/js/main.js`) | Staged coarse (pek → timecode → timestamp → learned → head → full), fine pass with rail guard, clock-drift report, cancel, boundary compensation |
