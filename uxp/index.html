@@ -224,8 +224,8 @@
             <div class="ins-section">
                 <div class="ins-heading">Speed and the cache</div>
                 <p class="ins-text">When Premiere’s own peak files (<code>.pek</code>) cover your media, whole tracks are matched from them in milliseconds without decoding any audio. Right after an import, or when a project opens in a new Premiere version, Premiere is still building them, so the first sync is slower — the log says when that is the case. Audio Syncitol does decode is cached on disk, so a re-run on the same footage takes seconds. The log reports what each step actually decoded.</p>
-                <p class="ins-text ins-note">To time a sync as a first run, clear Syncitol’s cache: the decoded audio, the peak-file index and the file metadata it has read. Premiere’s own peak files are Premiere’s — clear those under Preferences › Media Cache if you want to time a run without them. Windows and network drives also keep recently read files in memory for a while, so a second run straight away can still be quicker.</p>
-                <div class="ins-actions"><div id="btn-clear-cache" class="btn btn-mini" title="Forget all decoded audio and cached peak-file lookups, so the next sync runs as if for the first time">🗑 Clear cache</div></div>
+                <p class="ins-text ins-note">To time a sync as a first run, clear Syncitol’s cache: the audio it has decoded and the file metadata it has read. Premiere’s peak files are left alone. Windows and network drives also keep recently read files in memory for a while, so a second run straight away can still be a little quicker.</p>
+                <div class="ins-actions"><div id="btn-clear-cache" class="btn btn-mini" title="Forget the audio Syncitol has decoded and the file metadata it has read, so the next sync decodes afresh">🗑 Clear cache</div></div>
             </div>
 
             <div class="ins-section">

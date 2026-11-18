@@ -88,9 +88,9 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   sequence. It replaces the first -SYNC only if every clip lands exactly;
   otherwise the unpacked one is kept. Revert is not available after packing.
 - **Clear cache** (in the help panel, under "Speed and the cache") forgets
-  the decoded audio on disk and in memory, the peak-file index and the file
-  metadata, so the next sync can be timed as a first run. Premiere's own peak
-  files are left to Premiere.
+  the audio Syncitol has decoded (on disk and in memory) and the file
+  metadata it has read, so the next sync decodes afresh and can be timed.
+  Nothing to do with Premiere's peak files is touched.
 - **The help panel is reorganised** into how it works, running a sync, the
   three options, clocks, how the alignment works, and speed. It was one long
   section, with the Audio reference note stranded under Recording days.

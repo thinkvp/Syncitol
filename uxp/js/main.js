@@ -3621,11 +3621,10 @@ btnAuto.addEventListener("click", autoSync);
 if (btnExportLog) btnExportLog.addEventListener("click", exportLog);
 
 // ─── Clear cache ──────────────────────────────────────────────────────────────
-// Makes the next sync behave like a first run, for timing it: forgets the
-// decoded-audio envelopes on disk and in memory, the probed file metadata, and
-// the index of Premiere's peak files. Premiere's own peak files (.pek) are
-// Premiere's — clear those under Preferences › Media Cache if a run without
-// any peaks is what you want to time.
+// Makes the next sync decode its audio afresh, for timing it: forgets the
+// decoded-audio envelopes on disk and in memory and the probed file metadata.
+// Nothing to do with Premiere's peak files is touched — neither the .pek files
+// nor Syncitol's index of them.
 const btnClearCache = $("btn-clear-cache");
 async function clearCaches() {
     if (opDepth > 0 || isDisabled(btnClearCache)) return;
@@ -3633,13 +3632,12 @@ async function clearCaches() {
     try {
         audio.clearCache();
         audio.clearProbeCache();
-        pek.resetAll();
         const disk = await audio.clearDiskCache();
         const mb = disk.bytes / (1024 * 1024);
         log(`Cache cleared: ${disk.files} cached audio envelope${disk.files !== 1 ? "s" : ""} ` +
-            `(${mb >= 1 ? mb.toFixed(0) + " MB" : Math.round(disk.bytes / 1024) + " KB"}) removed, peak-file index and file metadata forgotten. ` +
-            `The next sync runs as a first run would — except that Windows and network drives keep recently read files in memory ` +
-            `for a while, and Premiere's own peak files stay (Preferences › Media Cache).`, "success");
+            `(${mb >= 1 ? mb.toFixed(0) + " MB" : Math.round(disk.bytes / 1024) + " KB"}) removed and file metadata forgotten, ` +
+            `so the next sync decodes its audio afresh. Premiere's peak files are untouched, and Windows and network drives ` +
+            `keep recently read files in memory for a while, so a run straight away can still be a little quicker.`, "success");
     } catch (e) {
         log(`✗ Could not clear the cache: ${e.message}`, "error");
     } finally {
