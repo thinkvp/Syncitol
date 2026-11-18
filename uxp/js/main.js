@@ -76,6 +76,8 @@ let lastDays = null;           // { closed, plan, embeddedPaths } from the last 
 let clipLayoutOpts;            // dsp.planBuildAnchors options clipPayload was planned with
 let lastSyncResult = null;     // { rows, clips, references } from the last fine tune, for the summary
 let lastLayoutRebuilt = false; // the last build laid the sequence out by device
+let lastRebuildBlocks = null;  // that build's device blocks, for packing tracks after the sync
+let originalSeqName = null;    // the sequence Auto Sync started from
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -2837,6 +2839,114 @@ function logDecodeStats(phase) {
     log(`${phase}: ${parts.join("; ")}.`);
 }
 
+// ─── Tidy the layout once the sync is done ────────────────────────────────────
+// Two things that can only be judged from FINAL positions:
+//  * the gaps between recording days were planned from the clocks, before the
+//    audio pass corrected them — each day is slid (as one piece) to start a
+//    minute after the previous one ends (sessions.tightenDays);
+//  * a rebuilt-by-device sequence gives every device block its own tracks,
+//    which every analysis step needs, but once synced, blocks that never
+//    overlap in time can share tracks (sources.packBlocks). Premiere can only
+//    slide clips along their own track, so that means placing them again, in a
+//    fresh copy, which replaces this one only if every clip lands exactly.
+async function finishLayout() {
+    const closedDays = !!(lastDays && lastDays.closed && lastDays.plan.sessions.length > 1);
+    const canPack = !!(lastLayoutRebuilt && lastRebuildBlocks && lastRebuildBlocks.length > 1);
+    if (!closedDays && !canPack) return;
+    try {
+        setBusy("Tidying the layout…");
+        const scan = await premiere.scanActiveSequence();
+        const spans = {};
+        for (const c of scan.clips) {
+            const e = spans[c.filePath] || (spans[c.filePath] = { startSec: Infinity, endSec: -Infinity });
+            e.startSec = Math.min(e.startSec, c.startSec);
+            e.endSec = Math.max(e.endSec, c.endSec);
+        }
+
+        let deltaByPath = {};
+        if (closedDays) {
+            const tight = sessions.tightenDays(lastDays.plan, spans, lastDays.embeddedPaths);
+            deltaByPath = tight.deltaByPath;
+            const names = sessions.sessionLabels(lastDays.plan);
+            const nameOf = (idx) => (names.find(l => l.index === idx) || {}).name || `session ${idx + 1}`;
+            for (const d of tight.days) {
+                if (d.merged) {
+                    log(`ℹ ${nameOf(d.index)}: after the audio pass its clips sit inside another day, so it is treated as part of that day (a device with a wrong date).`, "info");
+                } else if (d.shiftSec) {
+                    log(`${nameOf(d.index)} moved ${formatSignedSeconds(d.shiftSec)} so it starts a minute after the previous day ends — the gap was planned from the recording clocks, which the audio pass then corrected.`);
+                }
+            }
+        }
+        const finalSpans = {};
+        for (const p of Object.keys(spans)) {
+            const d = deltaByPath[p] || 0;
+            finalSpans[p] = { startSec: spans[p].startSec + d, endSec: spans[p].endSec + d };
+        }
+
+        if (canPack) {
+            const slots = sources.packBlocks(lastRebuildBlocks, finalSpans);
+            if (slots.length < lastRebuildBlocks.length && await repackSequence(slots, scan)) return;
+        }
+
+        const shifts = Object.keys(deltaByPath).map(p => ({ filePath: p, deltaSec: deltaByPath[p] }));
+        if (shifts.length) {
+            const r = await premiere.applyShifts(shifts, {});
+            reportApplyIntegrity(r, null);
+            if (lastFineTuneRevert) {
+                const byPath = new Map(lastFineTuneRevert.adjustments.map(a => [a.filePath, a.deltaSec]));
+                for (const sft of shifts) byPath.set(sft.filePath, (byPath.get(sft.filePath) || 0) - sft.deltaSec);
+                setRevertAvailable({ adjustments: [...byPath].map(([filePath, deltaSec]) => ({ filePath, deltaSec })) });
+            }
+        }
+    } catch (e) {
+        if (e && e.cancelled) throw e;
+        log(`⚠ Could not tidy the layout after the sync: ${e.message}. The sync itself is in place.`, "warn");
+    }
+}
+
+// Place the synced clips again on shared tracks; true when the packed copy
+// replaced the original (every clip landed exactly where it was).
+async function repackSequence(slots, scanBefore) {
+    const oldName = await premiere.getActiveSequenceName();
+    const tracksOf = (clips) => ({
+        video: new Set(clips.filter(c => c.trackType === "video").map(c => c.trackIndex)).size,
+        audio: new Set(clips.filter(c => c.trackType === "audio").map(c => c.trackIndex)).size
+    });
+    const was = tracksOf(scanBefore.clips);
+    const refPaths = forcedRefTrackKey
+        ? [...new Set(scanBefore.clips.filter(c => `${c.trackType}_${c.trackIndex}` === forcedRefTrackKey).map(c => c.filePath))]
+        : null;
+    setBusy("Packing tracks…");
+    const built = await premiere.buildSourceSequence(
+        slots.map(sl => ({ label: sl.label, hasVideo: sl.hasVideo, files: sl.files })),
+        { cloneFrom: originalSeqName });
+    if (built.failed.length || built.misplaced.length || built.placed !== built.total) {
+        await premiere.discardActiveSequence(oldName);
+        log(`⚠ Could not pack the tracks cleanly (${built.failed.length + built.misplaced.length} clip(s) would not land exactly), ` +
+            `so the sequence keeps one track block per device.`, "warn");
+        return false;
+    }
+    await premiere.deleteSequencesNamed(oldName);
+    try {
+        const project = await premiere.getActiveProject();
+        await premiere.renameSequence(project, built.sequence, oldName);
+    } catch (e) { /* keep the copy's name */ }
+    const after = tracksOf((await premiere.scanActiveSequence()).clips);
+    const shared = slots.filter(sl => sl.labels.length > 1).map(sl => sl.labels.join(" + "));
+    log(`✓ Packed onto ${after.video} video and ${after.audio} audio tracks (was ${was.video} and ${was.audio}): ` +
+        `blocks that never overlap in time now share tracks — ${shared.join("; ")}.`, "success");
+    if (refPaths && refPaths.length) {
+        const moved = sources.followTrack((await premiere.scanActiveSequence()).clips, refPaths, "audio");
+        if (moved) forcedRefTrackKey = moved;
+    }
+    await refreshTrackOptions();
+    // The clips were placed afresh, so the fine tune's inverse shifts no longer
+    // describe this sequence.
+    setRevertAvailable(null);
+    log("ℹ Revert is not available after packing — run Auto Sync again from the original sequence to start over.", "info");
+    return true;
+}
+
 // Clips the fine pass could not vouch for, as sequence markers at each clip's
 // start, so the editor finds them on the timeline rather than in the log.
 const CHECK_MARKER_LIMIT = 60;
@@ -3234,6 +3344,7 @@ async function buildSync() {
         // rebuild puts those recordings on different tracks, so follow them.
         const refFollow = (rebuildPlan && forcedRefTrackKey && rebuildPlan.refPaths) ? rebuildPlan.refPaths : null;
         lastLayoutRebuilt = !!rebuildPlan;
+        lastRebuildBlocks = rebuildPlan ? rebuildPlan.blocks : null;
         if (rebuildPlan) {
             reportRebuild(built, finalName);
         } else {
@@ -3466,6 +3577,7 @@ async function autoSync() {
             return;
         }
 
+        originalSeqName = scannedSeqName;
         enterStep(2);
         const built = await buildSync();
         if (!built) {
@@ -3479,6 +3591,7 @@ async function autoSync() {
 
         lastSyncResult = null;
         await fineTuneAudio();
+        if (!cancelRequested) await finishLayout();
         if (!cancelRequested) await markRecordingDays();
         if (!cancelRequested) await markClipsToCheck();
         if (!cancelRequested) logSyncSummary();

@@ -722,14 +722,25 @@ async function buildSyncSequence(clipPayload, baseName, layoutOpts) {
 // Audio track positions are NOT taken from the plan: how many tracks a camera's
 // sound takes is up to Premiere's channel mapping, so after each block the
 // timeline is read and the next block starts below the last occupied track.
-async function buildSourceSequence(blocks) {
+//
+// opts.cloneFrom: name of the sequence to clone instead of the active one —
+// the packed rebuild after a sync clones the ORIGINAL sequence, so it starts
+// from that sequence's own (few) tracks rather than every track the first
+// rebuild added.
+async function buildSourceSequence(blocks, opts) {
+    opts = opts || {};
     const step = (m) => { try { console.log("[rebuild] " + m); } catch (e) {} if (typeof buildSourceSequence.onStep === "function") buildSourceSequence.onStep(m); };
     const msgOf = (e) => (e && (e.message || String(e))) || "unknown error";
 
     const project = await getActiveProject();
     const before = await val(project.getSequences());
     const beforeIds = new Set(before.map(s => seqId(s)));
-    const active = await val(project.getActiveSequence());
+    let active = await val(project.getActiveSequence());
+    if (opts.cloneFrom) {
+        for (const sq of before || []) {
+            if (String(await val(sq.name)) === opts.cloneFrom) { active = sq; break; }
+        }
+    }
     if (!active) throw new Error("No active sequence.");
 
     // Project items come from the ORIGINAL timeline's instances, read through
@@ -838,6 +849,38 @@ async function buildSourceSequence(blocks) {
     };
 }
 
+// Delete every sequence called `name` except the active one. Used when a
+// packed rebuild replaces the -SYNC it was cloned from. Returns the count.
+async function deleteSequencesNamed(name) {
+    const project = await getActiveProject();
+    const active = await val(project.getActiveSequence());
+    const keep = seqId(active);
+    let deleted = 0;
+    for (const s of (await val(project.getSequences())) || []) {
+        if (seqId(s) === keep) continue;
+        if (String(await val(s.name)) !== name) continue;
+        try { if (await val(project.deleteSequence(s)) !== false) deleted += 1; } catch (e) { /* leave it */ }
+    }
+    return deleted;
+}
+
+// Throw away the active sequence (a failed packed rebuild) and make the one
+// called `name` active again.
+async function discardActiveSequence(reopenName) {
+    const project = await getActiveProject();
+    const active = await val(project.getActiveSequence());
+    let reopen = null;
+    for (const s of (await val(project.getSequences())) || []) {
+        if (seqId(s) !== seqId(active) && String(await val(s.name)) === reopenName) { reopen = s; break; }
+    }
+    if (reopen) {
+        try { await val(project.openSequence(reopen)); } catch (e) {}
+        try { await val(project.setActiveSequence(reopen)); } catch (e) {}
+    }
+    if (active && reopen) { try { await val(project.deleteSequence(active)); } catch (e) {} }
+    return !!reopen;
+}
+
 // Which bin a project item sits in, as "Parent/Child" from the project root
 // down. "" when unknown. Never throws: a bin is only a hint.
 async function getBinPath(projectItem) {
@@ -915,5 +958,6 @@ module.exports = {
     getActiveProject, getActiveSequence, getActiveSequenceName, renameSequence,
     scanSequence, scanActiveSequence, listTracks, listActiveSequenceTracks,
     applyStarts, applyShifts, buildSyncSequence, verifyMovement, repairTornFiles,
-    mendLinkAlignment, statMtimeMs, buildSourceSequence, getBinPath, readTextFile, addMarkers
+    mendLinkAlignment, statMtimeMs, buildSourceSequence, getBinPath, readTextFile, addMarkers,
+    deleteSequencesNamed, discardActiveSequence
 };

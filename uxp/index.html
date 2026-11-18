@@ -202,6 +202,8 @@
 
                 <p class="ins-text ins-note">With the days closed up, <strong>each day gets its own audio reference</strong> (the track with the most coverage that day, or your chosen Audio reference on the days it recorded), and clips are only ever compared with recordings from the same day. A forced Audio reference also follows its recordings when Track layout rebuilds the sequence by device.</p>
 
+                <p class="ins-text ins-note">Once the sync is done, the gaps between days are tightened from where the clips actually ended up — each day slides, as one piece, to start a minute after the previous one ends (the planned gap came from the clocks, before the audio pass corrected them). And if the sequence was rebuilt by device, blocks that never overlap in time are packed onto shared tracks — the same camera on two days, or two devices that never rolled together — by placing them afresh in a new copy that only replaces the first one if every clip lands exactly.</p>
+
                 <p class="ins-text ins-note">Only embedded recording clocks decide what a day is. A recorder whose files carry the date they were copied or processed is not a second day, and gets no marker. If even the closed-up timeline runs past 24 hours, it is built anyway: Premiere accepts that, but its timecode display rolls over at 24:00:00 — the day markers are the way around.</p>
 
                 <p class="ins-text ins-note">The list shows audio tracks only. Forcing a track really selects the <em>files</em> on it, and a camera clip’s picture and sound are one file — so V1 and A1 would pick exactly the same recordings. Auto still considers every clip whatever track it sits on.</p>

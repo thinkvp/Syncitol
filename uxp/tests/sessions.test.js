@@ -156,3 +156,32 @@ test("dayEvidence: one camera with the wrong date is not a second day", () => {
     assert.strictEqual(ev.sharedDevice, null);
     assert.deepStrictEqual(ev.sessions.map(s => s.devices), [["fx"], ["a7"]]);
 });
+
+test("tightenDays closes the gap a wrong clock left, sliding each day as one piece", () => {
+    // Day 1 ended on a camera 10 min fast; after the sync the real gap is 20 min.
+    const plan = { sessions: [{ index: 0, files: ["a1", "b1"] }, { index: 1, files: ["a2", "b2"] }] };
+    const spans = {
+        a1: { startSec: 0, endSec: 6000 }, b1: { startSec: 100, endSec: 6700 },
+        a2: { startSec: 7900, endSec: 9000 }, b2: { startSec: 7950, endSec: 9100 },
+        rec: { startSec: 8000, endSec: 8800 }   // copy-dated, sits inside day 2
+    };
+    const t = sessions.tightenDays(plan, spans, new Set(["a1", "b1", "a2", "b2"]), 60);
+    // Day 2 should start 60 s after day 1's end (6700) → shift 6760 − 7900.
+    assert.strictEqual(t.deltaByPath.a2, -1140);
+    assert.strictEqual(t.deltaByPath.b2, -1140);
+    assert.strictEqual(t.deltaByPath.rec, -1140, "the copy-dated recorder moves with the day it belongs to");
+    assert.strictEqual(t.deltaByPath.a1, undefined);
+});
+
+test("tightenDays pushes overlapping days apart, and merges a day the sync moved inside another", () => {
+    const plan = { sessions: [{ index: 0, files: ["a"] }, { index: 1, files: ["b"] }, { index: 2, files: ["c"] }] };
+    const spans = {
+        a: { startSec: 0, endSec: 5000 },
+        b: { startSec: 2000, endSec: 3000 },     // wrong clock: really part of day 1
+        c: { startSec: 4980, endSec: 8000 }      // overlaps day 1 by 20 s
+    };
+    const t = sessions.tightenDays(plan, spans, null, 60);
+    assert.strictEqual(t.deltaByPath.b, undefined, "merged into day 1, not moved");
+    assert.strictEqual(t.deltaByPath.c, 80, "pushed to start 60 s after day 1");
+    assert.ok(t.days.find(d => d.index === 1).merged);
+});

@@ -137,6 +137,87 @@ function dayEvidence(files, opts) {
     return out;
 }
 
+// ─── Tighten the gaps between days, after the sync ────────────────────────────
+// The closed-up gaps are planned from the recording CLOCKS, before the audio
+// pass corrects them, so the finished gap is the pad plus whatever the clocks
+// were wrong by: a day ending on a camera 10 minutes fast and the next day
+// starting on one 1.5 minutes slow left 17 minutes instead of 5 (or, the
+// other way round, would let days overlap). Once every clip is in its final
+// place, each day is slid as ONE piece so it starts `padSec` after the
+// previous one ends. Nothing within a day moves relative to anything else.
+//
+// fileSpans:  { path: { startSec, endSec } } — final timeline positions
+// embedded:   Set of paths with an embedded clock (they define the days)
+// Files dated only by copy time join the day their final position overlaps
+// most (else the nearest). A "day" that now sits well inside the previous one
+// (a wrong clock the audio pass moved there) is merged into it, never pushed.
+// Returns { deltaByPath, days: [{ index, startSec, endSec, shiftSec, merged }] }
+const TIGHT_PAD_SEC = 60;
+const TIGHT_MERGE_OVERLAP_SEC = 600;
+const TIGHT_MIN_SHIFT_SEC = 0.5;
+
+function tightenDays(plan, fileSpans, embedded, padSec) {
+    const pad = padSec === undefined ? TIGHT_PAD_SEC : padSec;
+    const days = [];
+    const dayOfPath = {};
+    for (const sess of plan.sessions) {
+        const paths = sess.files.filter(p => (!embedded || embedded.has(p)) && fileSpans[p]);
+        if (!paths.length) continue;
+        const day = { index: sess.index, paths: paths.slice(), startSec: Infinity, endSec: -Infinity, shiftSec: 0, merged: false };
+        for (const p of paths) {
+            day.startSec = Math.min(day.startSec, fileSpans[p].startSec);
+            day.endSec = Math.max(day.endSec, fileSpans[p].endSec);
+            dayOfPath[p] = day;
+        }
+        days.push(day);
+    }
+    if (days.length < 2) return { deltaByPath: {}, days };
+    days.sort((a, b) => a.startSec - b.startSec);
+
+    // Files that belong to no day (copy-dated) follow the day they now overlap.
+    for (const p of Object.keys(fileSpans)) {
+        if (dayOfPath[p]) continue;
+        const sp = fileSpans[p];
+        let best = null, bestScore = -Infinity;
+        for (const d of days) {
+            const ov = Math.min(sp.endSec, d.endSec) - Math.max(sp.startSec, d.startSec);
+            const mid = (sp.startSec + sp.endSec) / 2;
+            const dist = mid < d.startSec ? d.startSec - mid : (mid > d.endSec ? mid - d.endSec : 0);
+            const score = ov > 0 ? ov : -dist;
+            if (score > bestScore) { bestScore = score; best = d; }
+        }
+        best.paths.push(p);
+        dayOfPath[p] = best;
+        best.startSec = Math.min(best.startSec, sp.startSec);
+        best.endSec = Math.max(best.endSec, sp.endSec);
+    }
+    days.sort((a, b) => a.startSec - b.startSec);
+
+    // Merge days that now overlap heavily — they were one day all along.
+    const kept = [days[0]];
+    for (let i = 1; i < days.length; i += 1) {
+        const prev = kept[kept.length - 1];
+        if (days[i].startSec < prev.endSec - TIGHT_MERGE_OVERLAP_SEC) {
+            prev.paths.push(...days[i].paths);
+            prev.endSec = Math.max(prev.endSec, days[i].endSec);
+            days[i].merged = true;
+        } else {
+            kept.push(days[i]);
+        }
+    }
+
+    const deltaByPath = {};
+    let prevEnd = kept[0].endSec;
+    for (let i = 1; i < kept.length; i += 1) {
+        const d = kept[i];
+        const shift = (prevEnd + pad) - d.startSec;
+        d.shiftSec = Math.abs(shift) >= TIGHT_MIN_SHIFT_SEC ? Math.round(shift * 1000) / 1000 : 0;
+        if (d.shiftSec) for (const p of d.paths) deltaByPath[p] = d.shiftSec;
+        prevEnd = d.endSec + d.shiftSec;
+    }
+    return { deltaByPath, days };
+}
+
 // Marker names: "Day 1", "Day 2", … counted by calendar date (local time); a
 // second session on the same date becomes "Day 2 (2)". `dateLabel(ms)` formats
 // the start for the marker comment.
@@ -199,6 +280,8 @@ module.exports = {
     planSessions,
     closeGaps,
     spansDays,
+    tightenDays,
+    TIGHT_PAD_SEC,
     dayEvidence,
     sessionLabels,
     sessionStarts

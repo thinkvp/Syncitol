@@ -578,6 +578,55 @@ function placementTimes(plan, anchorMsByTrack) {
     });
 }
 
+// ─── Pack device blocks onto fewer tracks, after the sync ──────────────────────
+// The rebuild gives every device (and every day's footage of it) its own block
+// of tracks, because every analysis step treats a track as one device. Once
+// the sync is done that no longer matters, and blocks that never overlap in
+// time — the same camera on two days, or two devices that never rolled
+// together — can share tracks. Picture blocks share with picture blocks, sound
+// with sound; a block prefers a slot already holding its own device, then one
+// with the same number of audio channels.
+//
+// blocks:   [{ sourceId, label, hasVideo, audioWidth, files: [{ filePath }] }]
+// spanOf:   path → { startSec, endSec } final timeline position
+// Returns slots: [{ hasVideo, labels:[...], files: [{ filePath, startSec }] }]
+// in placement order (picture first). Two blocks share a slot only if their
+// spans are at least `marginSec` apart.
+const PACK_MARGIN_SEC = 1;
+
+function packBlocks(blocks, spanOf, marginSec) {
+    const margin = marginSec === undefined ? PACK_MARGIN_SEC : marginSec;
+    const items = [];
+    for (const b of blocks || []) {
+        const files = b.files.filter(f => spanOf[f.filePath]);
+        if (!files.length) continue;
+        let lo = Infinity, hi = -Infinity;
+        for (const f of files) {
+            lo = Math.min(lo, spanOf[f.filePath].startSec);
+            hi = Math.max(hi, spanOf[f.filePath].endSec);
+        }
+        items.push({ block: b, files, lo, hi });
+    }
+    const slots = [];
+    const fits = (slot, it) => slot.hasVideo === !!it.block.hasVideo &&
+        slot.spans.every(sp => it.lo >= sp.hi + margin || it.hi + margin <= sp.lo);
+    for (const it of items) {
+        const candidates = slots.filter(sl => fits(sl, it));
+        const pick = candidates.find(sl => sl.sources.indexOf(it.block.sourceId) >= 0) ||
+            candidates.find(sl => sl.audioWidth === it.block.audioWidth) ||
+            candidates[0] || null;
+        const slot = pick || { hasVideo: !!it.block.hasVideo, spans: [], sources: [], labels: [], audioWidth: it.block.audioWidth, files: [] };
+        if (!pick) slots.push(slot);
+        slot.spans.push({ lo: it.lo, hi: it.hi });
+        if (slot.sources.indexOf(it.block.sourceId) < 0) slot.sources.push(it.block.sourceId);
+        if (slot.labels.indexOf(it.block.label) < 0) slot.labels.push(it.block.label);
+        slot.audioWidth = Math.max(slot.audioWidth || 0, it.block.audioWidth || 0);
+        for (const f of it.files) slot.files.push({ filePath: f.filePath, startSec: spanOf[f.filePath].startSec });
+    }
+    slots.sort((a, b) => (b.hasVideo ? 1 : 0) - (a.hasVideo ? 1 : 0));
+    return slots.map(sl => ({ hasVideo: sl.hasVideo, labels: sl.labels, label: sl.labels.join(" + "), files: sl.files }));
+}
+
 // The track in a (rebuilt) sequence that best holds `paths`: most of them,
 // then fewest other files, then the lowest index. For carrying a forced
 // Audio reference across a rebuild by device.
@@ -603,6 +652,7 @@ function followTrack(clips, paths, trackType) {
 
 module.exports = {
     followTrack,
+    packBlocks,
     OVERLAP_TOL_SEC,
     MAX_PARALLEL_DEVICES,
     deviceFolder,

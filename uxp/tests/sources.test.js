@@ -313,3 +313,28 @@ test("followTrack finds where a forced reference's recordings went after a rebui
     assert.strictEqual(sources.followTrack(clips, ["rec_2.wav"], "audio"), "audio_5", "the purer track wins a tie");
     assert.strictEqual(sources.followTrack(clips, ["missing.wav"], "audio"), null);
 });
+
+test("packBlocks puts the same camera's two days on one set of tracks, keeps overlapping devices apart", () => {
+    const blocks = [
+        { sourceId: "fx6d1", label: "FX6 day 1", hasVideo: true, audioWidth: 4, files: [{ filePath: "f1" }] },
+        { sourceId: "a7d1", label: "A7S3 day 1", hasVideo: true, audioWidth: 2, files: [{ filePath: "s1" }] },
+        { sourceId: "fx6d2", label: "FX6 day 2", hasVideo: true, audioWidth: 4, files: [{ filePath: "f2" }] },
+        { sourceId: "a7d2", label: "A7S3 day 2", hasVideo: true, audioWidth: 2, files: [{ filePath: "s2" }] },
+        { sourceId: "rec", label: "Recorder", hasVideo: false, audioWidth: 1, files: [{ filePath: "r1" }, { filePath: "r2" }] }
+    ];
+    const span = (a, b) => ({ startSec: a, endSec: b });
+    const spans = { f1: span(0, 6000), s1: span(30, 5900), f2: span(6060, 9000), s2: span(6100, 9100), r1: span(10, 5000), r2: span(6200, 8000) };
+    const slots = sources.packBlocks(blocks, spans);
+    assert.strictEqual(slots.length, 3);
+    assert.deepStrictEqual(slots.map(s => s.labels), [["FX6 day 1", "FX6 day 2"], ["A7S3 day 1", "A7S3 day 2"], ["Recorder"]]);
+    assert.deepStrictEqual(slots[0].files, [{ filePath: "f1", startSec: 0 }, { filePath: "f2", startSec: 6060 }]);
+});
+
+test("packBlocks never shares a slot between blocks closer than the margin", () => {
+    const blocks = [
+        { sourceId: "a", label: "A", hasVideo: true, audioWidth: 2, files: [{ filePath: "a" }] },
+        { sourceId: "b", label: "B", hasVideo: true, audioWidth: 2, files: [{ filePath: "b" }] }
+    ];
+    const slots = sources.packBlocks(blocks, { a: { startSec: 0, endSec: 100 }, b: { startSec: 100.5, endSec: 200 } });
+    assert.strictEqual(slots.length, 2);
+});

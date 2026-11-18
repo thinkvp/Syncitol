@@ -70,6 +70,23 @@ The earlier internal history is a **separate 1.x line** that ran to its own
   audio pass only has to confirm. Before, such a track started at 0:00 and
   the audio pass searched for the multi-hour offset blind. Recurring
   same-time-every-day shoots are ambiguous, so they are left alone.
+- **Gaps between recording days are tightened after the sync.** They were
+  planned from the recording clocks, before the audio pass corrected them, so
+  the finished gap was the 5-minute pad plus however wrong the clocks were.
+  In a field test, a day ending on an FX6 10 minutes fast and the next
+  starting on an A7S3 1.5 minutes slow left about 20 minutes. A clock error
+  the other way could have made days overlap. Once every clip is in its
+  final place, each later day slides, as one piece, to start a minute after
+  the previous day ends. A "day" whose clips the sync put inside another day
+  is merged into it, not moved.
+- **Tracks are packed after the sync when the sequence was rebuilt by
+  device.** The rebuild gives every device block its own tracks, because the
+  analysis treats a track as one device. Once synced, blocks that never
+  overlap in time share tracks: the same camera on two days, or two devices
+  that never rolled together. Premiere can only slide clips along their own
+  track, so the packed layout is placed afresh in a new copy of the original
+  sequence. It replaces the first -SYNC only if every clip lands exactly;
+  otherwise the unpacked one is kept. Revert is not available after packing.
 - **The dropdowns show what Auto decided** after a run, e.g. "Auto · V3, V4",
   "Auto-detect · rebuilt by device", "Auto-detect · 2 days".
 - **A note when Premiere has no peak files yet** for some clips. That happens
