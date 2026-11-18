@@ -9,6 +9,19 @@ The earlier internal history is a **separate 1.x line** that ran to its own
 1.4.0 before that reset — unrelated to the 1.4.0 below — and is preserved in
 [CHANGELOG-legacy.md](CHANGELOG-legacy.md).
 
+## [1.9.1] - 2026-11-18
+
+### Changed
+- **On a Mac, a decoder that won't load says how to fix it.** The audio
+  decoder isn't signed with a paid Apple Developer ID, so macOS blocks it
+  until you allow it once. The error in the panel log, on the decoder chip
+  and from Auto Sync now says to open System Settings → Privacy & Security,
+  click Allow Anyway next to the message about `syncitol.uxpaddon`, and
+  restart Premiere Pro.
+- **Auto Sync stops straight away if the decoder isn't loaded.** It used to
+  scan and build a `-SYNC` sequence first and only fail at the audio pass,
+  leaving an unsynced copy behind.
+
 ## [1.9.0] - 2026-11-18
 
 ### Added
